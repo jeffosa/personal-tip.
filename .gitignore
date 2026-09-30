@@ -1,0 +1,11 @@
+.venv/
+.venv-ci/
+ci-artifacts/
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+.env
