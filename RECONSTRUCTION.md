@@ -54,8 +54,10 @@ Parts and their status:
 
 - **E1 — Verbatim drift (defect).** The module docstring and the two comments above the variance and
   minutes constants differ from the verbatim block in ESSENTIALS §2.3. The docstring was shortened to
-  one line and the comments were dropped. Code is otherwise identical. *Fixed in the commit after this
-  one* (see the change log below).
+  one line, the comments were dropped, and `DiscreteDistribution`, `ProjectionError` and `VoidRule`
+  sat between the constants and `validate_exposure_vector`. **Fixed** (commit "Restore verbatim
+  engine header"): the file now starts with the §2.3 block byte for byte, and the three classes
+  follow it.
 - **E2 — `DiscreteDistribution`.** R-TYPE-7 names the five methods (`pmf`, `cdf`, `sf`, `mean`,
   `var`) but not their signatures. Implemented as `values: ArrayLike -> float | np.ndarray`, and
   `mean()`/`var()` returning `float`.
@@ -74,12 +76,19 @@ Parts and their status:
 - **E5a — Negative no-appearance weight (defect, found during this write-up).** A negative weight of
   order 1e-16 reaches `outcome_model` as a scenario weight, because the zero-weight check is
   `== 0.0`. `return_moments` then rejects the negative probability, and `allocate` skips a valid
-  market as "projection unusable". This fails closed but is still wrong. *Fixed in the next commit* by
-  computing `1.0 - (p_start + p_sub_appearance)`. That form is exact and non-negative whenever the
-  validator's `p_start + p_sub_appearance <= 1` holds (Sterbenz lemma), so no clamp is needed.
+  market as "projection unusable". This fails closed but is still wrong. **Fixed** by computing
+  `1.0 - (p_start + p_sub_appearance)`. That form is exact and non-negative whenever the validator's
+  `p_start + p_sub_appearance <= 1` holds (Sterbenz lemma), so no clamp is needed. Regression test:
+  `test_complementary_lineup_leaves_no_negative_absence_weight`.
 - **E6 — `SideProbabilities`** validates that each value is finite and in [0, 1], and that the three
   sum to 1 within 1e-12. v3.0 had no validation and computed `p_void = max(0, 1 - p_win - p_lose)`.
-  Now `p_void = 1 - p_win - p_lose`, with no clamp.
+  Step 2 computed `p_void = 1 - p_win - p_lose` with no clamp.
+- **E6a — `p_void` rounding (defect, found during this write-up).** `1 - p_win - p_lose` rounds to
+  about -1e-16 on roughly 5% of inputs: 6,406 of 130,800 calls in a random probe. The strict
+  validator then raised `ValueError`, and `allocate` would skip those markets as "projection
+  unusable". **Fixed** by summing `p_void` directly from non-negative masses: the void-scenario weight
+  plus the push probability of each scenario. This is analytically identical and needs no clamp.
+  Regression test: `test_side_probabilities_never_fail_on_rounding` (fixed seed).
 - **E7 — `_line_split`** takes P(over) from `distribution.sf(floor(line))`, where v3.0 used
   `max(0, 1 - under - push)`. This is exact in the tail and removes a clamp.
 - **E8 — `count_distribution`** rejects minutes outside (0, 130]. AGENT G2 requires only "finite and
@@ -198,4 +207,16 @@ Parts and their status:
 |---|---|
 | `b085b3f` | Step 1: package skeleton, `engine.py`, core engine tests |
 | `4bc7167` | Step 2: `market_scanner.py`, allocator tests (57 passed) |
-| this commit | RECONSTRUCTION.md covering steps 1–2 |
+| `1ce1cfd` | RECONSTRUCTION.md covering steps 1–2 |
+| next | Fix E1, E5a, E6a in `engine.py`; two regression tests (62 passed) |
+
+### AGENT §2.1 gate record for the E1/E5a/E6a engine change
+
+| Gate | Outcome |
+|---|---|
+| G1 | No squared-moment subtraction introduced. The changes remove a rounding subtraction (`1 - p_win - p_lose`) rather than add one. |
+| G2 | No new input to a division, log or distribution parameter. |
+| G3 | The NB predictive distribution and `v = 1/α + 1/k + 1/(αk)` are unchanged. `p_void` and `p_no_appearance` are analytically identical to before, and differ only by removing about 1e-16 of round-off. |
+| G4 | No handler added. Validation still raises. |
+| G5 | Allocator untouched. The reference 1.94% / 0.04% test still passes. |
+| G6 | Proof of bite. Pre-fix `engine.py` with the new tests: `3 failed, 59 passed`. Fixed: `62 passed`. |

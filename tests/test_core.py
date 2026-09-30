@@ -129,6 +129,35 @@ def test_side_probabilities_partition(line: float, void_rule: VoidRule) -> None:
     assert sum((under.p_win, under.p_lose, under.p_void)) == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize(("p_start", "p_sub"), [(0.33, 0.67), (0.7, 0.3), (0.1, 0.9), (0.5, 0.5)])
+def test_complementary_lineup_leaves_no_negative_absence_weight(p_start: float, p_sub: float) -> None:
+    lineup = LineupExpectation(p_start, p_sub)
+    assert lineup.p_no_appearance == 0.0
+    projection = PropProjection(1, 2, "tackles", 7.0, 3.0, lineup)
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    over_price = price_for_ev(projection.side_probabilities(1.5, "over"), 0.10)
+    quote = LiveOddsQuote(1, 2, "tackles", 1.5, over_price, None, 100.0, "Book", now)
+    candidates, _ = InstitutionalAssetManager(1_000.0)._candidates(projection, [quote])
+    probabilities, _ = outcome_model(projection, candidates)
+    assert (probabilities >= 0.0).all()
+
+
+def test_side_probabilities_never_fail_on_rounding() -> None:
+    rng = np.random.default_rng(20260930)
+    for _ in range(100):
+        p_start = float(rng.choice([1.0, 0.92, 0.75, 0.5, 0.33, 0.0]))
+        p_sub = float(rng.choice([0.0, 0.05, 0.35, 1.0 - p_start]))
+        if p_start + p_sub > 1.0:
+            continue
+        lineup = LineupExpectation(p_start, p_sub, float(rng.uniform(10.0, 120.0)), float(rng.uniform(5.0, 40.0)))
+        projection = PropProjection(1, 2, "tackles", float(rng.uniform(0.5, 50.0)), float(rng.uniform(0.2, 20.0)), lineup)
+        for line in (0.0, 0.5, 1.0, 2.5):
+            for side in ("over", "under"):
+                for void_rule in VoidRule:
+                    result = projection.side_probabilities(line, side, void_rule)
+                    assert min(result.p_win, result.p_lose, result.p_void) >= 0.0
+
+
 def test_bimodal_substitution_has_no_absence_void_when_present() -> None:
     projection = PropProjection(1, 2, "tackles", 7.0, 3.0, LineupExpectation(0.5, 0.5))
     result = projection.side_probabilities(1.5, "over", VoidRule.VOID_IF_NO_APPEARANCE)

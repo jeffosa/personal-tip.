@@ -1,4 +1,5 @@
-"""Predictive engine: Gamma-Poisson posteriors with exposure and overdispersion."""
+"""Predictive engine: Gamma-Poisson posteriors with minutes exposure, referee adjustment,
+game-state overdispersion, lineup/void handling, and bivariate Poisson dependence."""
 
 from __future__ import annotations
 
@@ -15,31 +16,14 @@ from scipy.stats import nbinom, poisson
 logger = logging.getLogger("prop_alpha.engine")
 
 REFEREE_SENSITIVE_MARKETS: Final[frozenset[str]] = frozenset({"fouls", "fouls_drawn"})
+
+# Relative-variance bounds on the per-90 match rate, i.e. Var/mu^2 = 1/shape.
+# 1e-6 is the numerical Poisson limit; 1e3 caps shape at 1e-3, far beyond any fitted dispersion.
 MIN_RELATIVE_VARIANCE: Final[float] = 1e-6
 MAX_RELATIVE_VARIANCE: Final[float] = 1e3
+
+# Upper bound on minutes in one match (90 + stoppage + extra time); mirrors chk_minute_logic in schema.sql.
 MAX_MATCH_MINUTES: Final[float] = 130.0
-
-
-class DiscreteDistribution(Protocol):
-    def pmf(self, values: ArrayLike) -> float | np.ndarray: ...
-
-    def cdf(self, values: ArrayLike) -> float | np.ndarray: ...
-
-    def sf(self, values: ArrayLike) -> float | np.ndarray: ...
-
-    def mean(self) -> float: ...
-
-    def var(self) -> float: ...
-
-
-class ProjectionError(ValueError):
-    """Raised when inputs cannot produce a valid predictive distribution."""
-
-
-class VoidRule(str, Enum):
-    VOID_IF_NO_APPEARANCE = "void_if_no_appearance"
-    VOID_IF_NOT_STARTING = "void_if_not_starting"
-    NO_VOID = "no_void"
 
 
 def validate_exposure_vector(
@@ -69,6 +53,28 @@ def validate_exposure_vector(
     if ((np_counts > 0.0) & (np_minutes == 0.0)).any():
         raise ValueError("a positive count cannot be recorded with zero minutes played")
     return np_minutes, np_counts.astype(np.int64)
+
+
+class DiscreteDistribution(Protocol):
+    def pmf(self, values: ArrayLike) -> float | np.ndarray: ...
+
+    def cdf(self, values: ArrayLike) -> float | np.ndarray: ...
+
+    def sf(self, values: ArrayLike) -> float | np.ndarray: ...
+
+    def mean(self) -> float: ...
+
+    def var(self) -> float: ...
+
+
+class ProjectionError(ValueError):
+    """Raised when inputs cannot produce a valid predictive distribution."""
+
+
+class VoidRule(str, Enum):
+    VOID_IF_NO_APPEARANCE = "void_if_no_appearance"
+    VOID_IF_NOT_STARTING = "void_if_not_starting"
+    NO_VOID = "no_void"
 
 
 @dataclass(frozen=True)
@@ -136,7 +142,9 @@ class LineupExpectation:
 
     @property
     def p_no_appearance(self) -> float:
-        return 1.0 - self.p_start - self.p_sub_appearance
+        # Subtract the rounded sum once: __post_init__ guarantees it is <= 1, so 1 - sum is exact and
+        # non-negative (Sterbenz). Chained subtraction can return -1.1e-16 for (0.33, 0.67).
+        return 1.0 - (self.p_start + self.p_sub_appearance)
 
 
 @dataclass(frozen=True)
@@ -216,21 +224,29 @@ class PropProjection:
             raise ValueError("side must be 'over' or 'under'")
         rule = VoidRule(void_rule)
 
-        def oriented(split: tuple[float, float, float]) -> tuple[float, float]:
-            over_probability, under_probability, _ = split
-            return (over_probability, under_probability) if side == "over" else (under_probability, over_probability)
+        def oriented(split: tuple[float, float, float]) -> tuple[float, float, float]:
+            over_probability, under_probability, push_probability = split
+            if side == "over":
+                return over_probability, under_probability, push_probability
+            return under_probability, over_probability, push_probability
 
         lineup = self.lineup
-        win_start, lose_start = oriented(_line_split(self.count_distribution(lineup.exp_minutes_start), line))
-        win_sub, lose_sub = oriented(_line_split(self.count_distribution(lineup.exp_minutes_sub), line))
-        win_absent, lose_absent = oriented(_zero_split(line))
+        win_start, lose_start, push_start = oriented(
+            _line_split(self.count_distribution(lineup.exp_minutes_start), line)
+        )
+        win_sub, lose_sub, push_sub = oriented(_line_split(self.count_distribution(lineup.exp_minutes_sub), line))
+        win_absent, lose_absent, push_absent = oriented(_zero_split(line))
 
+        # p_void is summed from non-negative void and push masses, never formed as 1 - p_win - p_lose,
+        # which rounds to about -1e-16 on roughly 5% of inputs and would fail validation.
         if rule is VoidRule.VOID_IF_NO_APPEARANCE:
             p_win = lineup.p_start * win_start + lineup.p_sub_appearance * win_sub
             p_lose = lineup.p_start * lose_start + lineup.p_sub_appearance * lose_sub
+            p_void = lineup.p_no_appearance + lineup.p_start * push_start + lineup.p_sub_appearance * push_sub
         elif rule is VoidRule.VOID_IF_NOT_STARTING:
             p_win = lineup.p_start * win_start
             p_lose = lineup.p_start * lose_start
+            p_void = (1.0 - lineup.p_start) + lineup.p_start * push_start
         else:
             p_win = (
                 lineup.p_start * win_start
@@ -242,7 +258,12 @@ class PropProjection:
                 + lineup.p_sub_appearance * lose_sub
                 + lineup.p_no_appearance * lose_absent
             )
-        return SideProbabilities(p_win, p_lose, 1.0 - p_win - p_lose)
+            p_void = (
+                lineup.p_start * push_start
+                + lineup.p_sub_appearance * push_sub
+                + lineup.p_no_appearance * push_absent
+            )
+        return SideProbabilities(p_win, p_lose, p_void)
 
 
 def _poisson_log_term(rate: float, count: int) -> float:
