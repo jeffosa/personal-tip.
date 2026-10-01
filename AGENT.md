@@ -80,6 +80,7 @@
 | H3 | `ingestion/pipeline.py` → `ConcurrentIngestionEngine._with_transaction` | `psycopg2.errors.QueryCanceled` (SQLSTATE 57014) | none: re-raised immediately | `[STATEMENT_TIMEOUT]` at ERROR |
 | H4 | `ingestion/pipeline.py` → `ConcurrentIngestionEngine._with_transaction` | `RETRYABLE_DB_ERRORS` | one attempt; the last error is re-raised after `max_db_attempts` | `logger.warning` per attempt |
 | H5 | `scanner/market_scanner.py` → `InstitutionalAssetManager.allocate` | `(ProjectionError, ValueError, FloatingPointError)` | one player-market key | `report.skipped` (`"projection unusable: …"`) and `logger.error` |
+| H6 | `alerts/telegram.py` → `TelegramNotifier._call` | `requests.RequestException` | one Telegram API call | re-raised as `TelegramError` without the request URL, which contains the bot token (`from None`). **Added in the reconstruction at the maintainer's request for Telegram alerts; awaiting formal approval.** |
 
   Enforcement:
   - `test_only_sanctioned_exception_handlers_exist` requires the handler set to equal `SANCTIONED_HANDLERS` exactly.

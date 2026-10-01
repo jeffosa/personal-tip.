@@ -29,6 +29,8 @@ SANCTIONED_HANDLERS: frozenset[tuple[str, str, str]] = frozenset({
     ("prop_alpha/ingestion/pipeline.py", "ConcurrentIngestionEngine._with_transaction", "psycopg2.errors.QueryCanceled"),
     ("prop_alpha/ingestion/pipeline.py", "ConcurrentIngestionEngine._with_transaction", "RETRYABLE_DB_ERRORS"),
     ("prop_alpha/scanner/market_scanner.py", "InstitutionalAssetManager.allocate", "(ProjectionError, ValueError, FloatingPointError)"),
+    # H6, added with the Telegram alerts at the maintainer's request; pending formal approval (RECONSTRUCTION.md Q6).
+    ("prop_alpha/alerts/telegram.py", "TelegramNotifier._call", "requests.RequestException"),
 })
 
 PURE_MODULES: tuple[str, ...] = (

@@ -27,7 +27,7 @@ def _tree(module: str) -> ast.Module:
 
 def test_every_package_marker_is_empty() -> None:
     markers = list(PACKAGE.rglob("__init__.py"))
-    assert len(markers) == 6
+    assert len(markers) == 7
     assert all(marker.read_text(encoding="utf-8") == "" for marker in markers)
 
 

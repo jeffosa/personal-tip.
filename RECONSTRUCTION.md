@@ -49,6 +49,10 @@ Mixed files list each part separately.
 | `.gitattributes` | none (forces LF on `*.sh` and `*.sql`; bash rejects CRLF) | RECONSTRUCTED | step 4 |
 | `tests/test_typing_contract.py` | ESSENTIALS §2.1 R-TYPE-1 to R-TYPE-3 | RECONSTRUCTED | step 5 |
 | `tests/test_agent_contract.py` | AGENT §1.1 A3–A4, §1.2 Z1, §1.3 F2–F6, §1.4 P1–P5, §2.1 G1 | RECONSTRUCTED | step 5 |
+| `prop_alpha/alerts/__init__.py`, `prop_alpha/alerts/telegram.py` | **Not in any document.** New feature requested by the maintainer after step 2. | NEW | step 6 |
+| `tests/test_alerts.py` | none | NEW | step 6 |
+| `.env.example` | none (empty template; the real `.env` is gitignored) | NEW | step 6 |
+| `AGENT.md` (row H6), `CLAUDE.md` (I/O isolation, secrets, alert commands) | edited to match step 6 | EDITED | step 6 |
 
 ## Interpretations by file
 
@@ -477,6 +481,61 @@ Interpretations:
 | (same, after fixing the detector) | The marker was **not** caught at first. The regex's final `\b` was in a non-raw string, so it was a backspace. Fixed, and a text-marker detector case added. The marker alone then gives `1 failed, 38 passed`. |
 | Restored | `205 passed` |
 
+### Step 6 — Telegram alerts (NEW, not part of v3.3)
+
+The maintainer asked for a Telegram connection that sends each high-value opportunity as it is found,
+with the API key kept out of the code base and out of git.
+
+**What it does:**
+- `TelegramNotifier.notify(report)` sends one plain-text message per `report.directives` entry.
+- Every message starts with `PAPER ONLY - model not validated, no PRD go-live gate passed`.
+- It never sends `skipped_directives` (sub-minimum stakes) or skipped markets.
+- It never places a bet (AGENT A5).
+- **"High value"** means every directive the allocator emits (EV > `alpha_threshold` = 0.02, stake >=
+  `min_stake`). `min_ev_per_unit` can raise the bar. This was the default offered to the maintainer,
+  who did not choose otherwise.
+
+**Credentials:**
+- `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are read from the process environment first, then from
+  the repository-root `.env`.
+- `.env` is gitignored (`git check-ignore -v .env` → `.gitignore:11:.env`). Only `.env.example`, with
+  empty values, is committed.
+- The token is `repr=False` on the config and appears in no log or exception message.
+- `test_no_secrets_in_repository_files` fails the suite if a token-shaped string lands in any
+  repository file other than `.env`.
+
+**Sanctioned handler H6 (new):**
+- `TelegramNotifier._call` catches `requests.RequestException` and re-raises `TelegramError` with the
+  URL removed (`from None`). Telegram puts the token in the URL path, and `requests` quotes that URL
+  in connection-error messages, so without H6 every network failure would print the token.
+- H6 is in `SANCTIONED_HANDLERS` and the AGENT.md F2 table. AGENT.md requires a human maintainer's
+  approval for a new handler: **open question Q6.**
+- Proof of bite: without H6, `test_transport_errors_are_sanitised` fails (`1 failed, 11 passed`).
+
+**Layering:**
+- ESSENTIALS §1.2 says `pipeline.py` is the only network module. `alerts/telegram.py` is a second one,
+  so CLAUDE.md's I/O-isolation line was updated.
+- The module imports `engine` and `market_scanner`, while the pure modules import nothing from it.
+- It is not in `PURE_MODULES`.
+- The typing contract now covers 8 modules (24 rule tests).
+
+**What is not done:**
+- **Nothing calls `notify` in production.** The allocation process that would call `allocate` on live
+  quotes, and the odds poller that would feed it, are **[N]**. Until they exist, alerts come only
+  from `--demo`, which uses synthetic quotes and says so in the first message.
+- **No duplicate memory across restarts.** The record of sent directives lives in memory only, so a
+  restarted process can repeat an alert; a persistent store is [N].
+- **No player names.** Messages show IDs, because `StakingDirective` carries IDs only. A name lookup
+  needs the database [N].
+
+**Verification:**
+- 12 offline tests against a fake HTTP session.
+- One live call to `api.telegram.org` with a deliberately fake, well-formed token returned `getMe
+  rejected by Telegram (HTTP 401): Unauthorized`. That shows the endpoint is reachable from this
+  machine, and that the error path is sanitised.
+- **The maintainer's own bot has not been contacted.** The token pasted in chat must be revoked and
+  was written nowhere. `--check` with the new token in `.env` is the remaining step.
+
 ## Open questions for the maintainer
 
 | ID | Question | Current behaviour |
@@ -486,6 +545,7 @@ Interpretations:
 | Q3 | Should a quote whose `captured_at` is after `now` abort the whole `allocate` call, or be skipped and recorded per key? | Aborts the call (S6). |
 | Q4 | Stakes: floor to the cent (never exceeds `max_stake`) or round to the cent (PRD R-ALLOC-5)? | Floored (S7). |
 | Q5 | How should the backtest get referee data for `fouls` and card markets (Gate 2)? Add an optional referee to `PlayerMatchObservation`? | A neutral referee is used (B3). |
+| Q6 | Approve sanctioned handler H6 (`TelegramNotifier._call`, token-sanitising re-raise)? AGENT.md requires a maintainer's approval for any new handler. | Added and enforced; marked "awaiting formal approval" in AGENT.md. |
 
 ## Change log
 
@@ -497,7 +557,8 @@ Interpretations:
 | `1a0ce66` | Fix E1, E5a, E6a in `engine.py`; two regression tests (62 passed) |
 | `fe7a261` | Step 3: transform, pipeline, fitting, referee_job, backtest, and their tests (123 passed) |
 | `a25ab8c` | Step 4: schema.sql, migrations 002–003, ci/bootstrap.sh, .gitattributes, SQL structure tests (139 passed) |
-| step 5 | Typing and agent contract suites; `EXPECTED_TESTS=205` (205 passed; preflight passed) |
+| `a6eaa4a` | Step 5: typing and agent contract suites; `EXPECTED_TESTS=205` (205 passed; preflight passed) |
+| step 6 | Telegram alerts, H6, `.env.example`, CLAUDE.md/AGENT.md updates; `EXPECTED_TESTS=220` (220 passed) |
 
 ### AGENT §2.1 gate record for the E1/E5a/E6a engine change
 

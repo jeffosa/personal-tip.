@@ -14,7 +14,7 @@ Full rules for any code change: **AGENT.md**. Requirements and go-live gates: `p
 
 ## Design philosophy
 
-- **I/O isolation.** Only `ingestion/pipeline.py` does network and pool I/O (and `calibration/referee_job.run_referee_job` for its own job). Workers fetch and parse first, then take a pooled connection for one short transaction inside `ConcurrentIngestionEngine._with_transaction`, which is the only `pool.getconn()` call site. Never pass connections, cursors, pools or sessions into `transform.py`, `engine.py`, `market_scanner.py`, `fitting.py` or `backtest.py`.
+- **I/O isolation.** Only `ingestion/pipeline.py` does network and pool I/O (and `calibration/referee_job.run_referee_job` for its own job, and `alerts/telegram.py` for outbound Telegram messages). Workers fetch and parse first, then take a pooled connection for one short transaction inside `ConcurrentIngestionEngine._with_transaction`, which is the only `pool.getconn()` call site. Never pass connections, cursors, pools or sessions into `transform.py`, `engine.py`, `market_scanner.py`, `fitting.py` or `backtest.py`.
 - **Mathematical conservatism.** The allocator maximises \(f^\top\mu - \lambda f^\top\Sigma f\) jointly over all lines for a player, using the exact covariance from `return_moments`. Never revert to nominal-EV selection or per-line sizing. Don't change risk defaults (`risk_aversion=2.0`, the caps, `alpha_threshold`) without an explicit human instruction.
 - **Fail closed.** Raise `ValueError` or `ProjectionError` at the point of detection. Catch only at the five handlers in AGENT.md §1.3, each of which records the failure. No fallback distributions, no silent floors. The one clamp (relative variance) logs `[MATH_CLAMP]`.
 - **Type rigidity.** Follow these rules; they are enforced by `tests/test_typing_contract.py`:
@@ -61,6 +61,14 @@ python -m pytest tests/test_pipeline_concurrency.py -v -rs
 
 **Coverage.** `pytest-cov` is not in `requirements.txt`, so `--cov` errors with "unrecognized arguments". To use coverage, add an exact `pytest-cov==<version>` pin to `requirements.txt` in the same change, then run `python -m pytest tests --cov=prop_alpha --cov-report=term-missing`.
 
+Telegram alerts (sends messages only; never places bets):
+
+```bash
+python -m prop_alpha.alerts.telegram --get-chat-id   # after sending /start to the bot
+python -m prop_alpha.alerts.telegram --check         # token check + one test message
+python -m prop_alpha.alerts.telegram --demo          # synthetic reference-case alerts, labelled as such
+```
+
 ## Local PostgreSQL sandbox
 
 This recipe is **untested here**: the authoring machine has no Docker. Use a throwaway database whose name ends in `_ci`; `ci/bootstrap.sh` refuses to reset any other.
@@ -100,7 +108,7 @@ PROP_ALPHA_CI_DATABASE_URL="postgresql://postgres:${PGPASSWORD}@localhost:5432/p
   - Add constraints `NOT VALID`, then `VALIDATE`; build indexes `CONCURRENTLY`; set `lock_timeout`.
   - Every new `CHECK` needs a matching Python validation and a merge reject predicate.
   - Never use `TRUNCATE` on staging.
-- **Secrets.** None in code, tests or scripts. Tests need no credentials.
+- **Secrets.** None in code, tests or scripts. Tests need no credentials. The Telegram bot token and chat id live only in the gitignored `.env` (template: `.env.example`) or the process environment; `test_no_secrets_in_repository_files` scans for token-shaped strings.
 
 ## Before you say a change is done
 
