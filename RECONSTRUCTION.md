@@ -558,7 +558,32 @@ with the API key kept out of the code base and out of git.
 | `fe7a261` | Step 3: transform, pipeline, fitting, referee_job, backtest, and their tests (123 passed) |
 | `a25ab8c` | Step 4: schema.sql, migrations 002–003, ci/bootstrap.sh, .gitattributes, SQL structure tests (139 passed) |
 | `a6eaa4a` | Step 5: typing and agent contract suites; `EXPECTED_TESTS=205` (205 passed; preflight passed) |
-| step 6 | Telegram alerts, H6, `.env.example`, CLAUDE.md/AGENT.md updates; `EXPECTED_TESTS=220` (220 passed) |
+| `1dc8c2d` | Step 6: Telegram alerts, H6, `.env.example`, CLAUDE.md/AGENT.md updates; `EXPECTED_TESTS=220` (220 passed) |
+
+### Final verification (2026-10-01, CPython 3.14.6, Windows 11, Git Bash)
+
+| Command | Result |
+|---|---|
+| `.venv\Scripts\python.exe -m compileall -q prop_alpha tests` | exit 0, no output |
+| `.venv\Scripts\python.exe -m pytest tests -q -p no:cacheprovider` | `220 passed` |
+| `bash ci/bootstrap.sh --preflight` | `preflight passed; nothing created or installed` |
+| `bash ci/bootstrap.sh` (no database URL) | stages 1–5 passed; `junit totals: {'tests': 220, 'failures': 0, 'errors': 0, 'skipped': 0}`; `stage 6/6 skipped: PROP_ALPHA_CI_DATABASE_URL is unset`; `SUCCESS`, exit 0 |
+
+**Test count by suite:**
+
+| Suite | This reconstruction | Documented v3.3 |
+|---|---|---|
+| Core | 85 | 82 |
+| Integrity | 41 | 38 |
+| Agent contract | 39 | 27 |
+| Typing contract | 27 | 21 |
+| Concurrency | 13 | 12 |
+| Alerts (new in step 6) | 12 | none |
+| **Total** | **220** | **180** |
+
+The counts differ because the tests were reconstructed independently, not because these are the
+original 180 with 40 added. Documented test names that were reconstructed: all of them. None was
+omitted.
 
 ### AGENT §2.1 gate record for the E1/E5a/E6a engine change
 
