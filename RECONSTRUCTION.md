@@ -33,7 +33,15 @@ Mixed files list each part separately.
 | `prop_alpha/__init__.py` and the six sub-package `__init__.py` | ESSENTIALS §1.1, §1.2 (empty package markers) | VERBATIM (empty) | step 1 |
 | `prop_alpha/modeling/engine.py` | ESSENTIALS §2.3 (module top through `validate_exposure_vector`; `gamma_poisson_update`); refactor TASK 1 (v3.0 engine); AGENT §1.3, §2.1–§2.2, §4.2; PRD §2.3, §3 B3 | Mixed: see [engine.py](#prop_alphamodelingenginepy) | step 1 |
 | `prop_alpha/scanner/market_scanner.py` | refactor TASK 4 (v3.0 scanner); AGENT §1.3 H5, §2.2 U1–U3, §4.2; PRD §2.4, §3 B4–B5; ARCHITECTURE §4.2–§4.3 | ADAPTED | step 2 |
-| `tests/test_core.py` | Test names from AGENT §2.2, §3.3 and PRD; no test code is printed in any document | RECONSTRUCTED | steps 1–2 |
+| `tests/test_core.py` | Test names from AGENT §2.2, §3.3 and PRD; no test code is printed in any document | RECONSTRUCTED | steps 1–3 |
+| `prop_alpha/ingestion/transform.py` | refactor TASK 2 (supporting) (v3.0 transform); ESSENTIALS §1.2, §3.1, R-TYPE-5; AGENT §4.1–§4.2 | ADAPTED | step 3 |
+| `prop_alpha/ingestion/pipeline.py` | refactor TASK 2 (v3.0 pipeline); AGENT §1.3 H1–H4, §1.4 P3, §3.4; ARCHITECTURE §2; PRD §2.1, §3 B1–B2 | ADAPTED | step 3 |
+| `prop_alpha/calibration/fitting.py` | ESSENTIALS §1.2; ARCHITECTURE §1.3 export list; PRD §1.4 (the H2 estimator formula) | RECONSTRUCTED | step 3 |
+| `prop_alpha/calibration/referee_job.py` | ESSENTIALS §1.2; ARCHITECTURE §1.3, §3.3 P4; AGENT §1.4 P4, §3.4, §4.1–§4.2; PRD R-STG-6, Scenario C | RECONSTRUCTED | step 3 |
+| `prop_alpha/evaluation/backtest.py` | ESSENTIALS §1.2; ARCHITECTURE §1.3; AGENT §4.2 signature; PRD Gates 2–3 | RECONSTRUCTED | step 3 |
+| `tests/conftest.py` | none (shared payload builders) | RECONSTRUCTED | step 3 |
+| `tests/test_integrity.py` | ESSENTIALS §1.1, §2.3, §3.1; AGENT §3.3 boundary catalogue | RECONSTRUCTED | step 3 (SQL parts in step 4) |
+| `tests/test_pipeline_concurrency.py` (including the in-memory fakes) | ARCHITECTURE §2.1–§2.3; PRD §2.1, B1–B2; AGENT §3.3 | RECONSTRUCTED | step 3 |
 
 ## Interpretations by file
 
@@ -170,7 +178,8 @@ Parts and their status:
 - **T1 — Test placement.** It holds `test_valid_vectors_are_returned_typed`,
   `test_polluted_vectors_are_rejected` (11 cases, as ESSENTIALS §2.3 documents) and
   `test_gamma_update_uses_validation_and_allows_prior_only_history`. ESSENTIALS §1.1 assigns
-  "exposure validation" to `test_integrity.py`. *To be moved in step 3.*
+  "exposure validation" to `test_integrity.py`. **Done in step 3:** all three now live in
+  `test_integrity.py`, unchanged.
 - **T2 — Tests with no documented name:**
   - `test_bimodal_substitution_has_no_absence_void_when_present` (AGENT §3.3 bimodal row);
   - `test_invalid_projection_parameters_fail_closed`;
@@ -178,8 +187,8 @@ Parts and their status:
   - `test_referee_profile_rejects_non_finite_coefficients`;
   - `test_allocate_requires_explicit_utc_time`.
 - **T3 — Documented tests missing at end of step 2:** `test_bivariate_marginal_is_equidispersed_poisson`
-  (PRD R-MOD-5) and `test_corrupted_projection_is_skipped_never_traded` (PRD R-MOD-4). *To be added in
-  step 3.*
+  (PRD R-MOD-5) and `test_corrupted_projection_is_skipped_never_traded` (PRD R-MOD-4). **Added in
+  step 3.**
 - **T4 — Documented figures not pinned:**
   - `test_card_probability_not_distorted_by_variance_floor` checks the closed-form NB probability, not
     the documented 0.1675 → 0.1199 figures. The documents do not give the "representative
@@ -187,10 +196,150 @@ Parts and their status:
   - `test_predictive_gamma_stable_where_subtraction_form_cancels` asserts the clamped shape `1e6`, but
     does not reproduce the `-1.42e-14` subtraction result.
 - **T5 — `test_return_moments_match_closed_form`** uses a synthetic two-state grid. AGENT U2 says
-  "(all void rules)". *To be strengthened in step 3.*
+  "(all void rules)". **Strengthened in step 3:** it now checks the closed-form mean and variance of a
+  single candidate built from a real projection, under all three void rules, on a whole and a half
+  line (6 cases).
 - **T6 — Reference allocation pinned.** `test_mean_variance_prefers_low_variance_line_at_similar_ev`
   pins the documented 1.94% / 0.04% split (tolerance ±0.02 percentage points).
   `test_cross_line_covariance_matches_brute_force` sums x over [0, 300), as documented.
+
+### `prop_alpha/ingestion/transform.py` (ADAPTED from refactor TASK 2 supporting)
+
+- **X1 — L1 minute logic.** `PlayerMatchRecord.__post_init__` adds the two v3.2 rules: it rejects
+  `minute_off < minute_on` and `minutes_played > MAX_MATCH_MINUTES`. This is L1 parity with
+  `chk_minute_logic` (ESSENTIALS §3.1).
+- **X2 — Import of `MAX_MATCH_MINUTES` from `engine.py`.** ARCHITECTURE §1.3 (v3.1) describes
+  transform as "stdlib only". AGENT §3.2 and CLAUDE.md say a constant is defined once and imported,
+  never redeclared, and ESSENTIALS §1.2 names `MAX_MATCH_MINUTES` in the transform's rules. The
+  higher-ranked documents win, so transform imports from engine. That adds the edge engine →
+  transform, which keeps the graph acyclic (engine imports nothing internal) and imports no I/O
+  library (P1).
+- **X3 — Immutable constants (R-TYPE-5).** `DEFAULT_KAPPAS` is a `MappingProxyType`. All
+  module-level upper-case names, including the private widths, are `Final`.
+- **X4 — Carried over from v3.0 unchanged, with known weaknesses (left for the hardening task):**
+  - `_count` maps a missing or `None` stat to 0;
+  - `int()` truncates a fractional count;
+  - a bool counts as an int.
+
+### `prop_alpha/ingestion/pipeline.py` (ADAPTED from refactor TASK 2)
+
+- **P1 — H3 added.** `except psycopg2.errors.QueryCanceled` precedes `except RETRYABLE_DB_ERRORS`. It
+  logs `[STATEMENT_TIMEOUT]` at ERROR on `prop_alpha.ingestion` and re-raises with no retry (AGENT H3,
+  PRD B2).
+- **P2 — v3.0's `assert last_error is not None` replaced** with an explicit `RuntimeError`. It cannot
+  be reached, but an assert disappears under `python -O`.
+- **P3 — `build_arg_parser()` factored out of `main()`,** and `main(argv=None)` takes argv, so that the
+  "[T for argument parsing]" item of PRD §2.1 is testable without environment variables. The CLI
+  behaviour is unchanged.
+- **P4 — Typing:**
+  - SQL strings and `RETRYABLE_DB_ERRORS` are `Final`;
+  - `JOBS` is a `Final` class attribute;
+  - closures annotate `cur: Any` (R-TYPE-8).
+- **P5 — Kept from v3.0:**
+  - `DATA_VENDOR_RPS` is an environment variable read in `main()`, not a module constant;
+  - the pool-size check is skipped when the pool has no `maxconn` attribute.
+
+### `prop_alpha/calibration/fitting.py` (RECONSTRUCTED)
+
+No code in any document; signatures are interpretations.
+
+- **F1 — `fit_poisson_glm(design, counts, offset=None, max_iter=100, tol=1e-10) -> GLMResult`:**
+  - log link, Newton–Raphson from beta = 0;
+  - each step is halved until the log-likelihood does not decrease;
+  - standard errors come from the inverse Fisher information at convergence.
+  - Fail-closed: it **raises** `ValueError` on a rank-deficient design, non-convergence, or failed
+    step halving. It never returns a partial result (AGENT F3).
+  - `GLMResult` is frozen and validated: `coefficients`, `standard_errors`, `log_likelihood`,
+    `iterations`.
+- **F2 — `fit_possession_kappa(counts, minutes, team_possession_pct) -> float`:**
+  - model: `E[count] = t * exp(a) * (opp/50)^kappa`, with `opp = 100 - team_possession`;
+  - that is the exponent `padj_scale` divides out.
+  - Possession at 0 or 100 is **rejected** rather than clipped: the [1, 99] clip in `padj_scale` is
+    documented, but adding a second clip here would be a new clamp (AGENT F5).
+- **F3 — `fit_referee_betas(counts, expected_counts, strictness_coefficient, home_bias_ratio, is_home)
+  -> (beta1, beta2)`:**
+  - a GLM on `[1, log SC, log venue]`, with venue `1 - HBR` at home and `1 + HBR` away;
+  - offset `log(expected_counts)`, the player's referee-free expectation.
+- **F4 — `fit_game_state_dispersion(counts, expected_counts) -> float | None`:**
+  - exactly the PRD §1.4 formula;
+  - returns `None` when 1/k <= 0 (documented), which maps to `QuantEngine(game_state_k=None)`;
+  - the fixture-clustered bootstrap interval and the ">= 20 full matches" sample filter are **[N]**:
+    they are part of the falsification protocol, not of this function.
+- **F5 — `fit_state_duel_density(duels, leading, level, trailing) -> ndarray[3]`:** NNLS for duels per
+  90 in each match state. It raises if the three states are not identified.
+
+### `prop_alpha/calibration/referee_job.py` (RECONSTRUCTED)
+
+- **R1 — Estimators**, each shrunk toward its league with `shrink_matches` pseudo-matches of
+  league-average data:
+  - `SC = (F + m0*F_bar) / ((n + m0)*F_bar)`;
+  - `YCP` and `RCP`: cards per foul;
+  - `HBR = (away - home + m0*F_bar*h_bar) / (fouls + m0*F_bar)`, which stays inside (-1, 1).
+
+  The documents name the outputs but give no formulas. The units (cards per foul; venue multipliers
+  `1 ∓ HBR`) follow from how `QuantEngine.project_card_market` and `referee_multiplier` consume them.
+- **R2 — Input checks.** It raises if a league has zero fouls, if a referee appears in several leagues,
+  or if a (referee, fixture) row is duplicated.
+- **R3 — SQL:**
+  - `DISCIPLINE_SQL` aggregates `player_match_stats` per final fixture of the league inside the
+    lookback window;
+  - `UPDATE_SQL` uses `UPDATE … AS r … FROM (VALUES %s)` through `execute_values` with
+    `UPDATE_TEMPLATE`;
+  - rows are passed ordered by `referee_id` (ARCHITECTURE §3.3 P4).
+
+  The column names come from AGENT §4.1. The full SQL is reconstructed. **[U]**
+- **R4 — Lock statement.** The advisory lock is `ADVISORY_LOCK_SQL = "SELECT
+  pg_advisory_xact_lock(hashtext(%s))"`, executed first with `MERGE_LOCK_KEY` (PRD Scenario C step 4).
+  `ADVISORY_LOCK_SQL` is a new constant name.
+- **R5 — Connection.** `psycopg2.connect(dsn)`, with no `lock_timeout`, as PRD Scenario C states. There
+  are no exception handlers in the module, consistent with the sanctioned set.
+
+### `prop_alpha/evaluation/backtest.py` (RECONSTRUCTED)
+
+- **B1 — Lineup at team-sheet time.** `walk_forward_over_probability` prices a starter with `p_start =
+  1` and a used substitute with `p_sub = 1`. An unused substitute (0 minutes, not started) is treated as
+  voided and gets no prediction.
+- **B2 — Expected minutes** are the player's prior mean minutes when starting or coming on, else
+  `default_start_minutes` or `default_sub_minutes` (mirrors `LINEUP_UPSERT_SQL`).
+- **B3 — Neutral referee.** Observations carry no referee, so a neutral `RefereeProfile(1, 0, 0, 0)`
+  (multiplier 1) is used. **Consequence:** referee-sensitive markets (`fouls`, cards) are backtested
+  **without** the referee adjustment. PRD Gate 2 needs `fouls` and `yellow_card`, so this function is
+  only complete for `tackles`. **Open question Q5.**
+- **B4 — Half lines only.** Integer lines raise `ValueError`, so every outcome settles as 0/1.
+- **B5 — League rate is fixed.** `league_rate_per90` is a fixed argument (the documented signature);
+  PRD Gate 2's "trailing league rate" is the caller's responsibility.
+- **B6 — `summarize`** returns `dict[str, float]` (n, base_rate, brier, brier_climatology,
+  brier_skill, log_loss). Climatology is the sample's own base rate. The function raises when that
+  Brier score is zero.
+- **B7 — `log_loss` does not clip.** A confident miss returns `inf` rather than an epsilon-clipped
+  value (AGENT F5: no new clamps).
+
+### Tests added in step 3
+
+- **`test_core.py`** (+28 to 85):
+  - the two documented tests from T3;
+  - transforms: payload parsing, impossible stats (6 cases), malformed fixtures, `DEFAULT_KAPPAS`
+    immutability, `padj_scale` at 0/100 possession, `dribbled_past_rate`, match-state minutes;
+  - lineup parsing;
+  - estimators, each recovering known parameters from fixed-seed simulations;
+  - referee coefficients;
+  - scoring rules, calibration bins, CLV, walk-forward leakage and summarize.
+- **`test_integrity.py`** (25):
+  - the 13 moved exposure tests and a zero-exposure test;
+  - L1 minute-logic and possession boundaries;
+  - staging and stats row widths and column parity;
+  - `run_referee_job` against a recording fake: lock first, then read, then update in `referee_id`
+    order.
+- **`test_pipeline_concurrency.py`** (13):
+  - fakes of the pool, connection, cursor and vendor. The fake cursor implements `mogrify` and
+    `connection.encoding`, so the **real** `psycopg2.extras.execute_values` runs;
+  - the 12 behaviours ARCHITECTURE §2 and the PRD name, plus CLI parsing;
+  - concurrency is proven with a `threading.Barrier` rather than wall-clock timing. The only timing
+    assertion is the rate limiter's lower bound, with a 10% margin.
+- **Proof of bite** on a scratch copy of `pipeline.py`:
+  - removing the H3 handler: `2 failed, 11 passed`;
+  - moving the vendor fetch inside `_with_transaction`: `3 failed, 10 passed`;
+  - restored: `122 passed`.
 
 ## Open questions for the maintainer
 
@@ -200,6 +349,7 @@ Parts and their status:
 | Q2 | Should `LiveOddsQuote` reject a non-finite price at construction (fail early), or accept it so that `_candidates` skips the side, as AGENT §3.3 describes? | Rejected at construction (S4). |
 | Q3 | Should a quote whose `captured_at` is after `now` abort the whole `allocate` call, or be skipped and recorded per key? | Aborts the call (S6). |
 | Q4 | Stakes: floor to the cent (never exceeds `max_stake`) or round to the cent (PRD R-ALLOC-5)? | Floored (S7). |
+| Q5 | How should the backtest get referee data for `fouls` and card markets (Gate 2)? Add an optional referee to `PlayerMatchObservation`? | A neutral referee is used (B3). |
 
 ## Change log
 
@@ -208,7 +358,8 @@ Parts and their status:
 | `b085b3f` | Step 1: package skeleton, `engine.py`, core engine tests |
 | `4bc7167` | Step 2: `market_scanner.py`, allocator tests (57 passed) |
 | `1ce1cfd` | RECONSTRUCTION.md covering steps 1–2 |
-| next | Fix E1, E5a, E6a in `engine.py`; two regression tests (62 passed) |
+| `1a0ce66` | Fix E1, E5a, E6a in `engine.py`; two regression tests (62 passed) |
+| step 3 | transform, pipeline, fitting, referee_job, backtest, and their tests (123 passed) |
 
 ### AGENT §2.1 gate record for the E1/E5a/E6a engine change
 

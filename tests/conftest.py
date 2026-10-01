@@ -1,0 +1,78 @@
+from __future__ import annotations
+
+import copy
+from typing import Any, Callable
+
+import pytest
+
+HOME_UID = "T-HOME"
+AWAY_UID = "T-AWAY"
+
+
+def make_fixture_payload(uid: str = "FX-1", n_players: int = 2) -> dict[str, Any]:
+    """A valid vendor stats payload: a 2-1 home win with possession and n players per side."""
+    players: list[dict[str, Any]] = []
+    for side, team_uid in (("h", HOME_UID), ("a", AWAY_UID)):
+        for i in range(n_players):
+            players.append({
+                "uid": f"{uid}-{side}{i}",
+                "name": f"Player {side}{i}",
+                "position": "DM",
+                "team_uid": team_uid,
+                "started": i == 0,
+                "stats": {
+                    "minutes": 90 if i == 0 else 25,
+                    "tackles_attempted": 4,
+                    "tackles_won": 2,
+                    "interceptions": 1,
+                    "dribbled_past": 1,
+                    "duels_total": 8,
+                    "duels_won": 5,
+                    "fouls_committed": 2,
+                    "fouls_drawn": 1,
+                    "yellow_cards": 0,
+                    "red_cards": 0,
+                    "zone14_entries": 0,
+                    "halfspace_entries": 1,
+                    "long_balls_targeted": 2,
+                },
+            })
+    return {
+        "fixture": {
+            "uid": uid,
+            "home_team_uid": HOME_UID,
+            "away_team_uid": AWAY_UID,
+            "kickoff_at": "2026-01-10T15:00:00+00:00",
+            "status": "final",
+            "home_score": 2,
+            "away_score": 1,
+            "matchday": 21,
+        },
+        "referee": {"uid": "R-1", "name": "Ref One"},
+        "teams": {HOME_UID: {"possession_pct": 58.0}, AWAY_UID: {"possession_pct": 42.0}},
+        "goals": [
+            {"minute": 20, "team_uid": HOME_UID},
+            {"minute": 55, "team_uid": AWAY_UID},
+            {"minute": 80, "team_uid": HOME_UID},
+        ],
+        "players": players,
+    }
+
+
+def make_lineup_payload(uid: str = "FX-1", n_bench: int = 3) -> dict[str, Any]:
+    lineups = {
+        team_uid: {
+            "starters": [f"{uid}-{side}s{i}" for i in range(11)],
+            "bench": [f"{uid}-{side}b{i}" for i in range(n_bench)],
+        }
+        for side, team_uid in (("h", HOME_UID), ("a", AWAY_UID))
+    }
+    return {"fixture": {"uid": uid, "home_team_uid": HOME_UID, "away_team_uid": AWAY_UID}, "lineups": lineups}
+
+
+@pytest.fixture
+def fixture_payload() -> Callable[..., dict[str, Any]]:
+    def factory(uid: str = "FX-1", n_players: int = 2) -> dict[str, Any]:
+        return copy.deepcopy(make_fixture_payload(uid, n_players))
+
+    return factory
