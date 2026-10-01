@@ -42,6 +42,11 @@ Mixed files list each part separately.
 | `tests/conftest.py` | none (shared payload builders) | RECONSTRUCTED | step 3 |
 | `tests/test_integrity.py` | ESSENTIALS §1.1, §2.3, §3.1; AGENT §3.3 boundary catalogue | RECONSTRUCTED | step 3 (SQL parts in step 4) |
 | `tests/test_pipeline_concurrency.py` (including the in-memory fakes) | ARCHITECTURE §2.1–§2.3; PRD §2.1, B1–B2; AGENT §3.3 | RECONSTRUCTED | step 3 |
+| `migrations/002_staging_and_indexes.sql` | refactor TASK 3 | VERBATIM (byte-exact; superseded by 003, never apply to a v3.2+ schema) **[U]** | step 4 |
+| `migrations/003_integrity_constraints.sql` | ESSENTIALS §3.4 | VERBATIM (byte-exact) **[U]** | step 4 |
+| `schema.sql` | ESSENTIALS §3.3 (`player_match_stats`, `odds_lines`), §3.4 (merge function); refactor TASK 3 (staging DDL); everything else from column usage in code and documents | Mixed: see [schema.sql](#schemasql-mixed-u) **[U]** | step 4 |
+| `ci/bootstrap.sh` | ESSENTIALS §4.3 | VERBATIM except `EXPECTED_TESTS` (as instructed) | step 4 |
+| `.gitattributes` | none (forces LF on `*.sh` and `*.sql`; bash rejects CRLF) | RECONSTRUCTED | step 4 |
 
 ## Interpretations by file
 
@@ -341,6 +346,85 @@ No code in any document; signatures are interpretations.
   - moving the vendor fetch inside `_with_transaction`: `3 failed, 10 passed`;
   - restored: `122 passed`.
 
+### `schema.sql` (mixed; [U])
+
+**Status [U]:** never executed against PostgreSQL. There is no PostgreSQL, Docker or psql on this
+machine.
+
+| Part | Status |
+|---|---|
+| `player_match_stats` and `odds_lines` | VERBATIM (ESSENTIALS §3.3) |
+| `staging_player_feed` and `staging_rejects` | VERBATIM (migration 002 DDL) |
+| `merge_staging_player_feed()` | VERBATIM, byte-identical to migration 003. A test enforces this (AGENT M4, Z5). |
+| `leagues`, `teams`, `players`, `referees`, `fixtures`, `lineup_expectations`, `raw_payloads`, `model_projections`, `bets`, indexes | RECONSTRUCTED |
+
+- **Q-S1 — Unqualified names.** The verbatim excerpts use unqualified table names, so the file runs
+  `CREATE SCHEMA IF NOT EXISTS prop_alpha; SET search_path TO prop_alpha, public;` and ends with
+  `RESET search_path`.
+- **Q-S2 — Reconstructed columns** come from what the code and the merge function read and write:
+  - `referees` has neutral defaults (SC 1, propensities 0, HBR 0), because the merge inserts only
+    name, league and UID;
+  - `raw_payloads.payload_sha256` is `UNIQUE`;
+  - `fixtures.vendor_fixture_uid`, `players.vendor_player_uid` and `teams.vendor_team_uid` are
+    `UNIQUE`, as the `ON CONFLICT` targets require.
+- **Q-S3 — Undocumented CHECKs added.** Each is parity-safe:
+  - `fixtures.status IN (…)`: L1 is `VALID_STATUSES`, L2 is the merge's status reject;
+  - `lineup_expectations.p_start` and `p_sub_appearance` in [0, 1]: L1 is `parse_lineup_payload` and
+    `LineupExpectation`. These rows bypass staging, so L2 is n/a, as for `odds_lines`;
+  - `leagues.tier BETWEEN 1 AND 6` and `bets.side`: no merge path.
+
+  No CHECK was added on a staged column without an L2 predicate.
+- **Q-S4 — Fillfactor.** `player_match_stats` gets `fillfactor = 90` through a following `ALTER TABLE`,
+  so the verbatim `CREATE TABLE` stays untouched. `lineup_expectations` declares it inline
+  (ARCHITECTURE §1.2 item 7).
+- **Q-S5 — Indexes:**
+  - `idx_odds_market_latest` and `idx_odds_fixture_captured` are documented;
+  - `idx_pms_player` (for the lineup `LATERAL` and history reads) and `idx_fixtures_league_kickoff`
+    (for `DISCIPLINE_SQL`) are additions;
+  - `idx_odds_captured_brin` is absent, as PRD Gate 1 requires.
+- **Q-S6 — `model_projections` and `bets`** are minimal reconstructions for the [N] ProjectionRefresh
+  and ledger writer. They hold only the columns PRD Gate 3 names (`is_paper`, `closing_line_id`,
+  `clv`, links to `projection_id` and `line_id`) plus the directive's sizing fields.
+
+### Migrations and CI
+
+- **M-1 — No migration 001.** The prompt asked for "001-003 as documented", but no document contains
+  or describes a migration 001. ESSENTIALS §1.1 ships only 002 and 003, and 002 is described as "v2 →
+  v3". The v2 base schema is not documented, so 001 was **not invented**. A v2 database cannot be
+  rebuilt from these files.
+- **M-2 — 002 is verbatim.** It has no warning header, because adding one would break "verbatim". The
+  never-apply-after-003 rule lives in CLAUDE.md, ESSENTIALS §1.1 and the `schema.sql` header.
+  `test_superseded_002_merge_lacks_minute_logic_predicates` documents why.
+- **M-3 — `bootstrap.sh` is the v3.2 script.** Its required-files list does not include
+  `tests/test_agent_contract.py` (added in v3.3). It was left as is, because the instruction was
+  verbatim except `EXPECTED_TESTS`.
+- **M-4 — Preflight at the step 4 checkpoint** failed as expected:
+  `FATAL: repository is missing tests/test_typing_contract.py`. That file is created in step 5.
+
+### Tests added in step 4 (`test_integrity.py`, +16 to 41)
+
+These are structural, read-only checks of the SQL text:
+- L2/L3 parity for every core CHECK, in `schema.sql` and in 003;
+- the merge function is identical in `schema.sql` and 003;
+- the 002 body is the superseded one;
+- `NOT VALID` inside the transaction, `VALIDATE` after `COMMIT`, and drops after validation;
+- `lock_timeout`, idempotency guards, no `TRUNCATE`;
+- concurrent index changes in 002;
+- the advisory-lock key equals `MERGE_LOCK_KEY`;
+- the lock is the first statement, then the single-statement drain, then the return signature;
+- lock-order `ORDER BY` and `staged_at DESC`;
+- staging DDL equals `STAGING_COLUMNS` (42 columns);
+- the stats DDL and the merge `INSERT` and `UPDATE` lists equal `STATS_COLUMNS`;
+- PostgreSQL 15 features;
+- application SQL references existing columns.
+
+**Proof of bite.** Three mutations were made to a copy:
+- deleting `OR c.minutes_played > 130` from 003;
+- appending a `TRUNCATE` to `schema.sql`;
+- the regex test fixed alongside.
+
+Result: `4 failed, 37 passed`. The restored files give `139 passed`.
+
 ## Open questions for the maintainer
 
 | ID | Question | Current behaviour |
@@ -359,7 +443,8 @@ No code in any document; signatures are interpretations.
 | `4bc7167` | Step 2: `market_scanner.py`, allocator tests (57 passed) |
 | `1ce1cfd` | RECONSTRUCTION.md covering steps 1–2 |
 | `1a0ce66` | Fix E1, E5a, E6a in `engine.py`; two regression tests (62 passed) |
-| step 3 | transform, pipeline, fitting, referee_job, backtest, and their tests (123 passed) |
+| `fe7a261` | Step 3: transform, pipeline, fitting, referee_job, backtest, and their tests (123 passed) |
+| step 4 | schema.sql, migrations 002–003, ci/bootstrap.sh, .gitattributes, SQL structure tests (139 passed) |
 
 ### AGENT §2.1 gate record for the E1/E5a/E6a engine change
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import Any, Callable, Sequence, cast
 
 import numpy as np
@@ -13,6 +15,8 @@ from prop_alpha.ingestion.transform import (
     build_stats_row,
     parse_fixture_payload,
 )
+from prop_alpha.calibration import referee_job
+from prop_alpha.ingestion import pipeline
 from prop_alpha.modeling.engine import GammaPosterior, QuantEngine, validate_exposure_vector
 
 PayloadFactory = Callable[..., dict[str, Any]]
@@ -177,8 +181,6 @@ class _RecordingConnection:
 def test_referee_job_takes_merge_lock_before_reading_and_updates_in_id_order(monkeypatch: pytest.MonkeyPatch) -> None:
     import psycopg2
 
-    from prop_alpha.calibration import referee_job
-
     connection = _RecordingConnection()
     monkeypatch.setattr(psycopg2, "connect", lambda dsn: connection)
     assert referee_job.run_referee_job("postgresql://unused", league_id=7) == 2
@@ -189,3 +191,189 @@ def test_referee_job_takes_merge_lock_before_reading_and_updates_in_id_order(mon
     updated_ids = [args[0] for kind, args in connection.log if kind == "row"]
     assert updated_ids == [1, 2]
     assert connection.closed
+
+
+# ---------------- SQL structure (schema.sql and migrations are [U]: never executed) ----------------
+ROOT = Path(__file__).resolve().parents[1]
+SCHEMA = (ROOT / "schema.sql").read_text(encoding="utf-8")
+MIGRATION_002 = (ROOT / "migrations" / "002_staging_and_indexes.sql").read_text(encoding="utf-8")
+MIGRATION_003 = (ROOT / "migrations" / "003_integrity_constraints.sql").read_text(encoding="utf-8")
+CORE_CONSTRAINTS = (
+    "chk_possession_bounds", "chk_minute_logic", "chk_tackles_won_le_attempted", "chk_duels_won_le_total",
+)
+ODDS_CONSTRAINTS = ("chk_price_realism", "chk_line_increment")
+
+# L2 reject predicate fragments required for each core CHECK (ARCHITECTURE-ESSENTIALS 3.1 parity table).
+REJECT_PREDICATES = {
+    "chk_possession_bounds": ("c.team_possession_pct NOT BETWEEN 0 AND 100",),
+    "chk_minute_logic": ("c.minute_off < c.minute_on", "c.minutes_played > 130"),
+    "chk_tackles_won_le_attempted": ("c.tackles_won > c.tackles_attempted",),
+    "chk_duels_won_le_total": ("c.duels_won > c.duels_total",),
+    "yellow_cards BETWEEN 0 AND 2": ("c.yellow_cards NOT BETWEEN 0 AND 2",),
+    "red_cards BETWEEN 0 AND 1": ("c.red_cards NOT BETWEEN 0 AND 1",),
+    "minutes_played >= 0": ("c.minutes_played < 0",),
+    "minute_on >= 0": ("c.minute_on < 0",),
+    "minute_off >= 0": ("c.minute_off < 0",),
+}
+
+
+def _strip_comments(sql: str) -> str:
+    return re.sub(r"--[^\n]*", "", sql)
+
+
+def _merge_function(sql: str) -> str:
+    start = sql.index("CREATE OR REPLACE FUNCTION prop_alpha.merge_staging_player_feed()")
+    return sql[start:sql.index("$$;", start) + 3]
+
+
+def _player_reject_block(function: str) -> str:
+    end = function.index("'player row violates core constraints'")
+    return function[function.rindex("WITH bad AS", 0, end):end]
+
+
+def _table_columns(sql: str, table: str) -> list[str]:
+    pattern = rf"CREATE (?:UNLOGGED )?TABLE (?:IF NOT EXISTS )?(?:prop_alpha\.)?{table} \((.*?)\n\)"
+    match = re.search(pattern, sql, re.S)
+    assert match, f"table {table} not found"
+    columns = []
+    for line in _strip_comments(match.group(1)).splitlines():
+        token = line.strip().split(" ")[0] if line.strip() else ""
+        if token and token.upper() not in ("CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK") and not token.startswith("("):
+            columns.append(token)
+    return columns
+
+
+def _merge_stats_insert_columns(function: str) -> list[str]:
+    match = re.search(r"INSERT INTO prop_alpha\.player_match_stats AS s \((.*?)\)\s*SELECT", function, re.S)
+    assert match
+    return [column.strip() for column in match.group(1).replace("\n", " ").split(",")]
+
+
+@pytest.mark.parametrize("source", ["schema.sql", "003"])
+def test_merge_rejects_every_row_a_core_constraint_would_refuse(source: str) -> None:
+    block = _player_reject_block(_merge_function(SCHEMA if source == "schema.sql" else MIGRATION_003))
+    for constraint, fragments in REJECT_PREDICATES.items():
+        for fragment in fragments:
+            assert fragment in block, f"{constraint}: missing L2 predicate {fragment!r}"
+    for constraint in CORE_CONSTRAINTS:
+        assert f"CONSTRAINT {constraint}" in SCHEMA
+
+
+def test_merge_function_identical_in_schema_and_latest_migration() -> None:
+    assert _merge_function(SCHEMA) == _merge_function(MIGRATION_003)
+
+
+def test_superseded_002_merge_lacks_minute_logic_predicates() -> None:
+    old = _player_reject_block(_merge_function(MIGRATION_002))
+    assert "c.minutes_played > 130" not in old and "c.minute_off < c.minute_on" not in old
+    assert _merge_function(MIGRATION_002) != _merge_function(SCHEMA)
+
+
+def test_migration_adds_not_valid_then_validates() -> None:
+    begin, commit = MIGRATION_003.index("\nBEGIN;"), MIGRATION_003.index("\nCOMMIT;")
+    transaction, after = MIGRATION_003[begin:commit], MIGRATION_003[commit:]
+    assert "ADD CONSTRAINT %I %s NOT VALID" in transaction
+    for constraint in CORE_CONSTRAINTS + ODDS_CONSTRAINTS:
+        assert f"'{constraint}'" in transaction
+        assert f"VALIDATE CONSTRAINT {constraint};" in after
+        assert f"VALIDATE CONSTRAINT {constraint}" not in transaction
+    last_validate = after.rindex("VALIDATE CONSTRAINT")
+    drops = [m.start() for m in re.finditer(r"DROP CONSTRAINT IF EXISTS \w+", after)]
+    assert drops and all(position > last_validate for position in drops)
+
+
+def test_migration_adds_constraints_without_scanning_and_is_idempotent() -> None:
+    body = _strip_comments(MIGRATION_003)
+    assert body.lstrip().startswith("SET lock_timeout = '5s';")
+    assert "SELECT 1 FROM pg_constraint WHERE conrelid = spec.tbl AND conname = spec.conname" in body
+    assert "IF NOT EXISTS (" in body
+    assert "CREATE OR REPLACE FUNCTION" in body
+    assert not re.search(r"ADD CONSTRAINT(?![^\n]*NOT VALID)", body)
+    assert "RESET lock_timeout;" in body
+    for statement in ("TRUNCATE", "VACUUM FULL", "CLUSTER", "ALTER COLUMN"):
+        assert statement not in body
+
+
+def test_index_changes_in_002_are_concurrent_and_outside_the_transaction() -> None:
+    after_commit = MIGRATION_002[MIGRATION_002.index("\nCOMMIT;"):]
+    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_odds_fixture_captured" in after_commit
+    assert "DROP INDEX CONCURRENTLY IF EXISTS prop_alpha.idx_odds_captured_brin" in after_commit
+
+
+def test_referee_job_shares_merge_advisory_lock_key() -> None:
+    for sql in (SCHEMA, MIGRATION_003):
+        keys = re.findall(r"pg_advisory_xact_lock\(hashtext\('([^']+)'\)\)", sql)
+        assert keys == [referee_job.MERGE_LOCK_KEY]
+
+
+@pytest.mark.parametrize("source", ["schema.sql", "003"])
+def test_merge_drains_by_single_delete_returning_after_taking_the_lock(source: str) -> None:
+    function = _merge_function(SCHEMA if source == "schema.sql" else MIGRATION_003)
+    body = _strip_comments(function[function.index("\nBEGIN\n"):])
+    statements = [line.strip() for line in body.splitlines() if line.strip()]
+    assert statements[0] == "BEGIN"
+    assert statements[1] == "PERFORM pg_advisory_xact_lock(hashtext('prop_alpha.merge_staging_player_feed'));"
+    drain = (
+        "WITH drained AS (\n        DELETE FROM prop_alpha.staging_player_feed RETURNING *\n    )\n"
+        "    INSERT INTO claimed_feed SELECT * FROM drained;"
+    )
+    assert drain in function
+    assert "RETURNS TABLE (fixtures_merged integer, player_rows_merged integer, rows_rejected integer)" in function
+    for column in ("fixtures_merged", "player_rows_merged", "rows_rejected"):
+        assert column in pipeline.MERGE_SQL
+
+
+def test_no_truncate_in_any_sql() -> None:
+    for sql in (SCHEMA, MIGRATION_002, MIGRATION_003):
+        assert "TRUNCATE" not in _strip_comments(sql).upper()
+
+
+def test_merge_upserts_order_by_conflict_key_and_keep_latest_row() -> None:
+    function = _merge_function(SCHEMA)
+    assert "ORDER BY c.referee_uid, c.staged_at DESC" in function
+    assert "ORDER BY cf.vendor_fixture_uid, cf.staged_at DESC" in function
+    assert "ORDER BY c.vendor_player_uid, c.staged_at DESC" in function
+    assert "ORDER BY cf.vendor_fixture_uid, cf.vendor_player_uid, cf.staged_at DESC" in function
+    assert "ORDER BY f.fixture_id, p.player_id\n    ON CONFLICT (fixture_id, player_id)" in function
+
+
+def test_staging_ddl_matches_staging_columns() -> None:
+    columns = _table_columns(SCHEMA, "staging_player_feed")
+    assert columns == ["batch_id", "staged_at", *STAGING_COLUMNS[1:]]
+    assert len(columns) == 42
+    assert "CREATE UNLOGGED TABLE IF NOT EXISTS prop_alpha.staging_player_feed" in SCHEMA
+
+
+def test_core_stats_ddl_and_merge_lists_match_stats_columns() -> None:
+    assert _table_columns(SCHEMA, "player_match_stats") == [*STATS_COLUMNS, "source_updated_at"]
+    function = _merge_function(SCHEMA)
+    assert _merge_stats_insert_columns(function) == list(STATS_COLUMNS)
+    update_set = function[function.index("ON CONFLICT (fixture_id, player_id) DO UPDATE SET"):]
+    for column in STATS_COLUMNS[2:]:
+        assert re.search(rf"\b{column}\s+= EXCLUDED\.{column}\b", update_set), column
+
+
+def test_schema_declares_postgres_15_and_named_odds_constraints() -> None:
+    assert "CONSTRAINT uq_odds_snapshot UNIQUE NULLS NOT DISTINCT" in SCHEMA
+    for constraint in ODDS_CONSTRAINTS + ("chk_some_price",):
+        assert f"CONSTRAINT {constraint}" in SCHEMA
+    assert "idx_odds_fixture_captured" in SCHEMA and "idx_odds_captured_brin" not in SCHEMA
+    assert ") WITH (fillfactor = 90);" in SCHEMA
+    assert "ALTER TABLE player_match_stats SET (fillfactor = 90);" in SCHEMA
+
+
+def test_application_sql_references_existing_columns() -> None:
+    raw = set(_table_columns(SCHEMA, "raw_payloads"))
+    assert {"source", "vendor_fixture_uid", "payload", "payload_sha256"} <= raw
+    lineup = set(_table_columns(SCHEMA, "lineup_expectations"))
+    insert = re.search(r"lineup_expectations AS le\s*\((.*?)\)", pipeline.LINEUP_UPSERT_SQL, re.S)
+    assert insert and {c.strip() for c in insert.group(1).split(",")} <= lineup
+    referees = set(_table_columns(SCHEMA, "referees"))
+    updated = set(re.findall(r"(\w+)\s+= v\.", referee_job.UPDATE_SQL))
+    assert updated == {
+        "referee_id", "foul_strictness_coefficient", "yellow_card_propensity", "red_card_propensity", "home_bias_ratio",
+    }
+    assert updated <= referees
+    stats = set(_table_columns(SCHEMA, "player_match_stats"))
+    assert {"fouls_committed", "yellow_cards", "red_cards", "is_home"} <= stats
+    assert {"status", "referee_id", "league_id", "kickoff_at"} <= set(_table_columns(SCHEMA, "fixtures"))
