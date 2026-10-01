@@ -47,6 +47,8 @@ Mixed files list each part separately.
 | `schema.sql` | ESSENTIALS §3.3 (`player_match_stats`, `odds_lines`), §3.4 (merge function); refactor TASK 3 (staging DDL); everything else from column usage in code and documents | Mixed: see [schema.sql](#schemasql-mixed-u) **[U]** | step 4 |
 | `ci/bootstrap.sh` | ESSENTIALS §4.3 | VERBATIM except `EXPECTED_TESTS` (as instructed) | step 4 |
 | `.gitattributes` | none (forces LF on `*.sh` and `*.sql`; bash rejects CRLF) | RECONSTRUCTED | step 4 |
+| `tests/test_typing_contract.py` | ESSENTIALS §2.1 R-TYPE-1 to R-TYPE-3 | RECONSTRUCTED | step 5 |
+| `tests/test_agent_contract.py` | AGENT §1.1 A3–A4, §1.2 Z1, §1.3 F2–F6, §1.4 P1–P5, §2.1 G1 | RECONSTRUCTED | step 5 |
 
 ## Interpretations by file
 
@@ -399,7 +401,8 @@ machine.
   `tests/test_agent_contract.py` (added in v3.3). It was left as is, because the instruction was
   verbatim except `EXPECTED_TESTS`.
 - **M-4 — Preflight at the step 4 checkpoint** failed as expected:
-  `FATAL: repository is missing tests/test_typing_contract.py`. That file is created in step 5.
+  `FATAL: repository is missing tests/test_typing_contract.py`. That file is created in step 5, and
+  the step 5 preflight passes.
 
 ### Tests added in step 4 (`test_integrity.py`, +16 to 41)
 
@@ -425,6 +428,55 @@ These are structural, read-only checks of the SQL text:
 
 Result: `4 failed, 37 passed`. The restored files give `139 passed`.
 
+### Contract suites (step 5)
+
+**`tests/test_typing_contract.py` (27 tests):**
+- the three documented rules (postponed annotations, full annotations including closures, `Final`
+  module constants), each parametrized over the 7 package modules. That gives the documented 21
+  ("3 per module").
+- `test_every_package_marker_is_empty` (ESSENTIALS §1.2: the markers must have no side effects).
+- 5 detector self-tests that feed deliberate violations to the rule functions.
+
+Interpretations:
+- **TC1 — Upper-case names.** "Module-level UPPER_CASE" is matched as `^_?[A-Z][A-Z0-9_]*$`, so
+  private constants such as `_FIXTURE_PREFIX_WIDTH` must also be `Final`.
+- **TC2 — Exemptions.** `TypeVar` is exempt (R-TYPE-3). So is the first parameter of a
+  non-static method when it is named `self` or `cls`.
+
+**`tests/test_agent_contract.py` (39 tests):**
+
+| AGENT rule | Test(s) |
+|---|---|
+| F2 | `test_only_sanctioned_exception_handlers_exist`: set equality with `SANCTIONED_HANDLERS`, i.e. (module, enclosing function, unparsed exception type) for H1–H5 |
+| F2, F3 | `test_every_handler_records_or_reraises`: a call or `raise` in every handler body; no bare `except`; no `contextlib.suppress` |
+| H3 ordering | `test_statement_timeout_is_caught_before_retryable_errors`; `putconn` in `finally` |
+| F6 | `test_cli_exit_code_signals_an_incomplete_slate`: `main()` returns 1 when a fixture timed out, driven through stubs |
+| P1 | `test_pure_modules_import_no_io_libraries` (×5) |
+| P2 | `test_pure_functions_accept_no_database_or_session_handles` (×5) |
+| P5 | `test_pure_modules_read_no_clock_environment_or_random_state` (×5): no `datetime.now`, `time.*`, `os.environ`/`getenv`, `random.*` or `np.random.*` calls |
+| P3 | `test_with_transaction_is_the_single_connection_acquisition_site`; `test_fetch_and_parse_complete_before_the_transaction` (×2): calls precede `_with_transaction`, and the closure contains no fetch or parse |
+| P4 | `test_referee_job_defers_its_database_driver_import`: AST check, plus a subprocess importing the pure core with `psycopg2` blocked |
+| Z1 | `test_no_placeholders_or_truncation_markers`: placeholder markers, `pass`/`...` bodies outside `Protocol` classes, `raise NotImplementedError`; scans package, tests, SQL and CI |
+| G1 | `test_engine_contains_no_raw_moment_subtraction`: any `a - b**2`, `a - b*b`, `a - outer(…)` or `a - square(…)` in `engine.py`; `test_return_moments_documents_its_condition_number_bound` |
+| A3 | `test_risk_defaults_and_numerical_bounds_are_unchanged`: every `InstitutionalAssetManager` default, plus `MIN`/`MAX_RELATIVE_VARIANCE`, `MAX_MATCH_MINUTES` and `DEGENERATE_LOSS_PROBABILITY` |
+| A4 | `test_no_secrets_in_repository_files`: Telegram-token, live-key, inline-password DSN and private-key patterns in every repository file except `.env` (gitignored) and virtualenvs. `${VAR}` placeholders are allowed. |
+| (all) | `test_contract_detectors_flag_deliberate_violations` (×12): each detector fires on a deliberate violation |
+
+- **AC1 — No clamp detector.** AGENT F5 ("the only clamp") has no static test. Distinguishing a
+  clamp from legitimate bounds handling (for example SLSQP's `np.clip` back onto the box, or
+  `padj_scale`'s documented [1, 99] clip) needs judgement. It is enforced by review only.
+- **AC2 — Count above target.** The documented breakdown is 27 agent-contract tests. This
+  reconstruction has 39, because P5, A3, A4, F6 and the detector self-tests are counted separately.
+  None is a duplicate.
+
+**Proof of bite on a scratch copy:**
+
+| Mutation | Result |
+|---|---|
+| A silent `except ZeroDivisionError: pass` in `engine.py`, `import requests` in `transform.py`, and a placeholder marker in `fitting.py` | `3 failed, 35 passed` |
+| (same, after fixing the detector) | The marker was **not** caught at first. The regex's final `\b` was in a non-raw string, so it was a backspace. Fixed, and a text-marker detector case added. The marker alone then gives `1 failed, 38 passed`. |
+| Restored | `205 passed` |
+
 ## Open questions for the maintainer
 
 | ID | Question | Current behaviour |
@@ -444,7 +496,8 @@ Result: `4 failed, 37 passed`. The restored files give `139 passed`.
 | `1ce1cfd` | RECONSTRUCTION.md covering steps 1–2 |
 | `1a0ce66` | Fix E1, E5a, E6a in `engine.py`; two regression tests (62 passed) |
 | `fe7a261` | Step 3: transform, pipeline, fitting, referee_job, backtest, and their tests (123 passed) |
-| step 4 | schema.sql, migrations 002–003, ci/bootstrap.sh, .gitattributes, SQL structure tests (139 passed) |
+| `a25ab8c` | Step 4: schema.sql, migrations 002–003, ci/bootstrap.sh, .gitattributes, SQL structure tests (139 passed) |
+| step 5 | Typing and agent contract suites; `EXPECTED_TESTS=205` (205 passed; preflight passed) |
 
 ### AGENT §2.1 gate record for the E1/E5a/E6a engine change
 

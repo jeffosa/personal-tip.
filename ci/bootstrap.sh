@@ -25,7 +25,7 @@ readonly ARTIFACT_DIR="${PROP_ALPHA_ARTIFACT_DIR:-${REPO_ROOT}/ci-artifacts}"
 readonly PIP_VERSION="26.2.1"
 readonly MIN_PYTHON_MAJOR=3
 readonly MIN_PYTHON_MINOR=12
-readonly EXPECTED_TESTS=139
+readonly EXPECTED_TESTS=205
 
 log() { printf '%s [ci] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { log "FATAL: $*" >&2; exit 1; }
