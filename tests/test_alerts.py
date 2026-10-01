@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 import requests
 
@@ -12,11 +13,14 @@ from prop_alpha.alerts.telegram import (
     TelegramConfig,
     TelegramError,
     TelegramNotifier,
+    demo_case,
     format_directive,
     load_config,
     parse_env_file,
+    reference_projection,
     reference_report,
 )
+from prop_alpha.scanner.value_screen import HighValueCriteria, assess_high_value
 
 # Assembled at runtime so the repository secrets scan never sees a token-shaped literal.
 FAKE_TOKEN = "123456789" + ":" + "AAH" + "x" * 32
@@ -82,11 +86,16 @@ def test_config_rejects_missing_or_malformed_credentials() -> None:
     assert TelegramConfig.from_sources({}, f"TELEGRAM_BOT_TOKEN={FAKE_TOKEN}\n").chat_id is None
 
 
-def test_alert_text_carries_the_paper_label_and_the_directive() -> None:
-    directive = next(d for d in reference_report(NOW).directives if d.line_value == 1.5)
-    text = format_directive(directive, "GBP")
+def test_alert_text_carries_the_paper_label_and_the_screen_evidence() -> None:
+    projections, report = demo_case(NOW)
+    directive = next(d for d in report.directives if d.line_value == 4.5)
+    assessment = assess_high_value(directive, projections[(1001, 55, "tackles")], HighValueCriteria(),
+                                   np.random.default_rng(1))
+    text = format_directive(directive, assessment, "GBP")
     assert text.startswith(PAPER_LABEL)
-    assert "OVER 1.5" in text and f"GBP {directive.stake:.2f}" in text and "player 55" in text
+    assert "HIGH-VALUE BET" in text and "UNDER 4.5" in text and f"GBP {directive.stake:.2f}" in text
+    assert f"{assessment.surviving_simulations} of 1000 simulated match conditions" in text
+    assert "Expected profit +8.00% per 1 staked" in text
 
 
 def test_check_connection_and_send_message_call_the_bot_api() -> None:
@@ -97,25 +106,39 @@ def test_check_connection_and_send_message_call_the_bot_api() -> None:
     assert session.calls[1][1] == {"chat_id": "987654321", "text": "hello", "disable_web_page_preview": True}
 
 
-def test_notify_sends_each_directive_once() -> None:
-    report = reference_report(NOW)
+def test_notify_sends_only_high_value_bets_and_each_once() -> None:
+    projections, report = demo_case(NOW)
     assert len(report.directives) == 2
-    notifier, session = _notifier(*(_ok({"message_id": i}) for i in range(2)))
-    assert notifier.notify(report) == [0, 1]
-    assert notifier.notify(report) == []
-    assert len(session.calls) == 2
-
-
-def test_notify_respects_the_ev_floor_and_ignores_sub_minimum_stakes() -> None:
-    report = reference_report(NOW)
     notifier, session = _notifier(_ok({"message_id": 1}))
-    assert notifier.notify(report, min_ev_per_unit=0.061) == [1]
-    assert "OVER 2.5" in session.calls[0][1]["text"]
-    sub_minimum = reference_report(NOW)
-    sub_minimum.skipped_directives.extend(sub_minimum.directives)
-    sub_minimum.directives.clear()
+    assert notifier.notify(report, projections) == [1]
+    assert notifier.notify(report, projections) == []
+    assert len(session.calls) == 1
+    assert "UNDER 4.5" in session.calls[0][1]["text"]
+
+
+def test_reference_bets_are_screened_out() -> None:
+    report = reference_report(NOW)
+    notifier, session = _notifier()
+    assert notifier.notify(report, {(1001, 55, "tackles"): reference_projection()}) == []
+    assert session.calls == []
+
+
+def test_stricter_criteria_and_sub_minimum_stakes_send_nothing() -> None:
+    projections, report = demo_case(NOW)
+    strict, strict_session = _notifier()
+    assert strict.notify(report, projections, HighValueCriteria(min_ev_per_unit=0.09)) == []
+    assert strict_session.calls == []
+    report.skipped_directives.extend(report.directives)
+    report.directives.clear()
     quiet, quiet_session = _notifier()
-    assert quiet.notify(sub_minimum) == [] and quiet_session.calls == []
+    assert quiet.notify(report, projections) == [] and quiet_session.calls == []
+
+
+def test_directive_without_projection_cannot_be_screened() -> None:
+    _, report = demo_case(NOW)
+    notifier, _ = _notifier()
+    with pytest.raises(ValueError, match="cannot be screened"):
+        notifier.notify(report, {})
 
 
 def test_telegram_rejection_raises_without_the_token() -> None:

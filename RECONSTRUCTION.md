@@ -50,7 +50,8 @@ Mixed files list each part separately.
 | `tests/test_typing_contract.py` | ESSENTIALS §2.1 R-TYPE-1 to R-TYPE-3 | RECONSTRUCTED | step 5 |
 | `tests/test_agent_contract.py` | AGENT §1.1 A3–A4, §1.2 Z1, §1.3 F2–F6, §1.4 P1–P5, §2.1 G1 | RECONSTRUCTED | step 5 |
 | `prop_alpha/alerts/__init__.py`, `prop_alpha/alerts/telegram.py` | **Not in any document.** New feature requested by the maintainer after step 2. | NEW | step 6 |
-| `tests/test_alerts.py` | none | NEW | step 6 |
+| `tests/test_alerts.py` | none | NEW | step 6 (updated step 7) |
+| `prop_alpha/scanner/value_screen.py`, `tests/test_value_screen.py` | **Not in any document.** High-value definition set by the maintainer. | NEW | step 7 |
 | `.env.example` | none (empty template; the real `.env` is gitignored) | NEW | step 6 |
 | `AGENT.md` (row H6), `CLAUDE.md` (I/O isolation, secrets, alert commands) | edited to match step 6 | EDITED | step 6 |
 
@@ -535,6 +536,58 @@ with the API key kept out of the code base and out of git.
   machine, and that the error path is sanitised.
 - **The maintainer's own bot has not been contacted.** The token pasted in chat must be revoked and
   was written nowhere. `--check` with the new token in `.env` is the remaining step.
+
+### Step 7 — High-value bet screen (NEW, not part of v3.3)
+
+The maintainer defined a **high-value bet**, and only those are sent to Telegram. The thresholds were
+chosen in this session: 4% minimum return, and "edge survives" as the meaning of the 60% rule.
+
+A high-value bet must pass all three of these:
+1. **Mispriced.** The model's win probability, given the bet settles, is above the book's devigged
+   probability for that side, or above 1/odds when the book quotes one side only.
+2. **At least 4% expected profit per 1 unit staked:** `HighValueCriteria.min_ev_per_unit = 0.04`.
+3. **The edge survives.** In **more than** 60% of 1,000 simulated match conditions, the bet still
+   returns at least 4% at the book's price. Exactly 600/1000 fails.
+
+**What a simulated condition varies** (only what the model has data for, as the maintainer chose):
+- the player's situation, drawn from `LineupExpectation`: start, substitute or absent;
+- the match rate λ ~ Gamma(shape, rate) from the projection. This carries game-state
+  overdispersion k, posterior uncertainty and the referee adjustment.
+
+Given a condition, the count is Poisson(λ·t), so the EV in that condition is exact. Averaging the
+conditions reproduces the NB prices; a test checks this. Each directive's simulation is seeded by
+SHA-256 of its key, so re-runs give the same count.
+
+**Not simulated** (no data): weather, formation and fitness. Referee *uncertainty* is not simulated
+either, because the referee job produces point estimates only.
+
+**Interpretations:**
+- **V1 — Void conditions never count as surviving.** A condition in which the bet is void (EV 0), for
+  example the player not appearing, never survives. So a player with a 40% chance of missing the
+  match cannot qualify.
+- **V2 — Mispricing is nearly implied by EV.** With a normal book margin, EV > 0 already implies the
+  model probability is above the devigged book probability. Test 1 only bites when the book's two
+  sides sum to less than 1, i.e. an arbitrage.
+- **V3 — Consequence: the 60% rule favours Unders.** An Over profits only when the player has an
+  above-average match, and the Gamma distribution puts more than half its mass below its mean. On
+  the documented reference case:
+  - Over 1.5 (+6.0%) survives 539/1000 and Over 2.5 (+6.2%) 457/1000, so neither qualifies;
+  - Under 4.5 at +8% survives 684–698/1000 and qualifies.
+- **V4 — A thin edge rarely qualifies.** A bet just above 4% rarely passes, because any condition
+  worse than average pushes it below 4%. Even a very stable player (shape 400) at +4.5% survives only
+  727/1000.
+- **V5 — The screen does not change the allocator.** It filters alerts only. `allocate`, its risk
+  defaults and the stakes are unchanged (AGENT A3).
+- **V6 — Pure module.** `value_screen.py` follows the pure-module rules (no I/O, randomness only
+  through an explicit `rng`), and was added to `PURE_MODULES` in the agent contract.
+
+**Proof of bite on a scratch copy:**
+
+| Mutation | Result |
+|---|---|
+| Accept exactly 60% | `1 failed` |
+| Drop the 4% gate | first **not** caught, because the low-EV test bet also failed the simulation; after adding `test_high_value_requires_all_three_conditions`: `1 failed, 16 passed` |
+| Restored | `245 passed` |
 
 ## Open questions for the maintainer
 

@@ -9,15 +9,20 @@ Telegram puts the token in the request URL, and `requests` error messages quote 
 transport error is re-raised as TelegramError without the URL (sanctioned handler H6). The token never
 appears in a repr, log line or exception message.
 
+Only high-value bets are sent (prop_alpha.scanner.value_screen): mispriced by the book, at least 4%
+expected profit per unit staked, and an edge that still returns at least 4% in more than 60% of 1,000
+simulated match conditions.
+
 Usage:
     python -m prop_alpha.alerts.telegram --check        # getMe + one test message
     python -m prop_alpha.alerts.telegram --get-chat-id  # list chats that have messaged the bot
-    python -m prop_alpha.alerts.telegram --demo         # synthetic reference-case directives, labelled
+    python -m prop_alpha.alerts.telegram --demo         # synthetic directives, screened, labelled
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import re
@@ -27,16 +32,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Final, Mapping
 
+import numpy as np
 import requests
 
-from prop_alpha.modeling.engine import LineupExpectation, QuantEngine, RefereeProfile
+from prop_alpha.modeling.engine import LineupExpectation, PropProjection, QuantEngine, RefereeProfile
 from prop_alpha.scanner.market_scanner import (
     AllocationReport,
     InstitutionalAssetManager,
     LiveOddsQuote,
+    ProjectionKey,
     StakingDirective,
     price_for_ev,
 )
+from prop_alpha.scanner.value_screen import HighValueAssessment, HighValueCriteria, assess_high_value
 
 logger = logging.getLogger("prop_alpha.alerts")
 
@@ -107,17 +115,27 @@ def directive_key(directive: StakingDirective) -> DirectiveKey:
     )
 
 
-def format_directive(directive: StakingDirective, bankroll_currency: str = "") -> str:
+def simulation_seed(directive: StakingDirective) -> int:
+    """Stable seed per directive (sha256, not hash(), which is salted per process), so re-runs agree."""
+    return int.from_bytes(hashlib.sha256(repr(directive_key(directive)).encode("utf-8")).digest()[:8], "big")
+
+
+def format_directive(
+    directive: StakingDirective, assessment: HighValueAssessment, bankroll_currency: str = ""
+) -> str:
     """Plain-text alert (no parse_mode, so nothing needs escaping)."""
     currency = f"{bankroll_currency} " if bankroll_currency else ""
-    fair = "" if directive.fair_market_prob is None else f" | book fair p {directive.fair_market_prob:.1%}"
     return "\n".join((
         PAPER_LABEL,
+        "HIGH-VALUE BET",
         f"Fixture {directive.fixture_id} | player {directive.player_id} | {directive.market_type}",
         f"{directive.side.upper()} {directive.line_value:g} @ {directive.decimal_odds:.3f} "
         f"({directive.sportsbook}, {directive.void_rule})",
-        f"EV {directive.ev_per_unit:+.2%} per unit | model p(win) {directive.p_win:.1%} "
-        f"p(lose) {directive.p_lose:.1%} p(void) {directive.p_void:.1%}{fair}",
+        f"Mispriced: model win chance {assessment.model_win_probability:.1%} vs book "
+        f"{assessment.book_win_probability:.1%}",
+        f"Expected profit {assessment.ev_per_unit:+.2%} per 1 staked",
+        f"Edge held in {assessment.surviving_simulations} of {assessment.n_simulations} simulated match "
+        f"conditions ({assessment.survival_rate:.1%})",
         f"Suggested stake {currency}{directive.stake:.2f} ({directive.fraction:.3%} of bankroll)",
     ))
 
@@ -171,31 +189,56 @@ class TelegramNotifier:
         )
         return int(result["message_id"])
 
-    def notify(self, report: AllocationReport, min_ev_per_unit: float = 0.0, bankroll_currency: str = "") -> list[int]:
-        """Send each directive in report.directives with EV >= min_ev_per_unit that has not been sent yet.
+    def notify(
+        self,
+        report: AllocationReport,
+        projections: Mapping[ProjectionKey, PropProjection],
+        criteria: HighValueCriteria = HighValueCriteria(),
+        bankroll_currency: str = "",
+    ) -> list[int]:
+        """Send each not-yet-sent directive in report.directives that passes the high-value screen.
 
-        Sub-minimum stakes (report.skipped_directives) and skipped markets are never sent. A failed send
+        Sub-minimum stakes (report.skipped_directives) and skipped markets are never screened or sent.
+        A directive without its projection raises ValueError (it cannot be screened). A failed send
         raises TelegramError; directives sent before it stay marked as sent.
         """
         message_ids: list[int] = []
         for directive in report.directives:
             key = directive_key(directive)
-            if directive.ev_per_unit < min_ev_per_unit or key in self._sent:
+            if key in self._sent:
                 continue
-            message_ids.append(self.send_message(format_directive(directive, bankroll_currency)))
+            projection = projections.get((directive.fixture_id, directive.player_id, directive.market_type))
+            if projection is None:
+                raise ValueError(f"no projection for directive {key}; it cannot be screened")
+            assessment = assess_high_value(
+                directive, projection, criteria, np.random.default_rng(simulation_seed(directive))
+            )
+            if not assessment.is_high_value:
+                logger.info(
+                    "not high value %s: mispriced=%s ev=%.4f survived %d/%d",
+                    key, assessment.mispriced, assessment.ev_per_unit,
+                    assessment.surviving_simulations, assessment.n_simulations,
+                )
+                continue
+            message_ids.append(self.send_message(format_directive(directive, assessment, bankroll_currency)))
             self._sent.add(key)
             logger.info("alert sent for %s", key)
         return message_ids
 
 
-def reference_report(now: datetime) -> AllocationReport:
-    """The documented reference allocation (ARCHITECTURE 4.2) on synthetic quotes."""
-    projection = QuantEngine(game_state_k=6.0).project_count_market(
+def reference_projection() -> PropProjection:
+    """The documented reference projection (ARCHITECTURE 4.1): tackles, fixture 1001, player 55."""
+    return QuantEngine(game_state_k=6.0).project_count_market(
         fixture_id=1001, player_id=55, market_type="tackles",
         counts=[3, 2, 4, 3, 1, 3], minutes=[90.0, 90.0, 90.0, 85.0, 90.0, 90.0],
         league_rate_per90=2.2, referee=RefereeProfile(1.0, 0.13, 0.004, 0.0), is_home=True,
         lineup=LineupExpectation(0.92, 0.05, 86.0, 20.0),
     )
+
+
+def reference_report(now: datetime) -> AllocationReport:
+    """The documented reference allocation (ARCHITECTURE 4.2) on synthetic quotes."""
+    projection = reference_projection()
     quotes = [
         LiveOddsQuote(
             1001, 55, "tackles", line,
@@ -206,6 +249,26 @@ def reference_report(now: datetime) -> AllocationReport:
         for line, ev, book in ((1.5, 0.060, "SyntheticBookA"), (2.5, 0.062, "SyntheticBookB"))
     ]
     return InstitutionalAssetManager(bankroll=10_000.0).allocate({(1001, 55, "tackles"): projection}, quotes, now=now)
+
+
+def demo_case(now: datetime) -> tuple[dict[ProjectionKey, PropProjection], AllocationReport]:
+    """Reference quotes plus a synthetic Under 4.5 priced at +8% EV, which passes the screen."""
+    projection = reference_projection()
+    quotes = [
+        LiveOddsQuote(
+            1001, 55, "tackles", line,
+            over_price=price_for_ev(projection.side_probabilities(line, "over"), over_ev),
+            under_price=price_for_ev(projection.side_probabilities(line, "under"), under_ev),
+            max_stake=500.0, sportsbook=book, captured_at=now,
+        )
+        for line, over_ev, under_ev, book in (
+            (1.5, 0.060, -0.10, "SyntheticBookA"),
+            (2.5, 0.062, -0.10, "SyntheticBookB"),
+            (4.5, -0.10, 0.080, "SyntheticBookC"),
+        )
+    ]
+    projections = {(1001, 55, "tackles"): projection}
+    return projections, InstitutionalAssetManager(bankroll=10_000.0).allocate(projections, quotes, now=now)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -235,10 +298,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"test message delivered (message_id {message_id})")
         return 0
-    report = reference_report(datetime.now(timezone.utc))
-    notifier.send_message("SYNTHETIC DEMO: the alerts below use made-up quotes on the documented reference case.")
-    sent = notifier.notify(report)
-    print(f"demo: {len(sent)} synthetic directive alerts delivered")
+    projections, report = demo_case(datetime.now(timezone.utc))
+    criteria = HighValueCriteria()
+    for directive in report.directives:
+        assessment = assess_high_value(
+            directive, projections[(directive.fixture_id, directive.player_id, directive.market_type)],
+            criteria, np.random.default_rng(simulation_seed(directive)),
+        )
+        print(
+            f"{directive.side} {directive.line_value:g} @ {directive.decimal_odds:.3f}: "
+            f"mispriced={assessment.mispriced} ev={assessment.ev_per_unit:+.2%} "
+            f"survived {assessment.surviving_simulations}/{assessment.n_simulations} "
+            f"-> {'HIGH VALUE' if assessment.is_high_value else 'not high value'}"
+        )
+    notifier.send_message("SYNTHETIC DEMO: the alert below uses made-up quotes on the documented reference case.")
+    sent = notifier.notify(report, projections, criteria)
+    print(f"demo: {len(sent)} of {len(report.directives)} synthetic directives passed the screen and were sent")
     return 0
 
 

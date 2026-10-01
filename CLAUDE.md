@@ -61,7 +61,7 @@ python -m pytest tests/test_pipeline_concurrency.py -v -rs
 
 **Coverage.** `pytest-cov` is not in `requirements.txt`, so `--cov` errors with "unrecognized arguments". To use coverage, add an exact `pytest-cov==<version>` pin to `requirements.txt` in the same change, then run `python -m pytest tests --cov=prop_alpha --cov-report=term-missing`.
 
-Telegram alerts (sends messages only; never places bets):
+Telegram alerts (sends messages only; never places bets). Only high-value bets are sent (`scanner/value_screen.py`): mispriced by the book, at least 4% expected profit per unit staked, and an edge that still returns at least 4% in more than 60% of 1,000 simulated match conditions:
 
 ```bash
 python -m prop_alpha.alerts.telegram --get-chat-id   # after sending /start to the bot

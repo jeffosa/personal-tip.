@@ -39,6 +39,8 @@ PURE_MODULES: tuple[str, ...] = (
     "prop_alpha/scanner/market_scanner.py",
     "prop_alpha/calibration/fitting.py",
     "prop_alpha/evaluation/backtest.py",
+    # Added with the high-value screen; same no-I/O and determinism rules as the AGENT P1 modules.
+    "prop_alpha/scanner/value_screen.py",
 )
 IO_LIBRARIES = frozenset({
     "psycopg2", "requests", "urllib3", "socket", "http", "sqlite3", "threading", "concurrent", "asyncio", "subprocess",
