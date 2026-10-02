@@ -11,7 +11,11 @@ appears in a repr, log line or exception message.
 
 Only high-value bets are sent (prop_alpha.scanner.value_screen): mispriced by the book, at least 4%
 expected profit per unit staked, and an edge that still returns at least 4% in more than 60% of 1,000
-simulated match conditions.
+simulated match conditions, all after the model-risk loss floor (MODEL_RISK_LOSS_FLOOR).
+
+One alert is sent per market, line, side and book for the life of the process, whatever the price does
+afterwards, so a person following the alerts is not told to stack the same position on every price tick.
+The sent set is in memory only: persisting it across restarts needs the bet ledger ([N]).
 
 Usage:
     python -m prop_alpha.alerts.telegram --check        # getMe + one test message
@@ -35,9 +39,11 @@ from typing import Any, Final, Mapping
 import numpy as np
 import requests
 
-from prop_alpha.modeling.engine import LineupExpectation, PropProjection, QuantEngine, RefereeProfile
+from prop_alpha.modeling.engine import FactorProjection, LineupExpectation, QuantEngine, RefereeProfile, VoidRule
 from prop_alpha.scanner.market_scanner import (
+    MODEL_RISK_LOSS_FLOOR,
     AllocationReport,
+    ExposureBook,
     InstitutionalAssetManager,
     LiveOddsQuote,
     ProjectionKey,
@@ -56,7 +62,9 @@ PAPER_LABEL: Final[str] = "PAPER ONLY - model not validated, no PRD go-live gate
 _TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\d{5,15}:[A-Za-z0-9_-]{30,}$")
 _CHAT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^(-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,})$")
 
-DirectiveKey = tuple[int, int, str, float, str, str, float]
+AlertKey = tuple[int, int, str, float, str, str]
+SeedKey = tuple[int, int, str, float, str, str, float]
+DEFAULT_CRITERIA: Final[HighValueCriteria] = HighValueCriteria(loss_floor=MODEL_RISK_LOSS_FLOOR)
 
 
 class TelegramError(RuntimeError):
@@ -108,16 +116,18 @@ def load_config(env_file: Path = DEFAULT_ENV_FILE) -> TelegramConfig:
     return TelegramConfig.from_sources(os.environ, text)
 
 
-def directive_key(directive: StakingDirective) -> DirectiveKey:
+def alert_key(directive: StakingDirective) -> AlertKey:
+    """One alert per market/line/side/book per process, whatever the price does afterwards."""
     return (
-        directive.fixture_id, directive.player_id, directive.market_type, directive.line_value,
-        directive.side, directive.sportsbook, directive.decimal_odds,
+        directive.fixture_id, directive.player_id, directive.market_type,
+        directive.line_value, directive.side, directive.sportsbook,
     )
 
 
 def simulation_seed(directive: StakingDirective) -> int:
-    """Stable seed per directive (sha256, not hash(), which is salted per process), so re-runs agree."""
-    return int.from_bytes(hashlib.sha256(repr(directive_key(directive)).encode("utf-8")).digest()[:8], "big")
+    """Stable seed per directive and price (sha256, not hash(), which is salted per process), so re-runs agree."""
+    key: SeedKey = (*alert_key(directive), directive.decimal_odds)
+    return int.from_bytes(hashlib.sha256(repr(key).encode("utf-8")).digest()[:8], "big")
 
 
 def format_directive(
@@ -131,6 +141,7 @@ def format_directive(
         f"Fixture {directive.fixture_id} | player {directive.player_id} | {directive.market_type}",
         f"{directive.side.upper()} {directive.line_value:g} @ {directive.decimal_odds:.3f} "
         f"({directive.sportsbook}, {directive.void_rule})",
+        f"Do not bet below {directive.min_acceptable_odds:.3f}; valid until {directive.expires_at:%H:%M:%S} UTC",
         f"Mispriced: model win chance {assessment.model_win_probability:.1%} vs book "
         f"{assessment.book_win_probability:.1%}",
         f"Expected profit {assessment.ev_per_unit:+.2%} per 1 staked",
@@ -149,7 +160,7 @@ class TelegramNotifier:
         self._config = config
         self._session = session if session is not None else requests.Session()
         self._timeout_s = timeout_s
-        self._sent: set[DirectiveKey] = set()
+        self._sent: set[AlertKey] = set()
 
     def _call(self, method: str, payload: Mapping[str, Any]) -> Any:
         url = f"{TELEGRAM_API_BASE}/bot{self._config.bot_token}/{method}"
@@ -192,24 +203,27 @@ class TelegramNotifier:
     def notify(
         self,
         report: AllocationReport,
-        projections: Mapping[ProjectionKey, PropProjection],
-        criteria: HighValueCriteria = HighValueCriteria(),
+        projections: Mapping[ProjectionKey, FactorProjection],
+        criteria: HighValueCriteria = DEFAULT_CRITERIA,
         bankroll_currency: str = "",
     ) -> list[int]:
-        """Send each not-yet-sent directive in report.directives that passes the high-value screen.
+        """Send each directive in report.directives whose market/line/side/book has not been alerted yet
+        and that passes the high-value screen.
 
         Sub-minimum stakes (report.skipped_directives) and skipped markets are never screened or sent.
-        A directive without its projection raises ValueError (it cannot be screened). A failed send
+        A directive without its projection cannot be screened: it is logged at ERROR and skipped, and
+        the rest of the report is still screened (maintainer decision 5, 2026-10-01). A failed send
         raises TelegramError; directives sent before it stay marked as sent.
         """
         message_ids: list[int] = []
         for directive in report.directives:
-            key = directive_key(directive)
+            key = alert_key(directive)
             if key in self._sent:
                 continue
             projection = projections.get((directive.fixture_id, directive.player_id, directive.market_type))
             if projection is None:
-                raise ValueError(f"no projection for directive {key}; it cannot be screened")
+                logger.error("no projection for directive %s; it cannot be screened and was not sent", key)
+                continue
             assessment = assess_high_value(
                 directive, projection, criteria, np.random.default_rng(simulation_seed(directive))
             )
@@ -226,9 +240,9 @@ class TelegramNotifier:
         return message_ids
 
 
-def reference_projection() -> PropProjection:
+def reference_projection() -> FactorProjection:
     """The documented reference projection (ARCHITECTURE 4.1): tackles, fixture 1001, player 55."""
-    return QuantEngine(game_state_k=6.0).project_count_market(
+    return QuantEngine(game_state_k=6.0).factor_count_market(
         fixture_id=1001, player_id=55, market_type="tackles",
         counts=[3, 2, 4, 3, 1, 3], minutes=[90.0, 90.0, 90.0, 85.0, 90.0, 90.0],
         league_rate_per90=2.2, referee=RefereeProfile(1.0, 0.13, 0.004, 0.0), is_home=True,
@@ -244,14 +258,20 @@ def reference_report(now: datetime) -> AllocationReport:
             1001, 55, "tackles", line,
             over_price=price_for_ev(projection.side_probabilities(line, "over"), ev),
             under_price=price_for_ev(projection.side_probabilities(line, "under"), -0.10),
-            max_stake=500.0, sportsbook=book, captured_at=now,
+            max_stake=500.0, sportsbook=book, captured_at=now, void_rule=VoidRule.VOID_IF_NO_APPEARANCE,
         )
         for line, ev, book in ((1.5, 0.060, "SyntheticBookA"), (2.5, 0.062, "SyntheticBookB"))
     ]
-    return InstitutionalAssetManager(bankroll=10_000.0).allocate({(1001, 55, "tackles"): projection}, quotes, now=now)
+    return _reference_manager().allocate(
+        {(1001, 55, "tackles"): projection}, quotes, now=now, exposure=ExposureBook({})
+    )
 
 
-def demo_case(now: datetime) -> tuple[dict[ProjectionKey, PropProjection], AllocationReport]:
+def _reference_manager() -> InstitutionalAssetManager:
+    return InstitutionalAssetManager(bankroll=10_000.0, model_risk_loss_floor=MODEL_RISK_LOSS_FLOOR)
+
+
+def demo_case(now: datetime) -> tuple[dict[ProjectionKey, FactorProjection], AllocationReport]:
     """Reference quotes plus a synthetic Under 4.5 priced at +8% EV, which passes the screen."""
     projection = reference_projection()
     quotes = [
@@ -259,7 +279,7 @@ def demo_case(now: datetime) -> tuple[dict[ProjectionKey, PropProjection], Alloc
             1001, 55, "tackles", line,
             over_price=price_for_ev(projection.side_probabilities(line, "over"), over_ev),
             under_price=price_for_ev(projection.side_probabilities(line, "under"), under_ev),
-            max_stake=500.0, sportsbook=book, captured_at=now,
+            max_stake=500.0, sportsbook=book, captured_at=now, void_rule=VoidRule.VOID_IF_NO_APPEARANCE,
         )
         for line, over_ev, under_ev, book in (
             (1.5, 0.060, -0.10, "SyntheticBookA"),
@@ -268,7 +288,7 @@ def demo_case(now: datetime) -> tuple[dict[ProjectionKey, PropProjection], Alloc
         )
     ]
     projections = {(1001, 55, "tackles"): projection}
-    return projections, InstitutionalAssetManager(bankroll=10_000.0).allocate(projections, quotes, now=now)
+    return projections, _reference_manager().allocate(projections, quotes, now=now, exposure=ExposureBook({}))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -299,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"test message delivered (message_id {message_id})")
         return 0
     projections, report = demo_case(datetime.now(timezone.utc))
-    criteria = HighValueCriteria()
+    criteria = DEFAULT_CRITERIA
     for directive in report.directives:
         assessment = assess_high_value(
             directive, projections[(directive.fixture_id, directive.player_id, directive.market_type)],

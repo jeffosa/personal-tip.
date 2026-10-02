@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -47,6 +48,13 @@ T = TypeVar("T")
 # per-fixture transaction is rolled back before the retry. QueryCanceled (57014, statement_timeout)
 # is also an OperationalError, but _with_transaction catches it first and fails closed.
 RETRYABLE_DB_ERRORS: Final[tuple[type[BaseException], ...]] = (psycopg2.OperationalError, psycopg2.InterfaceError)
+
+# Vendor responses retried by VendorClient.get_json, each attempt metered by the rate limiter.
+RETRYABLE_HTTP_STATUS: Final[frozenset[int]] = frozenset({429, 500, 502, 503, 504})
+# Longest Retry-After honoured before a fixture is deferred (decision 6, 2026-10-01). Starting value:
+# review it with DATA_VENDOR_RPS against the vendor contract.
+MAX_RETRY_AFTER_S: Final[float] = 2.0
+_RETRY_AFTER_SECONDS: Final[re.Pattern[str]] = re.compile(r"\d+(\.\d+)?")
 
 INSERT_RAW_SQL: Final[str] = """
     INSERT INTO prop_alpha.raw_payloads (source, vendor_fixture_uid, payload, payload_sha256)
@@ -123,8 +131,20 @@ class TokenBucketRateLimiter:
             time.sleep(wait_s)
 
 
+def _retry_after_seconds(header: str | None) -> float | None:
+    """Seconds from a delay-seconds Retry-After header; None when absent or an HTTP-date (not honoured)."""
+    if header is None or not _RETRY_AFTER_SECONDS.fullmatch(header.strip()):
+        return None
+    return float(header.strip())
+
+
 class VendorClient:
-    """HTTP client with one requests.Session per worker thread (Session is not documented as thread-safe)."""
+    """HTTP client with one requests.Session per worker thread (Session is not documented as thread-safe).
+
+    Retries happen in get_json, not in the urllib3 adapter, so every attempt takes a rate-limiter token
+    and a vendor's Retry-After longer than MAX_RETRY_AFTER_S fails the fixture at once instead of
+    holding a worker past its timeout.
+    """
 
     def __init__(
         self,
@@ -134,6 +154,8 @@ class VendorClient:
         timeout: float = 5.0,
         max_retries: int = 2,
     ) -> None:
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
+            raise ValueError("max_retries must be a non-negative integer")
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.rate_limiter = rate_limiter
@@ -148,12 +170,11 @@ class VendorClient:
         if session is None:
             session = requests.Session()
             session.headers.update({"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"})
+            # Only failed connects are retried here: they never reach the vendor, so they spend no quota.
+            # Read errors and retryable statuses are handled (or raised) by get_json, one token per attempt.
             retry_policy = Retry(
-                total=self.max_retries,
-                backoff_factor=0.25,
-                status_forcelist=(429, 500, 502, 503, 504),
-                allowed_methods=frozenset({"GET"}),
-                respect_retry_after_header=True,
+                total=None, connect=self.max_retries, read=0, status=0, other=0, backoff_factor=0.25,
+                raise_on_status=False,
             )
             adapter = HTTPAdapter(max_retries=retry_policy, pool_maxsize=2)
             session.mount("https://", adapter)
@@ -164,13 +185,30 @@ class VendorClient:
         return session
 
     def get_json(self, path: str) -> dict[str, Any]:
-        self.rate_limiter.acquire()
-        resp = self._session().get(f"{self.base_url}/{path.lstrip('/')}", timeout=self.timeout)
-        resp.raise_for_status()
-        body = resp.json()
-        if not isinstance(body, dict):
-            raise ValueError(f"expected a JSON object from {path}")
-        return body
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        failure = "no attempt made"
+        for attempt in range(self.max_retries + 1):
+            self.rate_limiter.acquire()
+            resp = self._session().get(url, timeout=self.timeout)
+            if resp.status_code not in RETRYABLE_HTTP_STATUS:
+                resp.raise_for_status()
+                body = resp.json()
+                if not isinstance(body, dict):
+                    raise ValueError(f"expected a JSON object from {path}")
+                return body
+            failure = f"HTTP {resp.status_code}"
+            delay = 0.25 * (2 ** attempt)
+            retry_after = _retry_after_seconds(resp.headers.get("Retry-After"))
+            if retry_after is not None:
+                if retry_after > MAX_RETRY_AFTER_S:
+                    raise requests.HTTPError(
+                        f"{path}: vendor asked to wait {retry_after:g}s (> {MAX_RETRY_AFTER_S:g}s); fixture deferred"
+                    )
+                delay = retry_after
+            logger.warning("%s: attempt %d/%d got %s", path, attempt + 1, self.max_retries + 1, failure)
+            if attempt < self.max_retries:
+                time.sleep(delay)
+        raise requests.HTTPError(f"{path}: failed after {self.max_retries + 1} attempts ({failure})")
 
     def get_fixture_feed(self, fixture_vendor_uid: str) -> dict[str, Any]:
         return self.get_json(f"fixtures/{fixture_vendor_uid}/stats")
@@ -238,7 +276,10 @@ class ConcurrentIngestionEngine:
         max_db_attempts: int = 3,
         retry_base_delay_s: float = 0.05,
         bench_sub_probability: float = 0.35,
+        player_sub_probabilities: Mapping[str, float] | None = None,
     ) -> None:
+        """`player_sub_probabilities` maps vendor player uid to a fitted bench sub probability
+        (fitting.bench_sub_probability); other bench players get `bench_sub_probability`."""
         if max_workers < 1 or max_db_attempts < 1:
             raise ValueError("max_workers and max_db_attempts must be >= 1")
         pool_size = getattr(pool, "maxconn", None)
@@ -251,6 +292,8 @@ class ConcurrentIngestionEngine:
         self.max_db_attempts = max_db_attempts
         self.retry_base_delay_s = retry_base_delay_s
         self.bench_sub_probability = bench_sub_probability
+        self.player_sub_probabilities = dict(player_sub_probabilities or {})
+        self._slate_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ingest")
         self._closed = False
 
@@ -273,51 +316,76 @@ class ConcurrentIngestionEngine:
         Run one job for every fixture concurrently. Fixtures not finished by `deadline_s` are reported
         as timed_out; a task already running keeps going and its transaction commits or rolls back on
         its own, so a timed-out fixture may still land and be picked up by the next merge.
+
+        One slate at a time per engine: the pool holds max_workers + 1 connections, so a second
+        concurrent slate would exhaust it and fail its merge with PoolError. It raises RuntimeError instead.
         """
         if self._closed:
             raise RuntimeError("engine is closed")
         if job not in self.JOBS:
             raise ValueError(f"job must be one of {self.JOBS}")
-        task: Callable[[str], tuple[int, int]] = self._stats_task if job == "stats" else self._lineup_task
-        uids = list(dict.fromkeys(u for u in fixture_uids if u))
-        report = SlateReport(job=job)
-        started = time.monotonic()
+        if not self._slate_lock.acquire(blocking=False):
+            raise RuntimeError("run_slate is already running on this engine; use one engine per concurrent slate")
+        try:
+            task: Callable[[str], tuple[int, int]] = self._stats_task if job == "stats" else self._lineup_task
+            uids = list(dict.fromkeys(u for u in fixture_uids if u))
+            report = SlateReport(job=job)
+            started = time.monotonic()
 
-        futures: dict[Future[FixtureResult], str] = {
-            self._executor.submit(self._run_isolated, task, uid): uid for uid in uids
-        }
-        done, not_done = wait(futures, timeout=deadline_s)
-        for fut in done:
-            result = fut.result()
-            report.results[result.fixture_uid] = result
-        for fut in not_done:
-            fut.cancel()
-        report.timed_out = sorted(futures[f] for f in not_done)
+            futures: dict[Future[FixtureResult], str] = {
+                self._executor.submit(self._run_isolated, task, uid): uid for uid in uids
+            }
+            done, not_done = wait(futures, timeout=deadline_s)
+            for fut in done:
+                result = fut.result()
+                report.results[result.fixture_uid] = result
+            for fut in not_done:
+                fut.cancel()
+            report.timed_out = sorted(futures[f] for f in not_done)
 
-        if job == "stats" and merge and report.succeeded:
-            try:
-                report.merge = self.merge_staging()
-            except Exception as exc:
-                report.merge_error = f"{type(exc).__name__}: {exc}"
-                logger.exception("staging merge failed; rows remain in staging for the next merge")
+            if job == "stats" and merge and report.succeeded:
+                try:
+                    report.merge = self.merge_staging()
+                except Exception as exc:
+                    report.merge_error = f"{type(exc).__name__}: {exc}"
+                    logger.exception("staging merge failed; rows remain in staging for the next merge")
 
-        report.elapsed_s = time.monotonic() - started
-        logger.info(
-            "slate %s: %d ok, %d failed, %d timed out, merge=%s in %.2fs",
-            job, len(report.succeeded), len(report.failed), len(report.timed_out), report.merge, report.elapsed_s,
-        )
-        return report
+            report.elapsed_s = time.monotonic() - started
+            logger.info(
+                "slate %s: %d ok, %d failed, %d timed out, merge=%s in %.2fs",
+                job, len(report.succeeded), len(report.failed), len(report.timed_out), report.merge, report.elapsed_s,
+            )
+            return report
+        finally:
+            self._slate_lock.release()
 
-    def merge_staging(self) -> MergeResult:
+    def merge_staging(self, max_rounds: int = 50) -> MergeResult:
+        """Drain staging in bounded transactions: each call of the merge function claims at most its batch
+        limit (200 batches by default), so statement_timeout bounds one round, not the whole backlog.
+        Loops until a round merges nothing; raises RuntimeError if the backlog outlasts `max_rounds`."""
+        if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or max_rounds < 1:
+            raise ValueError("max_rounds must be a positive integer")
+
         def merge(cur: Any) -> MergeResult:
             cur.execute(MERGE_SQL)
             fixtures, rows, rejected = cur.fetchone()
             return MergeResult(int(fixtures), int(rows), int(rejected))
 
-        result, _ = self._with_transaction(merge)
-        if result.rows_rejected:
-            logger.warning("merge rejected %d staging rows; see prop_alpha.staging_rejects", result.rows_rejected)
-        return result
+        total = MergeResult(0, 0, 0)
+        for _ in range(max_rounds):
+            result, _ = self._with_transaction(merge)
+            if result == MergeResult(0, 0, 0):
+                break
+            total = MergeResult(
+                total.fixtures_merged + result.fixtures_merged,
+                total.player_rows_merged + result.player_rows_merged,
+                total.rows_rejected + result.rows_rejected,
+            )
+        else:
+            raise RuntimeError(f"staging backlog not drained after {max_rounds} merge rounds")
+        if total.rows_rejected:
+            logger.warning("merge rejected %d staging rows; see prop_alpha.staging_rejects", total.rows_rejected)
+        return total
 
     # ---------------- per-fixture tasks ----------------
     def _run_isolated(self, task: Callable[[str], tuple[int, int]], uid: str) -> FixtureResult:
@@ -347,7 +415,7 @@ class ConcurrentIngestionEngine:
 
     def _lineup_task(self, uid: str) -> tuple[int, int]:
         payload = self.client.get_lineups(uid)
-        entries = parse_lineup_payload(payload, self.bench_sub_probability)
+        entries = parse_lineup_payload(payload, self.bench_sub_probability, self.player_sub_probabilities)
         if any(e.vendor_fixture_uid != uid for e in entries):
             raise ValueError(f"lineup payload does not match request {uid}")
         values = [(e.vendor_fixture_uid, e.vendor_player_uid, e.p_start, e.p_sub_appearance) for e in entries]

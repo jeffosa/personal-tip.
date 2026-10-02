@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -9,17 +11,21 @@ import pytest
 import requests
 
 from prop_alpha.alerts.telegram import (
+    DEFAULT_CRITERIA,
     PAPER_LABEL,
     TelegramConfig,
     TelegramError,
     TelegramNotifier,
+    alert_key,
     demo_case,
     format_directive,
     load_config,
     parse_env_file,
     reference_projection,
     reference_report,
+    simulation_seed,
 )
+from prop_alpha.scanner.market_scanner import AllocationReport
 from prop_alpha.scanner.value_screen import HighValueCriteria, assess_high_value
 
 # Assembled at runtime so the repository secrets scan never sees a token-shaped literal.
@@ -89,7 +95,7 @@ def test_config_rejects_missing_or_malformed_credentials() -> None:
 def test_alert_text_carries_the_paper_label_and_the_screen_evidence() -> None:
     projections, report = demo_case(NOW)
     directive = next(d for d in report.directives if d.line_value == 4.5)
-    assessment = assess_high_value(directive, projections[(1001, 55, "tackles")], HighValueCriteria(),
+    assessment = assess_high_value(directive, projections[(1001, 55, "tackles")], DEFAULT_CRITERIA,
                                    np.random.default_rng(1))
     text = format_directive(directive, assessment, "GBP")
     assert text.startswith(PAPER_LABEL)
@@ -126,7 +132,7 @@ def test_reference_bets_are_screened_out() -> None:
 def test_stricter_criteria_and_sub_minimum_stakes_send_nothing() -> None:
     projections, report = demo_case(NOW)
     strict, strict_session = _notifier()
-    assert strict.notify(report, projections, HighValueCriteria(min_ev_per_unit=0.09)) == []
+    assert strict.notify(report, projections, HighValueCriteria(loss_floor=DEFAULT_CRITERIA.loss_floor, min_ev_per_unit=0.09)) == []
     assert strict_session.calls == []
     report.skipped_directives.extend(report.directives)
     report.directives.clear()
@@ -134,11 +140,42 @@ def test_stricter_criteria_and_sub_minimum_stakes_send_nothing() -> None:
     assert quiet.notify(report, projections) == [] and quiet_session.calls == []
 
 
-def test_directive_without_projection_cannot_be_screened() -> None:
-    _, report = demo_case(NOW)
-    notifier, _ = _notifier()
-    with pytest.raises(ValueError, match="cannot be screened"):
-        notifier.notify(report, {})
+def test_directive_without_projection_is_logged_and_skipped(caplog: pytest.LogCaptureFixture) -> None:
+    """Decision 5: one unscreenable directive no longer stops the rest of the report from being alerted."""
+    projections, report = demo_case(NOW)
+    orphan = replace(report.directives[0], player_id=999)
+    report.directives.insert(0, orphan)
+    notifier, session = _notifier(_ok({"message_id": 1}))
+    with caplog.at_level(logging.ERROR, logger="prop_alpha.alerts"):
+        assert notifier.notify(report, projections) == [1]
+    assert "cannot be screened" in caplog.text and "999" in caplog.text
+    assert "UNDER 4.5" in session.calls[0][1]["text"]
+
+
+def test_a_price_tick_does_not_resend_the_same_market() -> None:
+    """V2: two reports differing only in price (1.714, then 1.72) send one alert, not two."""
+    projections, report = demo_case(NOW)
+    under = next(d for d in report.directives if d.line_value == 4.5)
+    report.directives[:] = [under]
+    ticked = AllocationReport(directives=[replace(under, decimal_odds=round(under.decimal_odds + 0.006, 3))])
+    notifier, session = _notifier(_ok({"message_id": 1}), _ok({"message_id": 2}))
+    assert notifier.notify(report, projections) == [1]
+    assert notifier.notify(ticked, projections) == []
+    assert len(session.calls) == 1
+    assert alert_key(under) == alert_key(ticked.directives[0])
+    assert simulation_seed(under) != simulation_seed(ticked.directives[0])
+
+
+def test_alert_text_shows_the_price_floor_and_expiry() -> None:
+    """V3: a person acting on the alert sees the minimum acceptable odds and when the directive expires."""
+    projections, report = demo_case(NOW)
+    directive = next(d for d in report.directives if d.line_value == 4.5)
+    assessment = assess_high_value(directive, projections[(1001, 55, "tackles")], DEFAULT_CRITERIA,
+                                   np.random.default_rng(1))
+    text = format_directive(directive, assessment)
+    assert f"Do not bet below {directive.min_acceptable_odds:.3f}" in text
+    assert "valid until 12:05:00 UTC" in text
+    assert directive.min_acceptable_odds <= directive.decimal_odds
 
 
 def test_telegram_rejection_raises_without_the_token() -> None:

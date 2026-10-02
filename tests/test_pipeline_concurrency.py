@@ -11,7 +11,10 @@ psycopg2 = pytest.importorskip("psycopg2")
 import psycopg2.errors  # noqa: E402
 
 from conftest import make_fixture_payload, make_lineup_payload  # noqa: E402
+import requests  # noqa: E402
+
 from prop_alpha.ingestion.pipeline import (  # noqa: E402
+    MAX_RETRY_AFTER_S,
     ConcurrentIngestionEngine,
     TokenBucketRateLimiter,
     VendorClient,
@@ -230,7 +233,8 @@ def test_slate_is_processed_concurrently() -> None:
     assert report.fully_successful
     assert len(vendor.fetch_threads) == 4
     assert pool.gets == pool.puts and pool.in_use == 0
-    assert db.merge_calls == 1 and db.merged_fixtures == set(uids) and not db.staging
+    # D2: one round drains the staged batches, a second round returns all zeros and ends the loop.
+    assert db.merge_calls == 2 and db.merged_fixtures == set(uids) and not db.staging
     assert report.merge is not None and report.merge.fixtures_merged == 4
 
 
@@ -392,3 +396,143 @@ def test_cli_arguments_parse() -> None:
     assert (args.job, args.workers, args.deadline, args.bench_sub_probability) == ("lineups", 6, 45.0, 0.35)
     with pytest.raises(SystemExit):
         build_arg_parser().parse_args(["odds"])
+
+
+# ---------------- remediation I2, I3, D2, K2 ----------------
+class CountingLimiter(TokenBucketRateLimiter):
+    def __init__(self) -> None:
+        super().__init__(rate_per_sec=1000.0, burst=1000)
+        self.acquired = 0
+
+    def acquire(self) -> None:
+        self.acquired += 1
+
+
+def _response(status: int, body: Any = None, headers: dict[str, str] | None = None) -> requests.Response:
+    response = requests.Response()
+    response.status_code = status
+    response._content = repr(body).replace("'", '"').encode("utf-8") if body is not None else b"{}"
+    response.headers.update(headers or {})
+    response.url = "https://vendor.invalid/api/fixtures/FX-1/stats"
+    return response
+
+
+class ScriptedSession:
+    """Stands in for requests.Session: replays responses and counts what reached the vendor."""
+
+    def __init__(self, *responses: requests.Response) -> None:
+        self.responses = list(responses)
+        self.requests = 0
+
+    def get(self, url: str, timeout: float) -> requests.Response:
+        self.requests += 1
+        return self.responses.pop(0)
+
+
+def _client(session: ScriptedSession, limiter: CountingLimiter) -> VendorClient:
+    client = VendorClient("https://vendor.invalid/api", "test-key", limiter)
+    client._local.session = session
+    return client
+
+
+def test_every_vendor_attempt_takes_a_rate_limiter_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """I2: 429, 429, 200 is three vendor requests and three tokens (previously one token, retries unmetered)."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    limiter = CountingLimiter()
+    session = ScriptedSession(_response(429), _response(429), _response(200, {"ok": 1}))
+    assert _client(session, limiter).get_json("fixtures/FX-1/stats") == {"ok": 1}
+    assert session.requests == 3 and limiter.acquired == 3
+    assert sleeps == [0.25, 0.5]
+
+
+def test_long_retry_after_fails_fast_instead_of_blocking_the_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """I2: Retry-After: 4 used to hold one call for 8 s despite timeout=5; now it raises at once."""
+    monkeypatch.setattr(time, "sleep", lambda seconds: pytest.fail(f"slept {seconds}s"))
+    limiter = CountingLimiter()
+    session = ScriptedSession(_response(429, headers={"Retry-After": "4"}))
+    started = time.monotonic()
+    with pytest.raises(requests.HTTPError, match="asked to wait 4s"):
+        _client(session, limiter).get_json("fixtures/FX-1/stats")
+    assert time.monotonic() - started < 0.1
+    assert MAX_RETRY_AFTER_S == 2.0
+
+
+def test_short_retry_after_is_honoured_and_exhaustion_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    limiter = CountingLimiter()
+    session = ScriptedSession(*(_response(503, headers={"Retry-After": "1"}) for _ in range(3)))
+    with pytest.raises(requests.HTTPError, match="failed after 3 attempts"):
+        _client(session, limiter).get_json("fixtures/FX-1/stats")
+    assert sleeps == [1.0, 1.0] and limiter.acquired == 3
+    not_found = ScriptedSession(_response(404))
+    with pytest.raises(requests.HTTPError):
+        _client(not_found, CountingLimiter()).get_json("fixtures/FX-1/stats")
+    assert not_found.requests == 1
+
+
+def test_adapter_retries_only_connects_which_never_reach_the_vendor() -> None:
+    client = VendorClient("https://vendor.invalid/api", "test-key", TokenBucketRateLimiter(100.0, 10))
+    retries = client._session().get_adapter("https://vendor.invalid").max_retries
+    assert (retries.total, retries.connect, retries.read, retries.status) == (None, 2, 0, 0)
+    client.close()
+
+
+def test_second_concurrent_slate_on_one_engine_is_refused() -> None:
+    """I3: the pool has one spare connection; a second concurrent slate fails loudly instead of PoolError."""
+    db, pool, vendor, uids = _setup(1)
+    entered, release = threading.Event(), threading.Event()
+
+    def block(uid: str) -> None:
+        entered.set()
+        release.wait(10.0)
+
+    vendor.before_fetch = block
+    engine = _engine(vendor, pool)
+    first: list[Any] = []
+    runner = threading.Thread(target=lambda: first.append(engine.run_slate(uids, job="stats")))
+    try:
+        runner.start()
+        assert entered.wait(10.0)
+        with pytest.raises(RuntimeError, match="already running"):
+            engine.run_slate(uids, job="stats")
+    finally:
+        release.set()
+        runner.join(10.0)
+    assert first and first[0].fully_successful
+    second = engine.run_slate([], job="stats")
+    assert second.results == {}
+    engine.close()
+
+
+def test_merge_loop_sums_rounds_and_raises_when_the_backlog_outlasts_it() -> None:
+    """D2: rounds are summed until one merges nothing; a backlog that never empties raises."""
+    db, pool, vendor, uids = _setup(2)
+    with _engine(vendor, pool) as engine:
+        engine.run_slate(uids, job="stats", merge=False)
+        assert len(db.staging) == 2 * 5
+        with pytest.raises(RuntimeError, match="not drained after 1 merge rounds"):
+            engine.merge_staging(max_rounds=1)
+        assert not db.staging and db.merge_calls == 1
+        assert engine.merge_staging().fixtures_merged == 0
+        with pytest.raises(ValueError):
+            engine.merge_staging(max_rounds=0)
+
+
+def test_lineup_job_uses_per_player_bench_probabilities() -> None:
+    """K2: a fitted per-player probability replaces the league-level 0.35 for that player only."""
+    db, pool, vendor, _ = _setup(0)
+    sheet = make_lineup_payload("FX-L", n_bench=2)
+    listed = [uid for side in sheet["lineups"].values() for uid in side["starters"] + side["bench"]]
+    db.player_ids = {uid: 1000 + i for i, uid in enumerate(listed)}
+    vendor.lineups["FX-L"] = sheet
+    regular, rotation = sheet["lineups"]["T-AWAY"]["bench"]
+    engine = ConcurrentIngestionEngine(
+        vendor, pool, max_workers=4, retry_base_delay_s=0.001,  # type: ignore[arg-type]
+        player_sub_probabilities={regular: 0.8},
+    )
+    with engine:
+        assert engine.run_slate(["FX-L"], job="lineups").fully_successful
+    assert db.lineups[("FX-L", db.player_ids[regular])] == (0.0, 0.8)
+    assert db.lineups[("FX-L", db.player_ids[rotation])] == (0.0, 0.35)

@@ -346,9 +346,12 @@ def test_risk_defaults_and_numerical_bounds_are_unchanged() -> None:
         "max_fixture_fraction": 0.05,
         "max_total_fraction": 0.20,
         "max_quote_age": timedelta(minutes=5),
-        "open_exposure": 0.0,
         "min_stake": 1.0,
     }
+    # Open positions now enter allocate() as a required ExposureBook (remediation S1), not a constructor default.
+    floor = inspect.signature(market_scanner.InstitutionalAssetManager.__init__).parameters["model_risk_loss_floor"]
+    assert floor.default is inspect.Parameter.empty and floor.kind is inspect.Parameter.KEYWORD_ONLY
+    assert market_scanner.MODEL_RISK_LOSS_FLOOR == 0.03  # maintainer decision 1, 2026-10-01
     assert (engine.MIN_RELATIVE_VARIANCE, engine.MAX_RELATIVE_VARIANCE, engine.MAX_MATCH_MINUTES) == (1e-6, 1e3, 130.0)
     assert market_scanner.DEGENERATE_LOSS_PROBABILITY == 1e-6
 

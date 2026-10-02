@@ -260,10 +260,10 @@ CREATE TABLE bets (
 );
 
 -- ============================================================
--- merge_staging_player_feed(): identical to migrations/003_integrity_constraints.sql (AGENT M4, Z5).
--- Call: SELECT * FROM prop_alpha.merge_staging_player_feed();
+-- merge_staging_player_feed(): identical to migrations/004_merge_hardening.sql (AGENT M4, Z5).
+-- Call: SELECT * FROM prop_alpha.merge_staging_player_feed();  -- claims at most 200 batches per call
 -- ============================================================
-CREATE OR REPLACE FUNCTION prop_alpha.merge_staging_player_feed()
+CREATE OR REPLACE FUNCTION prop_alpha.merge_staging_player_feed(p_max_batches integer DEFAULT 200)
 RETURNS TABLE (fixtures_merged integer, player_rows_merged integer, rows_rejected integer)
 LANGUAGE plpgsql
 AS $$
@@ -278,8 +278,23 @@ BEGIN
     DROP TABLE IF EXISTS pg_temp.claimed_feed;
     CREATE TEMP TABLE claimed_feed (LIKE prop_alpha.staging_player_feed) ON COMMIT DROP;
 
-    WITH drained AS (
-        DELETE FROM prop_alpha.staging_player_feed RETURNING *
+    IF p_max_batches IS NULL OR p_max_batches < 1 THEN
+        RAISE EXCEPTION 'p_max_batches must be a positive integer, got %', p_max_batches;
+    END IF;
+
+    -- Claim whole batches, oldest first, in one statement. A worker commits one batch_id atomically, so a
+    -- batch is either fully visible to this snapshot or not at all, and a fixture is never split.
+    WITH oldest AS (
+        SELECT s.batch_id
+        FROM prop_alpha.staging_player_feed s
+        GROUP BY s.batch_id
+        ORDER BY min(s.staged_at), s.batch_id
+        LIMIT p_max_batches
+    ), drained AS (
+        DELETE FROM prop_alpha.staging_player_feed s
+        USING oldest o
+        WHERE s.batch_id = o.batch_id
+        RETURNING s.*
     )
     INSERT INTO claimed_feed SELECT * FROM drained;
 
@@ -312,6 +327,10 @@ BEGIN
                OR c.minute_off < c.minute_on
                OR c.minute_on < 0
                OR c.minute_off < 0
+               OR c.minutes_played IS NULL
+               OR (c.minutes_played > 0 AND (   c.tackles_attempted IS NULL OR c.tackles_won IS NULL
+                                            OR c.fouls_committed   IS NULL OR c.fouls_drawn IS NULL
+                                            OR c.yellow_cards      IS NULL OR c.red_cards   IS NULL))
                OR (c.team_possession_pct IS NOT NULL AND c.team_possession_pct NOT BETWEEN 0 AND 100))
         RETURNING c.*
     )

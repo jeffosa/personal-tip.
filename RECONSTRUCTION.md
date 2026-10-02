@@ -595,7 +595,7 @@ either, because the referee job produces point estimates only.
 |---|---|---|
 | Q1 | Should `QuantEngine` accept `beta1`/`beta2` of 0 or below (for example a fitted exponent near zero)? | Rejected with `ValueError` (E10). |
 | Q2 | Should `LiveOddsQuote` reject a non-finite price at construction (fail early), or accept it so that `_candidates` skips the side, as AGENT §3.3 describes? | Rejected at construction (S4). |
-| Q3 | Should a quote whose `captured_at` is after `now` abort the whole `allocate` call, or be skipped and recorded per key? | Aborts the call (S6). |
+| Q3 | Should a quote whose `captured_at` is after `now` abort the whole `allocate` call, or be skipped and recorded per key? | **Answered 2026-10-01 (remediation S5):** skipped, counted in `AllocationReport.future_quotes` and recorded in `report.skipped`; other markets are still allocated. |
 | Q4 | Stakes: floor to the cent (never exceeds `max_stake`) or round to the cent (PRD R-ALLOC-5)? | Floored (S7). |
 | Q5 | How should the backtest get referee data for `fouls` and card markets (Gate 2)? Add an optional referee to `PlayerMatchObservation`? | A neutral referee is used (B3). |
 | Q6 | Approve sanctioned handler H6 (`TelegramNotifier._call`, token-sanitising re-raise)? AGENT.md requires a maintainer's approval for any new handler. | Added and enforced; marked "awaiting formal approval" in AGENT.md. |
@@ -612,6 +612,7 @@ either, because the referee job produces point estimates only.
 | `a25ab8c` | Step 4: schema.sql, migrations 002–003, ci/bootstrap.sh, .gitattributes, SQL structure tests (139 passed) |
 | `a6eaa4a` | Step 5: typing and agent contract suites; `EXPECTED_TESTS=205` (205 passed; preflight passed) |
 | `1dc8c2d` | Step 6: Telegram alerts, H6, `.env.example`, CLAUDE.md/AGENT.md updates; `EXPECTED_TESTS=220` (220 passed) |
+| (uncommitted) | Remediation plan of 2026-10-01: 21 changes (I1–I3, S1–S7, V1–V3, E1–E4, K1–K2, D1–D2), migration 004, AGENT.md/CLAUDE.md updates; `EXPECTED_TESTS=307` (307 passed). See [Remediation](#remediation-2026-10-01). |
 
 ### Final verification (2026-10-01, CPython 3.14.6, Windows 11, Git Bash)
 
@@ -648,3 +649,67 @@ omitted.
 | G4 | No handler added. Validation still raises. |
 | G5 | Allocator untouched. The reference 1.94% / 0.04% test still passes. |
 | G6 | Proof of bite. Pre-fix `engine.py` with the new tests: `3 failed, 59 passed`. Fixed: `62 passed`. |
+
+## Remediation (2026-10-01)
+
+Implements the remediation plan written from the audit of `e67d8de` (suite then 245 passed). Twenty-one
+changes landed. B1–B3 (projection refresh, bet ledger, executor) were left unbuilt at the maintainer's
+direction and stay **[N]**.
+
+### Maintainer decisions (2026-10-01)
+
+| # | Decision | Applied as |
+|---|---|---|
+| 1 | Model-risk loss floor 0.03 | `market_scanner.MODEL_RISK_LOSS_FLOOR`; required `model_risk_loss_floor` keyword on `InstitutionalAssetManager`; required `loss_floor` on `HighValueCriteria`; added to the AGENT A3 list. Not backtested. |
+| 2 | At least 200 matches to fit k | `fitting.MIN_GAME_STATE_OBSERVATIONS`; `fit_game_state_dispersion` raises below it and when no overdispersion is detected |
+| 3 | Raise above `MAX_RELATIVE_VARIANCE` | `predictive_gamma` and `rate_posterior` raise `ProjectionError`; the lower `[MATH_CLAMP]` clamp stays. AGENT F5, G2, V1 and the §3.3 catalogue updated. |
+| 4 | Land breaking signatures without shims | `QuantEngine(*, game_state_k)`, `predictive_gamma(..., multiplier_relative_variance)`, `project_card_market(card_multiplier_relative_variance=...)`, `LiveOddsQuote.void_rule` (no default), `allocate(..., *, now, exposure)`, `HighValueCriteria(loss_floor=...)`, `StakingDirective` (two new fields) |
+| 5 | `notify` logs and skips a directive without a projection | `logger.error` and `continue`. No exception handler is involved (the old code raised directly, not inside an `except`), so the sanctioned set is unchanged: H1–H6. |
+| 6 | Keep `MAX_RETRY_AFTER_S = 2.0` and 200 batches per merge | `pipeline.MAX_RETRY_AFTER_S`; `merge_staging_player_feed(p_max_batches integer DEFAULT 200)`. Both still need the vendor contract and a timed merge on a real server. |
+
+### Deviations from the plan text
+
+| Item | Plan | Implemented | Why |
+|---|---|---|---|
+| S2 | "Under 2.5 at 1.06 gets no directive at floor 0.03" | The allocator test uses 1.05. At 1.06 the haircut EV is 0.97 x 0.06 - 0.03 = 0.028, above `alpha_threshold` 0.02, so the allocator still stakes it; the value screen (4% minimum, V1) stops the alert. | The plan's sentence does not hold arithmetically; the audit prototype itself tested 1.05. Removing it in the allocator at 1.06 would need a floor of about 0.038 or a higher `alpha_threshold`: a maintainer decision. |
+| S2 | Haircut EV for the candidate filter and Kelly bound | Also applied to the QP mean vector: each candidate's mean return is reduced by shift x price | Otherwise the filter and the sizing would use different EVs for the same bet. |
+| S3 | `scipy.special.roots_genlaguerre` | Golub-Welsch on the Laguerre Jacobi matrix (`engine.game_state_quadrature`) | `roots_genlaguerre` returns NaN weights for k above about 170; the new rule is exact to about 1e-12 for k in [0.05, 1e9] and matches scipy to 1e-14 at k = 6. |
+| S1/S3 | Fixture cap via `_apply_residual_cap` after optimisation | Fixture cap, per-market budget (net of open exposure) and per-slot Kelly budget are constraints of one QP per fixture; only the slate cap scales afterwards | S3 replaces per-key optimisation, so the fixture cap belongs inside the joint problem. |
+| I2 | Retry `ConnectionError`/`Timeout` in `get_json` with `try/except` | urllib3 retries connects only (`connect=max_retries, read=0, status=0`); `get_json` retries vendor responses without a `try` | The plan's code added two unsanctioned exception handlers (including `except ValueError: return None`, an F3 violation). A failed connect never reaches the vendor, so it spends no quota. A read timeout now fails the fixture (H1) instead of being retried. |
+| D1/D2 | `SET lock_timeout = '2s'` in migration 004 | `'5s'` | AGENT M3. |
+| E4 | P(under 1.5) = 0.3420 for a 90/70/45 mix | Tested against an independent weighted sum of fixed-minute prices | The plan does not give the projection behind 0.3420. |
+| K2 | Per-player values replace the scalar | Per-player overrides; the scalar stays as the fallback | Nothing persists unused bench selections yet, so no caller can produce per-player counts. |
+
+### AGENT §2.1 gate record (engine.py, market_scanner.py)
+
+| Gate | Outcome |
+|---|---|
+| G1 | `engine.py` forms every relative variance as `expm1(sum of log1p)`; `test_engine_contains_no_raw_moment_subtraction` passes. `fixture_moments` (market_scanner) subtracts `outer(mean, mean)` from per-unit returns bounded by [-1, O - 1], with kappa about 1.005 on the reference case; the proof is in its docstring, as for `return_moments`. |
+| G2 | New inputs validated and raising: `multiplier_relative_variance` (finite, >= 0), `game_state_k` (required, finite, > 0) in `QuantEngine`, `FactorProjection` and `game_state_quadrature`, the quadrature node g, `MinutesMixture` minutes and weights, `model_risk_loss_floor` and `loss_floor` in [0, 1), `ExposureBook` amounts (finite, >= 0). |
+| G3 | `PropProjection` remains the moment-matched NB with v = (1 + 1/alpha)(1 + 1/k)(1 + v_c) - 1, which equals 1/alpha + 1/k + 1/(alpha k) within 1e-15 when v_c = 0. The allocator prices with the unmatched `FactorProjection`: its quadrature marginal P(over 1.5) = 0.61245 matches the audit's Monte Carlo value. |
+| G4 | No exception handler added or widened; `test_only_sanctioned_exception_handlers_exist` passes with H1–H6. Above-cap variance now raises. |
+| G5 | Joint mean-variance over all candidates of a fixture, exact moments from `outcome_model` grids, Kelly, position, book-limit, market, slot and fixture constraints, then the slate cap. The reference test (`test_mean_variance_prefers_low_variance_line_at_similar_ev`) gives 1.942% on Over 1.5 and 0.044% on Over 2.5. |
+| G6 | Proof of bite on a worktree of `e67d8de`: the 26 new ingestion tests (I1 x18, I2 x4, I3, D2, K2, and the D2 merge count) fail (`26 failed, 12 passed`; the 12 are unchanged tests). Allocator, alert, engine and fitting tests import APIs that do not exist at `e67d8de`, so the old behaviour was reproduced directly there: exposure 5.0%, 9.8%, 14.3%, 18.5% over four cycles (S1); a $20,000 near-certain Under (S2); a future-dated quote aborting the call (S5); two alerts across a price tick (V2); `QuantEngine()` accepted with k = None (E1); a 1e-4 league rate clamped instead of refused (E2); the k fitter returning None in 55 of 300 samples of 20 matches (K1). |
+
+### Verification (2026-10-01, CPython 3.14.6, Windows 11, Git Bash)
+
+| Command | Result |
+|---|---|
+| `.venv\Scripts\python.exe -m compileall -q prop_alpha tests` | exit 0, no output |
+| `.venv\Scripts\python.exe -m pytest tests -q -p no:cacheprovider` | `307 passed` |
+| `bash ci/bootstrap.sh --preflight` | `preflight passed; nothing created or installed` |
+| `ci/bootstrap.sh` stage 6 (PostgreSQL) | **not run**: no database available. `schema.sql` and `migrations/004_merge_hardening.sql` are **[U]**. Stage 6 now applies 004 for idempotency, then 003 followed by 004 to rehearse the v3.2 upgrade. |
+
+| Suite | Tests |
+|---|---|
+| Core | 112 |
+| Integrity | 65 |
+| Agent contract | 42 |
+| Typing contract | 33 |
+| Concurrency | 20 |
+| Alerts | 16 |
+| Value screen | 19 |
+| **Total** | **307** |
+
+The audit prototype (`audit/hardened_allocator.py`, `audit/check_hardened_allocator.py`, added in `d140c30`)
+is superseded by the package code and was deleted; it remains in git history at that commit.

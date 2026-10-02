@@ -106,6 +106,70 @@ def test_transform_admits_possession_at_bounds(fixture_payload: PayloadFactory, 
     assert all(np.isfinite(value) for value in record.derived_features(DEFAULT_KAPPAS)[:3])
 
 
+def test_renamed_market_metric_fails_the_fixture(fixture_payload: PayloadFactory) -> None:
+    """I1: `fouls_committed` renamed to `fouls` used to parse as 90 minutes and 0 fouls."""
+    payload = fixture_payload()
+    stats = payload["players"][0]["stats"]
+    stats["fouls"] = stats.pop("fouls_committed")
+    with pytest.raises(ValueError, match="'fouls_committed' missing"):
+        parse_fixture_payload(payload)
+
+
+@pytest.mark.parametrize("metric", ["tackles_won", "fouls_committed", "fouls_drawn", "yellow_cards", "red_cards",
+                                    "tackles_attempted", "minutes"])
+def test_every_market_metric_is_required_on_the_pitch(fixture_payload: PayloadFactory, metric: str) -> None:
+    payload = fixture_payload()
+    del payload["players"][0]["stats"][metric]
+    with pytest.raises(ValueError, match="missing"):
+        parse_fixture_payload(payload)
+
+
+@pytest.mark.parametrize("started", ["false", "true", 0, 1, None])
+def test_started_must_be_a_json_boolean(fixture_payload: PayloadFactory, started: object) -> None:
+    """I1: bool("false") is True, which skewed avg_start and every starter's expected minutes."""
+    payload = fixture_payload()
+    payload["players"][1]["started"] = started
+    with pytest.raises(ValueError, match="JSON boolean"):
+        parse_fixture_payload(payload)
+
+
+@pytest.mark.parametrize("value", ["2", 2.5, True, None])
+def test_market_metric_must_be_an_integer(fixture_payload: PayloadFactory, value: object) -> None:
+    payload = fixture_payload()
+    payload["players"][0]["stats"]["fouls_committed"] = value
+    with pytest.raises(ValueError, match="not an integer"):
+        parse_fixture_payload(payload)
+
+
+def test_missing_stats_block_fails_and_unused_substitute_may_omit_metrics(fixture_payload: PayloadFactory) -> None:
+    payload = fixture_payload()
+    del payload["players"][0]["stats"]
+    with pytest.raises(ValueError, match="'stats' object missing"):
+        parse_fixture_payload(payload)
+    unused = fixture_payload()
+    unused["players"][1]["stats"] = {"minutes": 0}
+    record = parse_fixture_payload(unused).players[1]
+    assert (record.minutes_played, record.fouls_committed, record.tackles_attempted) == (0, 0, 0)
+    integral = fixture_payload()
+    integral["players"][0]["stats"]["fouls_committed"] = 2.0
+    assert parse_fixture_payload(integral).players[0].fouls_committed == 2
+
+
+def test_lineup_parse_validates_per_player_bench_probabilities() -> None:
+    from conftest import make_lineup_payload
+
+    from prop_alpha.ingestion.transform import parse_lineup_payload
+
+    payload = make_lineup_payload(n_bench=1)
+    bench = payload["lineups"]["T-HOME"]["bench"][0]
+    entries = {e.vendor_player_uid: e for e in parse_lineup_payload(payload, 0.35, {bench: 0.6})}
+    assert entries[bench].p_sub_appearance == 0.6
+    assert entries[payload["lineups"]["T-AWAY"]["bench"][0]].p_sub_appearance == 0.35
+    for bad in (1.5, -0.1, True):
+        with pytest.raises(ValueError):
+            parse_lineup_payload(payload, 0.35, {bench: bad})  # type: ignore[dict-item]
+
+
 def test_staging_rows_have_header_and_full_width(fixture_payload: PayloadFactory) -> None:
     parsed = parse_fixture_payload(fixture_payload(n_players=3))
     rows = build_staging_rows(parsed, DEFAULT_KAPPAS, "00000000-0000-0000-0000-000000000001")
@@ -198,6 +262,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = (ROOT / "schema.sql").read_text(encoding="utf-8")
 MIGRATION_002 = (ROOT / "migrations" / "002_staging_and_indexes.sql").read_text(encoding="utf-8")
 MIGRATION_003 = (ROOT / "migrations" / "003_integrity_constraints.sql").read_text(encoding="utf-8")
+MIGRATION_004 = (ROOT / "migrations" / "004_merge_hardening.sql").read_text(encoding="utf-8")
+MERGE_SOURCES = {"schema.sql": SCHEMA, "003": MIGRATION_003, "004": MIGRATION_004}
 CORE_CONSTRAINTS = (
     "chk_possession_bounds", "chk_minute_logic", "chk_tackles_won_le_attempted", "chk_duels_won_le_total",
 )
@@ -216,13 +282,21 @@ REJECT_PREDICATES = {
     "minute_off >= 0": ("c.minute_off < 0",),
 }
 
+# D1 (migration 004): NULL market metrics on a player who was on the pitch are rejected, never COALESCEd to 0.
+NULL_METRIC_PREDICATES = (
+    "OR c.minutes_played IS NULL",
+    "c.minutes_played > 0 AND (",
+    "c.tackles_attempted IS NULL", "c.tackles_won IS NULL", "c.fouls_committed   IS NULL",
+    "c.fouls_drawn IS NULL", "c.yellow_cards      IS NULL", "c.red_cards   IS NULL",
+)
+
 
 def _strip_comments(sql: str) -> str:
     return re.sub(r"--[^\n]*", "", sql)
 
 
 def _merge_function(sql: str) -> str:
-    start = sql.index("CREATE OR REPLACE FUNCTION prop_alpha.merge_staging_player_feed()")
+    start = sql.index("CREATE OR REPLACE FUNCTION prop_alpha.merge_staging_player_feed(")
     return sql[start:sql.index("$$;", start) + 3]
 
 
@@ -249,9 +323,9 @@ def _merge_stats_insert_columns(function: str) -> list[str]:
     return [column.strip() for column in match.group(1).replace("\n", " ").split(",")]
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "003"])
+@pytest.mark.parametrize("source", ["schema.sql", "003", "004"])
 def test_merge_rejects_every_row_a_core_constraint_would_refuse(source: str) -> None:
-    block = _player_reject_block(_merge_function(SCHEMA if source == "schema.sql" else MIGRATION_003))
+    block = _player_reject_block(_merge_function(MERGE_SOURCES[source]))
     for constraint, fragments in REJECT_PREDICATES.items():
         for fragment in fragments:
             assert fragment in block, f"{constraint}: missing L2 predicate {fragment!r}"
@@ -259,8 +333,32 @@ def test_merge_rejects_every_row_a_core_constraint_would_refuse(source: str) -> 
         assert f"CONSTRAINT {constraint}" in SCHEMA
 
 
+@pytest.mark.parametrize("source", ["schema.sql", "004"])
+def test_merge_rejects_null_market_metrics(source: str) -> None:
+    block = _player_reject_block(_merge_function(MERGE_SOURCES[source]))
+    for fragment in NULL_METRIC_PREDICATES:
+        assert fragment in block, f"missing D1 predicate {fragment!r}"
+    assert "c.minutes_played IS NULL" not in _player_reject_block(_merge_function(MIGRATION_003))
+
+
 def test_merge_function_identical_in_schema_and_latest_migration() -> None:
-    assert _merge_function(SCHEMA) == _merge_function(MIGRATION_003)
+    assert _merge_function(SCHEMA) == _merge_function(MIGRATION_004)
+    assert _merge_function(MIGRATION_003) != _merge_function(MIGRATION_004)
+
+
+def test_migration_004_replaces_the_zero_argument_function_in_one_transaction() -> None:
+    body = _strip_comments(MIGRATION_004)
+    statements = [line.strip() for line in body.splitlines() if line.strip()]
+    assert statements[:3] == [
+        "SET lock_timeout = '5s';", "BEGIN;", "DROP FUNCTION IF EXISTS prop_alpha.merge_staging_player_feed();",
+    ]
+    assert statements[3] == (
+        "CREATE OR REPLACE FUNCTION prop_alpha.merge_staging_player_feed(p_max_batches integer DEFAULT 200)"
+    )
+    assert statements[-2:] == ["COMMIT;", "RESET lock_timeout;"]
+    for statement in ("TRUNCATE", "VACUUM FULL", "CLUSTER", "ALTER COLUMN"):
+        assert statement not in body
+    assert "merge_staging_player_feed()" in pipeline.MERGE_SQL
 
 
 def test_superseded_002_merge_lacks_minute_logic_predicates() -> None:
@@ -301,30 +399,49 @@ def test_index_changes_in_002_are_concurrent_and_outside_the_transaction() -> No
 
 
 def test_referee_job_shares_merge_advisory_lock_key() -> None:
-    for sql in (SCHEMA, MIGRATION_003):
+    for sql in (SCHEMA, MIGRATION_003, MIGRATION_004):
         keys = re.findall(r"pg_advisory_xact_lock\(hashtext\('([^']+)'\)\)", sql)
         assert keys == [referee_job.MERGE_LOCK_KEY]
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "003"])
+@pytest.mark.parametrize("source", ["schema.sql", "003", "004"])
 def test_merge_drains_by_single_delete_returning_after_taking_the_lock(source: str) -> None:
-    function = _merge_function(SCHEMA if source == "schema.sql" else MIGRATION_003)
+    function = _merge_function(MERGE_SOURCES[source])
     body = _strip_comments(function[function.index("\nBEGIN\n"):])
     statements = [line.strip() for line in body.splitlines() if line.strip()]
     assert statements[0] == "BEGIN"
     assert statements[1] == "PERFORM pg_advisory_xact_lock(hashtext('prop_alpha.merge_staging_player_feed'));"
-    drain = (
-        "WITH drained AS (\n        DELETE FROM prop_alpha.staging_player_feed RETURNING *\n    )\n"
-        "    INSERT INTO claimed_feed SELECT * FROM drained;"
-    )
+    if source == "003":
+        drain = (
+            "WITH drained AS (\n        DELETE FROM prop_alpha.staging_player_feed RETURNING *\n    )\n"
+            "    INSERT INTO claimed_feed SELECT * FROM drained;"
+        )
+    else:
+        # D2: whole batches, oldest first, at most p_max_batches per call; still one claiming statement.
+        drain = (
+            "    WITH oldest AS (\n"
+            "        SELECT s.batch_id\n"
+            "        FROM prop_alpha.staging_player_feed s\n"
+            "        GROUP BY s.batch_id\n"
+            "        ORDER BY min(s.staged_at), s.batch_id\n"
+            "        LIMIT p_max_batches\n"
+            "    ), drained AS (\n"
+            "        DELETE FROM prop_alpha.staging_player_feed s\n"
+            "        USING oldest o\n"
+            "        WHERE s.batch_id = o.batch_id\n"
+            "        RETURNING s.*\n"
+            "    )\n"
+            "    INSERT INTO claimed_feed SELECT * FROM drained;"
+        )
     assert drain in function
+    assert function.count("DELETE FROM prop_alpha.staging_player_feed") == 1
     assert "RETURNS TABLE (fixtures_merged integer, player_rows_merged integer, rows_rejected integer)" in function
     for column in ("fixtures_merged", "player_rows_merged", "rows_rejected"):
         assert column in pipeline.MERGE_SQL
 
 
 def test_no_truncate_in_any_sql() -> None:
-    for sql in (SCHEMA, MIGRATION_002, MIGRATION_003):
+    for sql in (SCHEMA, MIGRATION_002, MIGRATION_003, MIGRATION_004):
         assert "TRUNCATE" not in _strip_comments(sql).upper()
 
 

@@ -8,11 +8,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Final
 
 import numpy as np
 from numpy.typing import ArrayLike
 from scipy.optimize import nnls
 from scipy.special import gammaln
+
+# Minimum sample for fitting k (maintainer decision 2, 2026-10-01): with a true k of 6 the moment estimate
+# reports no overdispersion in 15.8% of 50-match samples, 1.7% at 200 and none at 1,000.
+MIN_GAME_STATE_OBSERVATIONS: Final[int] = 200
 
 
 @dataclass(frozen=True)
@@ -161,20 +166,45 @@ def fit_referee_betas(
     return float(coefficients[1]), float(coefficients[2])
 
 
-def fit_game_state_dispersion(counts: ArrayLike, expected_counts: ArrayLike) -> float | None:
-    """NB2 method-of-moments shape k from out-of-sample expectations (PRD H2).
+def fit_game_state_dispersion(
+    counts: ArrayLike, expected_counts: ArrayLike, min_observations: int = MIN_GAME_STATE_OBSERVATIONS
+) -> float:
+    """NB2 method-of-moments shape k from out-of-sample expectations (PRD H2): 1/k = sum[(y - mu)^2 - y] / sum[mu^2].
 
-    1/k = sum[(y - mu)^2 - y] / sum[mu^2]. Returns None when the estimate of 1/k is <= 0 (no
-    overdispersion), which maps to QuantEngine(game_state_k=None).
+    Raises instead of returning "no overdispersion": on small samples the estimate is <= 0 by sampling
+    noise alone (26.7% of fits at 20 matches with a true k of 6), and there is no Poisson engine to fall
+    back to. Callers keep the previously fitted k when this raises.
     """
+    if isinstance(min_observations, bool) or not isinstance(min_observations, int) or min_observations < 1:
+        raise ValueError("min_observations must be a positive integer")
     y = _as_counts(counts, "counts")
     mu = _as_positive(expected_counts, "expected_counts")
     if mu.size != y.size:
         raise ValueError("counts and expected_counts must have equal length")
+    if y.size < min_observations:
+        raise ValueError(f"need at least {min_observations} matches to fit k, got {y.size}")
     inverse_k = float(np.sum((y - mu) ** 2 - y) / np.sum(mu**2))
-    if inverse_k <= 0.0:
-        return None
+    if not inverse_k > 0.0:
+        raise ValueError("no overdispersion detected; keep the previously fitted k instead of switching to Poisson")
     return 1.0 / inverse_k
+
+
+def bench_sub_probability(
+    bench_appearances: int, sub_appearances: int, league_mean: float, prior_strength: float
+) -> float:
+    """Beta-binomial posterior mean of P(comes on | named on the bench), shrunk towards the league mean.
+
+    `bench_appearances` counts every bench selection, used or not. Nothing persists unused selections
+    yet (vendor team sheets are not stored per fixture), so no caller can supply real counts today.
+    """
+    for name, value in (("bench_appearances", bench_appearances), ("sub_appearances", sub_appearances)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer")
+    if bench_appearances < 0 or not 0 <= sub_appearances <= bench_appearances:
+        raise ValueError("need 0 <= sub_appearances <= bench_appearances")
+    if not (0.0 < league_mean < 1.0 and math.isfinite(prior_strength) and prior_strength > 0.0):
+        raise ValueError("league_mean must lie in (0, 1) and prior_strength must be finite and positive")
+    return (sub_appearances + prior_strength * league_mean) / (bench_appearances + prior_strength)
 
 
 def fit_state_duel_density(

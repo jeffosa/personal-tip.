@@ -9,6 +9,8 @@ import pytest
 from conftest import make_lineup_payload
 
 from prop_alpha.calibration.fitting import (
+    MIN_GAME_STATE_OBSERVATIONS,
+    bench_sub_probability,
     fit_game_state_dispersion,
     fit_poisson_glm,
     fit_possession_kappa,
@@ -37,32 +39,53 @@ from prop_alpha.ingestion.transform import (
 from prop_alpha.modeling.engine import (
     MAX_RELATIVE_VARIANCE,
     MIN_RELATIVE_VARIANCE,
+    FactorProjection,
     GammaPosterior,
     LineupExpectation,
+    MinutesMixture,
     ProjectionError,
     PropProjection,
     QuantEngine,
     RefereeProfile,
+    SideProbabilities,
     VoidRule,
+    game_state_quadrature,
 )
 from prop_alpha.scanner.market_scanner import (
+    DEGENERATE_LOSS_PROBABILITY,
+    MODEL_RISK_LOSS_FLOOR,
+    AllocationReport,
     Candidate,
+    ExposureBook,
     InstitutionalAssetManager,
     LiveOddsQuote,
+    ProjectionKey,
     devig_two_way,
+    fixture_moments,
     kelly_fraction_with_push,
     outcome_model,
     price_for_ev,
     return_moments,
     solve_mean_variance,
+    stressed_probabilities,
 )
+
+NO_EXPOSURE = ExposureBook({})
+
+
+def _manager(bankroll: float, **kwargs: Any) -> InstitutionalAssetManager:
+    return InstitutionalAssetManager(bankroll, model_risk_loss_floor=kwargs.pop("floor", MODEL_RISK_LOSS_FLOOR), **kwargs)
+
+
+# k -> infinity limit: a finite k so large that 1/k vanishes against 1/alpha in double precision.
+NO_GAME_STATE_K = 1e300
 
 
 def test_predictive_gamma_exact_without_game_state() -> None:
     posterior = GammaPosterior(alpha=12.0, beta=6.0)
-    shape, rate = QuantEngine().predictive_gamma(posterior, 2.0)
-    assert shape == posterior.alpha
-    assert rate == posterior.beta / 2.0
+    shape, rate = QuantEngine(game_state_k=NO_GAME_STATE_K).predictive_gamma(posterior, 2.0, 0.0)
+    assert shape == pytest.approx(posterior.alpha, rel=1e-14)
+    assert rate == pytest.approx(posterior.beta / 2.0, rel=1e-14)
 
 
 def test_predictive_is_negative_binomial_with_posterior_mean() -> None:
@@ -73,34 +96,131 @@ def test_predictive_is_negative_binomial_with_posterior_mean() -> None:
 
 def test_game_state_mixing_widens_but_preserves_mean() -> None:
     posterior = GammaPosterior(alpha=9.0, beta=4.0)
-    plain_shape, plain_rate = QuantEngine().predictive_gamma(posterior, 1.5)
-    mixed_shape, mixed_rate = QuantEngine(game_state_k=4.0).predictive_gamma(posterior, 1.5)
+    plain_shape, plain_rate = QuantEngine(game_state_k=NO_GAME_STATE_K).predictive_gamma(posterior, 1.5, 0.0)
+    mixed_shape, mixed_rate = QuantEngine(game_state_k=4.0).predictive_gamma(posterior, 1.5, 0.0)
     assert mixed_shape < plain_shape
     assert mixed_shape / mixed_rate == pytest.approx(plain_shape / plain_rate)
 
 
 def test_predictive_gamma_stable_where_subtraction_form_cancels() -> None:
     posterior = GammaPosterior(alpha=1e17, beta=1e17 / 2.0)
-    shape, rate = QuantEngine().predictive_gamma(posterior, 1.0)
+    shape, rate = QuantEngine(game_state_k=NO_GAME_STATE_K).predictive_gamma(posterior, 1.0, 0.0)
     assert shape == 1.0 / MIN_RELATIVE_VARIANCE
     assert math.isfinite(shape) and math.isfinite(rate) and rate > 0.0
 
 
-def test_predictive_gamma_bounded_under_extreme_overdispersion() -> None:
-    shape, _ = QuantEngine(game_state_k=1e-9).predictive_gamma(GammaPosterior(4.0, 2.0), 1.0)
-    assert shape == 1.0 / MAX_RELATIVE_VARIANCE
+def test_predictive_gamma_raises_under_extreme_overdispersion() -> None:
+    # Decision 3 (2026-10-01): above MAX_RELATIVE_VARIANCE the inputs are degenerate; raise, never clamp.
+    with pytest.raises(ProjectionError, match="exceeds"):
+        QuantEngine(game_state_k=1e-9).predictive_gamma(GammaPosterior(4.0, 2.0), 1.0, 0.0)
+
+
+def test_tiny_league_rate_raises_instead_of_pricing_a_needle() -> None:
+    # Prior-only player at league rate 1e-4: v = 1/alpha = 1/6e-4 ~ 1667 > MAX_RELATIVE_VARIANCE.
+    engine = QuantEngine(game_state_k=6.0)
+    posterior = engine.positional_prior(1e-4)
+    assert 1.0 / posterior.alpha > MAX_RELATIVE_VARIANCE
+    with pytest.raises(ProjectionError, match="degenerate"):
+        engine.predictive_gamma(posterior, 1.0, 0.0)
 
 
 def test_math_clamp_is_logged(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level("WARNING", logger="prop_alpha.engine"):
-        QuantEngine(game_state_k=1e-9).predictive_gamma(GammaPosterior(4.0, 2.0), 1.0)
+        QuantEngine(game_state_k=NO_GAME_STATE_K).predictive_gamma(GammaPosterior(1e17, 1e17), 1.0, 0.0)
     assert "[MATH_CLAMP]" in caplog.text
 
 
 def test_no_math_clamp_for_ordinary_inputs(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level("WARNING", logger="prop_alpha.engine"):
-        QuantEngine(game_state_k=6.0).predictive_gamma(GammaPosterior(20.0, 10.0), 1.0)
+        QuantEngine(game_state_k=6.0).predictive_gamma(GammaPosterior(20.0, 10.0), 1.0, 0.0)
     assert "[MATH_CLAMP]" not in caplog.text
+
+
+def test_game_state_k_is_mandatory() -> None:
+    with pytest.raises(TypeError):
+        QuantEngine()  # type: ignore[call-arg]
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            QuantEngine(game_state_k=bad)
+
+
+def test_relative_variance_without_multiplier_matches_the_additive_form() -> None:
+    posterior = GammaPosterior(alpha=29.2, beta=11.944)
+    k = 6.0
+    shape, rate = QuantEngine(game_state_k=k).predictive_gamma(posterior, 1.0, 0.0)
+    additive = 1.0 / posterior.alpha + 1.0 / k + 1.0 / (posterior.alpha * k)
+    assert abs(1.0 / shape - additive) <= 1e-15
+    assert shape / rate == pytest.approx(posterior.alpha / posterior.beta, rel=1e-15)
+
+
+def test_multiplier_variance_widens_the_predictive_distribution() -> None:
+    engine = QuantEngine(game_state_k=6.0)
+    posterior = GammaPosterior(alpha=30.0, beta=25.0)
+    plain_shape, plain_rate = engine.predictive_gamma(posterior, 0.15, 0.0)
+    wide_shape, wide_rate = engine.predictive_gamma(posterior, 0.15, 0.25)
+    assert wide_shape < plain_shape
+    assert wide_shape / wide_rate == pytest.approx(plain_shape / plain_rate, rel=1e-14)
+    expected = (1.0 + 1.0 / 30.0) * (1.0 + 1.0 / 6.0) * 1.25 - 1.0
+    assert 1.0 / wide_shape == pytest.approx(expected, rel=1e-14)
+    with pytest.raises(ProjectionError):
+        engine.predictive_gamma(posterior, 0.15, -0.1)
+
+
+def test_card_projection_takes_the_multiplier_variance() -> None:
+    engine = QuantEngine(game_state_k=6.0)
+    kwargs: dict[str, Any] = dict(
+        fixture_id=1, player_id=2, foul_counts=[2, 1, 3, 2], minutes=[90.0, 90.0, 80.0, 90.0],
+        league_foul_rate_per90=1.4, referee=RefereeProfile(1.1, 0.15, 0.01, 0.05), is_home=False,
+        lineup=LineupExpectation(1.0, 0.0),
+    )
+    certain = engine.project_card_market(card_multiplier_relative_variance=0.0, **kwargs)
+    uncertain = engine.project_card_market(card_multiplier_relative_variance=0.25, **kwargs)
+    assert uncertain.gamma_shape < certain.gamma_shape
+    assert uncertain.rate_per90 == pytest.approx(certain.rate_per90, rel=1e-14)
+    factor = engine.factor_card_market(card_multiplier_relative_variance=0.25, **kwargs)
+    assert factor.rate_per90 == pytest.approx(certain.rate_per90, rel=1e-14)
+    assert factor.rate_posterior.alpha < engine.factor_card_market(card_multiplier_relative_variance=0.0, **kwargs).rate_posterior.alpha
+    with pytest.raises(TypeError):
+        engine.project_card_market(**kwargs)
+
+
+# ---------------- minutes mixtures (E4) ----------------
+def test_minutes_mixture_prices_the_mix_not_its_mean() -> None:
+    mixture = MinutesMixture((90.0, 70.0, 45.0), (0.65, 0.15, 0.20))
+    assert mixture.mean == pytest.approx(78.0)
+    fixed = PropProjection(1, 2, "fouls", 6.0, 6.0 / 1.4, LineupExpectation(1.0, 0.0, 78.0, 20.0))
+    mixed = PropProjection(1, 2, "fouls", 6.0, 6.0 / 1.4, LineupExpectation(1.0, 0.0, 78.0, 20.0, start_mixture=mixture))
+    by_hand = math.fsum(
+        weight * float(fixed.count_distribution(minutes).cdf(1))
+        for minutes, weight in zip(mixture.minutes, mixture.weights)
+    )
+    under_mixed = mixed.side_probabilities(1.5, "under").p_win
+    assert under_mixed == pytest.approx(by_hand, abs=1e-14)
+    assert under_mixed > fixed.side_probabilities(1.5, "under").p_win + 0.002
+
+
+def test_minutes_mixture_keeps_ev_and_covariance_consistent() -> None:
+    mixture = MinutesMixture((90.0, 70.0, 45.0), (0.65, 0.15, 0.20))
+    projection = PropProjection(1, 2, "fouls", 6.0, 6.0 / 1.4, LineupExpectation(0.8, 0.1, 78.0, 20.0, start_mixture=mixture))
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    quote = LiveOddsQuote(1, 2, "fouls", 1.5, 2.0, None, 100.0, "Book", now, VoidRule.NO_VOID)
+    probs = projection.side_probabilities(1.5, "over", VoidRule.NO_VOID)
+    mean_returns, _ = return_moments(*outcome_model(projection, [Candidate(quote, "over", 2.0, probs, None, 0.0, 0.0)]))
+    assert mean_returns[0] == pytest.approx(probs.p_win * 1.0 - probs.p_lose, abs=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("minutes", "weights"),
+    [((), ()), ((90.0,), (0.5,)), ((0.0,), (1.0,)), ((131.0,), (1.0,)), ((90.0, 45.0), (1.2, -0.2))],
+)
+def test_minutes_mixture_rejects_invalid_input(minutes: tuple[float, ...], weights: tuple[float, ...]) -> None:
+    with pytest.raises(ValueError):
+        MinutesMixture(minutes, weights)
+
+
+def test_lineup_mixture_mean_must_match_expected_minutes() -> None:
+    with pytest.raises(ValueError, match="must equal"):
+        LineupExpectation(1.0, 0.0, 85.0, 20.0, start_mixture=MinutesMixture((90.0, 45.0), (0.5, 0.5)))
 
 
 @pytest.mark.parametrize("void_rule", list(VoidRule))
@@ -122,8 +242,8 @@ def test_complementary_lineup_leaves_no_negative_absence_weight(p_start: float, 
     projection = PropProjection(1, 2, "tackles", 7.0, 3.0, lineup)
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     over_price = price_for_ev(projection.side_probabilities(1.5, "over"), 0.10)
-    quote = LiveOddsQuote(1, 2, "tackles", 1.5, over_price, None, 100.0, "Book", now)
-    candidates, _ = InstitutionalAssetManager(1_000.0)._candidates(projection, [quote])
+    quote = LiveOddsQuote(1, 2, "tackles", 1.5, over_price, None, 100.0, "Book", now, VoidRule.VOID_IF_NO_APPEARANCE)
+    candidates, _ = _manager(1_000.0)._candidates(projection, [quote])
     probabilities, _ = outcome_model(projection, candidates)
     assert (probabilities >= 0.0).all()
 
@@ -191,12 +311,26 @@ def _reference_projection(fixture_id: int = 1001, player_id: int = 55) -> PropPr
     )
 
 
+def _reference_factor(fixture_id: int = 1001, player_id: int = 55) -> FactorProjection:
+    return QuantEngine(game_state_k=6.0).factor_count_market(
+        fixture_id=fixture_id,
+        player_id=player_id,
+        market_type="tackles",
+        counts=[3, 2, 4, 3, 1, 3],
+        minutes=[90.0, 90.0, 90.0, 85.0, 90.0, 90.0],
+        league_rate_per90=2.2,
+        referee=RefereeProfile(1.0, 0.13, 0.004, 0.0),
+        is_home=True,
+        lineup=LineupExpectation(0.92, 0.05, 86.0, 20.0),
+    )
+
+
 def _reference_quote(
-    projection: PropProjection,
+    projection: PropProjection | FactorProjection,
     line: float,
     target_ev: float,
     sportsbook: str,
-    now: object,
+    now: datetime,
 ) -> LiveOddsQuote:
     over_probabilities = projection.side_probabilities(line, "over")
     under_probabilities = projection.side_probabilities(line, "under")
@@ -210,19 +344,18 @@ def _reference_quote(
         max_stake=500.0,
         sportsbook=sportsbook,
         captured_at=now,
+        void_rule=VoidRule.VOID_IF_NO_APPEARANCE,
     )
 
 
 def test_mean_variance_prefers_low_variance_line_at_similar_ev() -> None:
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    projection = _reference_projection()
+    projection = _reference_factor()
     quotes = [
         _reference_quote(projection, 1.5, 0.060, "BookA", now),
         _reference_quote(projection, 2.5, 0.062, "BookB", now),
     ]
-    report = InstitutionalAssetManager(10_000.0).allocate(
-        {(1001, 55, "tackles"): projection}, quotes, now=now
-    )
+    report = _manager(10_000.0).allocate({(1001, 55, "tackles"): projection}, quotes, now=now, exposure=NO_EXPOSURE)
     fractions = {directive.line_value: directive.fraction for directive in report.directives}
     assert fractions[1.5] == pytest.approx(0.0194, abs=0.0002)
     assert fractions[2.5] == pytest.approx(0.0004, abs=0.0002)
@@ -252,7 +385,7 @@ def test_cross_line_covariance_matches_brute_force() -> None:
         _reference_quote(projection, 1.5, 0.060, "BookA", now),
         _reference_quote(projection, 2.5, 0.062, "BookB", now),
     ]
-    manager = InstitutionalAssetManager(10_000.0)
+    manager = _manager(10_000.0)
     candidates, _ = manager._candidates(projection, quotes)
     probabilities, payoffs = outcome_model(projection, candidates)
     _, covariance = return_moments(probabilities, payoffs)
@@ -313,35 +446,36 @@ def test_higher_risk_aversion_reduces_exposure() -> None:
 def test_fixture_cap_scales_correlated_positions() -> None:
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     projections = {
-        (1001, player_id, "tackles"): _reference_projection(1001, player_id)
+        (1001, player_id, "tackles"): _reference_factor(1001, player_id)
         for player_id in (55, 56, 57)
     }
     quotes = [
         _reference_quote(projection, 1.5, 0.06, f"Book{player_id}", now)
         for (_, player_id, _), projection in projections.items()
     ]
-    report = InstitutionalAssetManager(10_000.0).allocate(projections, quotes, now=now)
+    report = _manager(10_000.0).allocate(projections, quotes, now=now, exposure=NO_EXPOSURE)
     assert sum(directive.fraction for directive in report.directives) <= 0.05001
     assert sum(directive.stake for directive in report.directives) <= 500.0
 
 
 def test_certain_outcome_is_flagged_not_staked() -> None:
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    projection = PropProjection(1, 2, "tackles", 3.0, 2.0, LineupExpectation(0.0, 0.0))
+    projection = FactorProjection(1, 2, "tackles", GammaPosterior(3.0, 2.0), 6.0, LineupExpectation(0.0, 0.0))
     quote = LiveOddsQuote(1, 2, "tackles", 0.5, None, 1.5, 100.0, "Book", now, VoidRule.NO_VOID)
-    report = InstitutionalAssetManager(1_000.0).allocate({(1, 2, "tackles"): projection}, [quote], now)
+    report = _manager(1_000.0).allocate({(1, 2, "tackles"): projection}, [quote], now=now, exposure=NO_EXPOSURE)
     assert not report.directives
     assert any("degenerate outcome" in reason for _, reason in report.skipped)
 
 
 def test_best_price_kept_and_stale_quotes_dropped() -> None:
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    projection = _reference_projection()
+    projection = _reference_factor()
     best = _reference_quote(projection, 1.5, 0.06, "BookA", now)
+    assert best.over_price is not None
     better = LiveOddsQuote(**{**best.__dict__, "over_price": best.over_price + 0.05, "sportsbook": "BookB"})
     stale = LiveOddsQuote(**{**best.__dict__, "captured_at": now - timedelta(minutes=6)})
-    report = InstitutionalAssetManager(10_000.0).allocate(
-        {(1001, 55, "tackles"): projection}, [best, better, stale], now=now
+    report = _manager(10_000.0).allocate(
+        {(1001, 55, "tackles"): projection}, [best, better, stale], now=now, exposure=NO_EXPOSURE
     )
     assert report.stale_quotes == 1
     assert any(directive.sportsbook == "BookB" for directive in report.directives)
@@ -349,10 +483,10 @@ def test_best_price_kept_and_stale_quotes_dropped() -> None:
 
 def test_sub_minimum_stakes_recorded_in_skipped_directives() -> None:
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    projection = _reference_projection()
+    projection = _reference_factor()
     quote = _reference_quote(projection, 1.5, 0.06, "Book", now)
-    report = InstitutionalAssetManager(10.0, min_stake=1.0).allocate(
-        {(1001, 55, "tackles"): projection}, [quote], now=now
+    report = _manager(10.0, min_stake=1.0).allocate(
+        {(1001, 55, "tackles"): projection}, [quote], now=now, exposure=NO_EXPOSURE
     )
     assert not report.directives
     assert report.skipped_directives
@@ -363,16 +497,226 @@ def test_devig_sums_to_one() -> None:
     assert over_probability + under_probability == pytest.approx(1.0)
 
 
-def test_allocate_requires_explicit_utc_time() -> None:
-    manager = InstitutionalAssetManager(100.0)
+def test_allocate_requires_explicit_utc_time_and_exposure() -> None:
+    manager = _manager(100.0)
     with pytest.raises(ValueError):
-        manager.allocate({}, [])
+        manager.allocate({}, [], now=datetime(2026, 1, 1), exposure=NO_EXPOSURE)
+    with pytest.raises(TypeError):
+        manager.allocate({}, [])  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        manager.allocate({}, [], now=datetime(2026, 1, 1, tzinfo=timezone.utc))  # type: ignore[call-arg]
+
+
+# ---------------- hardened allocator (S1-S7) ----------------
+NOW = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+STARTER = LineupExpectation(1.0, 0.0)
+AUDIT_POSTERIOR = GammaPosterior(29.2, 11.944)
+
+
+def _quote(
+    fixture_id: int, player_id: int, line: float, over: float | None, under: float | None,
+    max_stake: float = 1e9, book: str = "A", at: datetime = NOW,
+) -> LiveOddsQuote:
+    return LiveOddsQuote(fixture_id, player_id, "tackles", line, over, under, max_stake, book, at,
+                         VoidRule.VOID_IF_NO_APPEARANCE)
+
+
+def _audit_fixture(n_players: int = 4) -> dict[ProjectionKey, FactorProjection]:
+    return {
+        (9, player, "tackles"): FactorProjection(9, player, "tackles", AUDIT_POSTERIOR, 6.0, STARTER)
+        for player in range(1, n_players + 1)
+    }
+
+
+def _book_from(report: AllocationReport, book: dict[ProjectionKey, float]) -> dict[ProjectionKey, float]:
+    for directive in report.directives:
+        key = (directive.fixture_id, directive.player_id, directive.market_type)
+        book[key] = book.get(key, 0.0) + directive.stake
+    return book
+
+
+def test_exposure_book_stops_restaking_a_persistent_edge() -> None:
+    """S1: four cycles feeding stakes back keep the fixture at 5% (previously 5.0, 9.8, 14.3, 18.5%)."""
+    projections = _audit_fixture()
+    quotes = [_quote(9, player, 1.5, 1.714, None) for player in range(1, 5)]
+    manager = _manager(1e6)
+    book: dict[ProjectionKey, float] = {}
+    issued: list[float] = []
+    for _ in range(4):
+        report = manager.allocate(projections, quotes, now=NOW, exposure=ExposureBook(dict(book)))
+        issued.append(math.fsum(d.stake for d in report.directives))
+        _book_from(report, book)
+    assert issued[0] > 0.0 and issued[1:] == [0.0, 0.0, 0.0]
+    assert math.fsum(book.values()) <= 0.05 * 1e6 + 0.01
+    last = manager.allocate(projections, quotes, now=NOW, exposure=ExposureBook(dict(book)))
+    assert all("cap already used" in reason for _, reason in last.skipped)
+
+
+def test_exposure_book_caps_each_market_net_of_its_open_position() -> None:
+    projections = _audit_fixture(1)
+    quote = _quote(9, 1, 1.5, 1.714, None)
+    first = _manager(1e6).allocate(projections, [quote], now=NOW, exposure=NO_EXPOSURE)
+    assert 0.01 < first.directives[0].fraction <= 0.02
+    open_amount = 0.015 * 1e6
+    second = _manager(1e6).allocate(
+        projections, [quote], now=NOW, exposure=ExposureBook({(9, 1, "tackles"): open_amount})
+    )
+    available = 1e6 - open_amount
+    assert second.directives[0].stake + open_amount <= 0.02 * available + 0.01
+    assert second.directives[0].stake < first.directives[0].stake
+
+
+def test_exposure_book_rejects_invalid_amounts() -> None:
+    for amount in (-1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            ExposureBook({(1, 2, "tackles"): amount})
+
+
+def _near_certain_under(price: float) -> tuple[dict[ProjectionKey, FactorProjection], LiveOddsQuote]:
+    """0.31 tackles per 90 (posterior 14.4 / 46.0): Under 2.5 loses well under 1% of the time."""
+    projection = FactorProjection(7, 7, "tackles", GammaPosterior(14.4, 46.0), 6.0, STARTER)
+    return {(7, 7, "tackles"): projection}, LiveOddsQuote(
+        7, 7, "tackles", 2.5, 8.0, price, 1e9, "A", NOW, VoidRule.VOID_IF_NO_APPEARANCE
+    )
+
+
+def test_loss_floor_removes_the_near_certain_under() -> None:
+    """S2: at 1.05 this Under takes the full 2% cap ($20,000 to win $1,000) without the floor and nothing with
+    it (haircut EV 0.97 x 0.05 - 0.03 < alpha 0.02). At 1.06 the haircut EV is 0.028 > alpha, so the
+    allocator still sizes it; the value screen's 4% minimum stops the alert (test_value_screen)."""
+    projections, quote = _near_certain_under(1.05)
+    probabilities = projections[(7, 7, "tackles")].side_probabilities(2.5, "under")
+    assert DEGENERATE_LOSS_PROBABILITY < probabilities.p_lose < 0.01
+    unfloored = _manager(1e6, floor=0.0).allocate(projections, [quote], now=NOW, exposure=NO_EXPOSURE)
+    assert [(d.side, d.stake) for d in unfloored.directives] == [("under", 20_000.0)]
+    floored = _manager(1e6).allocate(projections, [quote], now=NOW, exposure=NO_EXPOSURE)
+    assert not floored.directives
+    assert any(key == (7, 7, "tackles") for key, _ in floored.skipped)
+
+
+
+def test_stressed_probabilities_move_win_mass_to_loss_only() -> None:
+    stressed = stressed_probabilities(SideProbabilities(0.9, 0.004, 0.096), 0.03)
+    assert (stressed.p_win, stressed.p_lose, stressed.p_void) == pytest.approx((0.874, 0.03, 0.096))
+    untouched = SideProbabilities(0.5, 0.4, 0.1)
+    assert stressed_probabilities(untouched, 0.03) == untouched
+    with pytest.raises(ValueError):
+        stressed_probabilities(untouched, 1.0)
+    with pytest.raises(ValueError):
+        _manager(1e6, floor=-0.01)
+    with pytest.raises(TypeError):
+        InstitutionalAssetManager(1e6)  # type: ignore[call-arg]
+
+
+def test_shared_game_state_covariance_matches_monte_carlo() -> None:
+    """S3: four players in one fixture share G; the cross-player covariance matches simulation."""
+    projections = _audit_fixture()
+    price = 1.714
+    manager = _manager(1e6)
+    candidate_sets = [manager._candidates(projections[(9, p, "tackles")], [_quote(9, p, 1.5, price, None)])[0]
+                      for p in range(1, 5)]
+    nodes, weights = game_state_quadrature(6.0)
+    grids = [[outcome_model(projections[(9, p, "tackles")].conditional(float(g)), candidates) for g in nodes]
+             for p, candidates in zip(range(1, 5), candidate_sets)]
+    mean, covariance = fixture_moments(grids, weights)
+    rng = np.random.default_rng(1)
+    n = 400_000
+    shared = rng.gamma(6.0, 1.0 / 6.0, n)
+    returns = np.array([
+        np.where(rng.poisson(rng.gamma(29.2, 1.0 / 11.944, n) * shared * 85.0 / 90.0) > 1.5, price - 1.0, -1.0)
+        for _ in range(4)
+    ])
+    simulated = np.cov(returns)
+    assert abs(covariance[0, 1] - simulated[0, 1]) < 3e-3
+    assert covariance[0, 1] > 0.05
+    assert mean[0] == pytest.approx(float(returns[0].mean()), abs=5e-3)
+    marginal = projections[(9, 1, "tackles")].side_probabilities(1.5, "over").p_win
+    assert marginal == pytest.approx(float(np.mean(returns[0] > 0.0)), abs=3e-3)
+
+
+def test_game_state_quadrature_is_exact_for_the_first_moments_and_large_k() -> None:
+    for k in (0.5, 6.0, 1e3, 1e6):
+        nodes, weights = game_state_quadrature(k)
+        assert float(weights @ nodes) == pytest.approx(1.0, abs=1e-12)
+        assert float(weights @ (nodes - 1.0) ** 2) == pytest.approx(1.0 / k, rel=1e-9)
+    with pytest.raises(ProjectionError):
+        game_state_quadrature(0.0)
+
+
+def test_corrupt_factor_projection_is_skipped_never_traded() -> None:
+    healthy = _reference_factor()
+    corrupt = FactorProjection(1001, 99, "tackles", GammaPosterior(3.0, 1.5), 6.0, LineupExpectation(1.0, 0.0))
+    object.__setattr__(corrupt.rate_posterior, "alpha", float("nan"))  # simulates a validator bypass
+    quotes = [
+        _reference_quote(healthy, 1.5, 0.06, "BookA", NOW),
+        LiveOddsQuote(1001, 99, "tackles", 2.5, 1.9, 1.25, 500.0, "BookA", NOW, VoidRule.VOID_IF_NO_APPEARANCE),
+    ]
+    report = _manager(10_000.0).allocate(
+        {(1001, 55, "tackles"): healthy, (1001, 99, "tackles"): corrupt}, quotes, now=NOW, exposure=NO_EXPOSURE
+    )
+    assert report.directives and all(d.player_id == 55 for d in report.directives)
+    assert any(key == (1001, 99, "tackles") and reason.startswith("projection unusable") for key, reason in report.skipped)
+
+
+def test_void_rule_must_be_stated_on_every_quote() -> None:
+    """S4: a book that settles NO_VOID must not be priced as VOID_IF_NO_APPEARANCE by default."""
+    with pytest.raises(TypeError):
+        LiveOddsQuote(1, 2, "tackles", 1.5, 1.9, None, 100.0, "Book", NOW)  # type: ignore[call-arg]
+
+
+def test_future_dated_quote_is_skipped_and_counted() -> None:
+    """S5: one book clock 2 s fast no longer blocks every other market."""
+    projections = _audit_fixture(2)
+    quotes = [_quote(9, 1, 1.5, 1.714, None), _quote(9, 2, 1.5, 1.714, None, at=NOW + timedelta(seconds=2))]
+    report = _manager(1e6).allocate(projections, quotes, now=NOW, exposure=NO_EXPOSURE)
+    assert report.future_quotes == 1
+    assert [d.player_id for d in report.directives] == [1]
+    assert any(key == (9, 2, "tackles") and "clock skew" in reason for key, reason in report.skipped)
+
+
+def test_small_limit_book_no_longer_hides_a_deep_book() -> None:
+    """S6: a $5-limit book at a better price and a $50,000 book both get directives, within their limits."""
+    projections = _audit_fixture(1)
+    quotes = [_quote(9, 1, 1.5, 1.72, None, max_stake=5.0, book="Tiny"),
+              _quote(9, 1, 1.5, 1.71, None, max_stake=50_000.0, book="Deep")]
+    report = _manager(1e6).allocate(projections, quotes, now=NOW, exposure=NO_EXPOSURE)
+    stakes = {d.sportsbook: d.stake for d in report.directives}
+    assert set(stakes) == {"Tiny", "Deep"}
+    assert stakes["Tiny"] <= 5.0 and stakes["Deep"] > 1_000.0
+    assert math.fsum(d.fraction for d in report.directives) <= 0.02 + 1e-9
+
+
+def test_book_limit_is_in_the_optimiser_not_clipped_afterwards() -> None:
+    projections = _audit_fixture(1)
+    report = _manager(1e6).allocate(projections, [_quote(9, 1, 1.5, 1.714, None, max_stake=50.0)],
+                                    now=NOW, exposure=NO_EXPOSURE)
+    (directive,) = report.directives
+    assert directive.stake == pytest.approx(50.0) and directive.fraction == pytest.approx(50.0 / 1e6)
+    (allocation,) = report.allocations
+    assert allocation.expected_return == pytest.approx(directive.fraction * directive.ev_per_unit, rel=1e-3)
+
+
+def test_directive_carries_price_floor_and_expiry() -> None:
+    """S7: min_acceptable_odds is the alpha_threshold price rounded up to 0.001; expiry is capture + 5 min."""
+    projections = _audit_fixture(1)
+    report = _manager(1e6).allocate(projections, [_quote(9, 1, 1.5, 1.714, None)], now=NOW, exposure=NO_EXPOSURE)
+    (directive,) = report.directives
+    probabilities = _stressed_audit_probabilities(directive.line_value, directive.side)
+    expected_floor = math.ceil(price_for_ev(probabilities, 0.02) * 1000.0 - 1e-9) / 1000.0
+    assert directive.min_acceptable_odds == pytest.approx(expected_floor, abs=1e-12)
+    assert directive.min_acceptable_odds <= directive.decimal_odds
+    assert directive.expires_at == NOW + timedelta(minutes=5)
+
+
+def _stressed_audit_probabilities(line: float, side: str) -> SideProbabilities:
+    projection = FactorProjection(9, 1, "tackles", AUDIT_POSTERIOR, 6.0, STARTER)
+    return stressed_probabilities(projection.side_probabilities(line, side), MODEL_RISK_LOSS_FLOOR)
 
 
 # ---------------- engine: dependence and fail-closed allocation ----------------
 def test_bivariate_marginal_is_equidispersed_poisson() -> None:
     lambda_x, lambda_y, lambda_shared = 1.3, 0.8, 0.4
-    engine = QuantEngine()
+    engine = QuantEngine(game_state_k=6.0)
     marginal = np.array([
         math.fsum(engine.bivariate_poisson_pmf(x, y, lambda_x, lambda_y, lambda_shared) for y in range(60))
         for x in range(40)
@@ -386,34 +730,15 @@ def test_bivariate_marginal_is_equidispersed_poisson() -> None:
 
 
 def test_joint_over_probability_matches_monte_carlo() -> None:
-    engine = QuantEngine()
+    engine = QuantEngine(game_state_k=6.0)
     exact = engine.joint_over_probability(1.5, 0.5, 1.3, 0.8, 0.4)
     xs, ys = engine.sample_bivariate_poisson(1.3, 0.8, 0.4, 200_000, np.random.default_rng(7))
     assert exact == pytest.approx(float(np.mean((xs > 1.5) & (ys > 0.5))), abs=0.005)
 
 
-def test_corrupted_projection_is_skipped_never_traded() -> None:
-    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    healthy = _reference_projection()
-    corrupt = PropProjection(1001, 99, "tackles", 3.0, 1.5, LineupExpectation(1.0, 0.0))
-    object.__setattr__(corrupt, "gamma_shape", float("nan"))  # simulates a validator bypass
-    quotes = [
-        _reference_quote(healthy, 1.5, 0.06, "BookA", now),
-        LiveOddsQuote(1001, 99, "tackles", 2.5, 1.9, 1.25, 500.0, "BookA", now),
-    ]
-    report = InstitutionalAssetManager(10_000.0).allocate(
-        {(1001, 55, "tackles"): healthy, (1001, 99, "tackles"): corrupt}, quotes, now=now
-    )
-    assert report.directives
-    assert all(directive.player_id == 55 for directive in report.directives)
-    assert any(
-        key == (1001, 99, "tackles") and reason.startswith("projection unusable") for key, reason in report.skipped
-    )
-
-
 def test_projection_error_raised_for_non_finite_multiplier() -> None:
     with pytest.raises(ProjectionError):
-        QuantEngine().predictive_gamma(GammaPosterior(4.0, 2.0), float("nan"))
+        QuantEngine(game_state_k=6.0).predictive_gamma(GammaPosterior(4.0, 2.0), float("nan"), 0.0)
 
 
 # ---------------- transforms ----------------
@@ -547,14 +872,36 @@ def test_referee_betas_recovered() -> None:
     assert beta2 == pytest.approx(0.9, abs=0.3)
 
 
-def test_game_state_dispersion_recovers_k_and_returns_none_without_overdispersion() -> None:
+def test_game_state_dispersion_recovers_k() -> None:
     rng = np.random.default_rng(14)
     mu = rng.uniform(1.0, 3.0, size=40_000)
     k = 5.0
     overdispersed = rng.poisson(mu * rng.gamma(k, 1.0 / k, size=mu.size))
-    estimate = fit_game_state_dispersion(overdispersed, mu)
-    assert estimate is not None and estimate == pytest.approx(k, rel=0.15)
-    assert fit_game_state_dispersion(np.array([1, 2, 1, 2]), np.array([1.5, 1.5, 1.5, 1.5])) is None
+    assert fit_game_state_dispersion(overdispersed, mu) == pytest.approx(k, rel=0.15)
+
+
+def test_game_state_dispersion_raises_instead_of_returning_poisson() -> None:
+    """K1: no overdispersion, or too few matches, raises; the caller keeps its previously fitted k."""
+    assert MIN_GAME_STATE_OBSERVATIONS == 200
+    flat_counts, flat_mu = np.array([1, 2] * 100), np.full(200, 1.5)
+    with pytest.raises(ValueError, match="no overdispersion"):
+        fit_game_state_dispersion(flat_counts, flat_mu)
+    rng = np.random.default_rng(15)
+    mu = rng.uniform(1.0, 3.0, size=199)
+    with pytest.raises(ValueError, match="at least 200"):
+        fit_game_state_dispersion(rng.poisson(mu * rng.gamma(6.0, 1.0 / 6.0, size=199)), mu)
+
+
+def test_bench_sub_probability_shrinks_towards_the_league_mean() -> None:
+    """K2: no history gives the league mean; growing history moves towards the player's own rate."""
+    assert bench_sub_probability(0, 0, 0.35, 10.0) == pytest.approx(0.35)
+    few = bench_sub_probability(5, 5, 0.35, 10.0)
+    many = bench_sub_probability(200, 200, 0.35, 10.0)
+    assert 0.35 < few < many < 1.0
+    assert bench_sub_probability(200, 20, 0.35, 10.0) == pytest.approx((20 + 3.5) / 210.0)
+    for args in ((-1, 0, 0.35, 10.0), (3, 4, 0.35, 10.0), (3, 1, 1.0, 10.0), (3, 1, 0.35, 0.0)):
+        with pytest.raises(ValueError):
+            bench_sub_probability(*args)
 
 
 def test_state_duel_density_exact_on_noiseless_data() -> None:
@@ -639,7 +986,7 @@ def test_summarize_reports_brier_skill_against_climatology() -> None:
         [_observation(i, 1 + i, True, 90.0, count) for i, count in enumerate([0, 3, 1, 4, 2, 0, 5, 1])],
         1.5,
         2.0,
-        QuantEngine(),
+        QuantEngine(game_state_k=6.0),
     )
     summary = summarize(predictions)
     assert summary["n"] == 8.0

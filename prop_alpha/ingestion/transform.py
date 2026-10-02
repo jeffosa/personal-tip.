@@ -10,6 +10,10 @@ from prop_alpha.modeling.engine import MAX_MATCH_MINUTES
 
 VALID_STATUSES: Final[frozenset[str]] = frozenset({"scheduled", "live", "final", "postponed"})
 
+# Stats that price a market. Each is required (an integer) whenever the player was on the pitch: a renamed
+# vendor field must fail the fixture, never parse as 0 and manufacture Under edges across a league.
+MARKET_METRICS: Final[tuple[str, ...]] = ("tackles_won", "fouls_committed", "fouls_drawn", "yellow_cards", "red_cards")
+
 # Standard linear possession adjustment until fitted values (fit_possession_kappa) are loaded.
 DEFAULT_KAPPAS: Final[Mapping[str, float]] = MappingProxyType({"tackles": 1.0, "interceptions": 1.0, "fouls": 1.0})
 
@@ -153,8 +157,32 @@ class ParsedFixture:
 
 
 def _count(stats: Mapping[str, Any], key: str) -> int:
+    """Lenient read for auxiliary metrics (zone 14 entries and the like): a missing key counts as 0."""
     value = stats.get(key)
     return int(value) if value is not None else 0
+
+
+def _require_int(stats: Mapping[str, Any], key: str, player_uid: str) -> int:
+    if key not in stats:
+        raise ValueError(f"player {player_uid}: stats field {key!r} missing (vendor schema drift?)")
+    value = stats[key]
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"player {player_uid}: stats field {key!r} is not an integer ({value!r})")
+    return value
+
+
+def _require_bool(raw: Mapping[str, Any], key: str, player_uid: str) -> bool:
+    value = raw.get(key)
+    if not isinstance(value, bool):
+        raise ValueError(f"player {player_uid}: {key!r} must be a JSON boolean, got {value!r}")
+    return value
+
+
+def _metric(stats: Mapping[str, Any], key: str, player_uid: str, minutes: int) -> int:
+    """Required whenever the player was on the pitch; an unused substitute may omit it (count is then 0)."""
+    return _require_int(stats, key, player_uid) if minutes > 0 else _count(stats, key)
 
 
 def _optional_int(value: Any) -> int | None:
@@ -177,6 +205,9 @@ def parse_fixture_payload(payload: Mapping[str, Any], match_length: int = 90) ->
                              "fouls_drawn", "yellow_cards", "red_cards", "zone14_entries",
                              "halfspace_entries", "long_balls_targeted"}}]
     }
+    Strict fields: "stats" must be an object, "minutes" an integer and "started" a JSON boolean. When
+    minutes > 0, the tackles count and every MARKET_METRICS field must be present as integers (integral
+    floats are accepted). Auxiliary metrics stay lenient. Any violation raises ValueError for the fixture.
     """
     fx = payload["fixture"]
     status = str(fx["status"]).lower()
@@ -218,9 +249,11 @@ def parse_fixture_payload(payload: Mapping[str, Any], match_length: int = 90) ->
         if team_uid not in (fixture.home_team_uid, fixture.away_team_uid):
             raise ValueError(f"player {uid} belongs to neither side: {team_uid}")
 
-        stats = p.get("stats", {})
-        minutes = _count(stats, "minutes")
-        started = bool(p.get("started", False))
+        stats = p.get("stats")
+        if not isinstance(stats, Mapping):
+            raise ValueError(f"player {uid}: 'stats' object missing")
+        minutes = _require_int(stats, "minutes", uid)
+        started = _require_bool(p, "started", uid)
         default_on = 0 if started else max(match_length - minutes, 0)
         minute_on = int(p.get("minute_on", default_on))
         minute_off = int(p.get("minute_off", minute_on + minutes))
@@ -237,7 +270,11 @@ def parse_fixture_payload(payload: Mapping[str, Any], match_length: int = 90) ->
         else:
             states = (0, 0, 0)
 
-        tackles_attempted = _count(stats, "tackles_attempted") if "tackles_attempted" in stats else _count(stats, "tackles")
+        tackles_key = "tackles_attempted" if "tackles_attempted" in stats else "tackles"
+        tackles_attempted = _metric(stats, tackles_key, uid, minutes)
+        tackles_won, fouls_committed, fouls_drawn, yellow_cards, red_cards = (
+            _metric(stats, key, uid, minutes) for key in MARKET_METRICS
+        )
 
         players.append(PlayerMatchRecord(
             player_uid=uid,
@@ -253,15 +290,15 @@ def parse_fixture_payload(payload: Mapping[str, Any], match_length: int = 90) ->
             state_level_min=states[1],
             state_trailing_min=states[2],
             tackles_attempted=tackles_attempted,
-            tackles_won=_count(stats, "tackles_won"),
+            tackles_won=tackles_won,
             interceptions=_count(stats, "interceptions"),
             dribbled_past=_count(stats, "dribbled_past"),
             duels_total=_count(stats, "duels_total"),
             duels_won=_count(stats, "duels_won"),
-            fouls_committed=_count(stats, "fouls_committed"),
-            fouls_drawn=_count(stats, "fouls_drawn"),
-            yellow_cards=_count(stats, "yellow_cards"),
-            red_cards=_count(stats, "red_cards"),
+            fouls_committed=fouls_committed,
+            fouls_drawn=fouls_drawn,
+            yellow_cards=yellow_cards,
+            red_cards=red_cards,
             zone14_entries=_count(stats, "zone14_entries"),
             halfspace_entries=_count(stats, "halfspace_entries"),
             long_balls_targeted=_count(stats, "long_balls_targeted"),
@@ -339,15 +376,26 @@ class LineupEntry:
     p_sub_appearance: float
 
 
-def parse_lineup_payload(payload: Mapping[str, Any], bench_sub_probability: float) -> list[LineupEntry]:
+def parse_lineup_payload(
+    payload: Mapping[str, Any],
+    bench_sub_probability: float,
+    player_sub_probabilities: Mapping[str, float] | None = None,
+) -> list[LineupEntry]:
     """
     Expected shape:
     {"fixture": {"uid", "home_team_uid", "away_team_uid"},
      "lineups": {"<team_uid>": {"starters": [player_uid x 11], "bench": [player_uid, ...]}}}
     Both sides are required so that players absent from the sheet can be safely zeroed.
+
+    A bench player's p_sub is `player_sub_probabilities[uid]` when present (fitting.bench_sub_probability),
+    else the league-level `bench_sub_probability`.
     """
     if not 0.0 <= bench_sub_probability <= 1.0:
         raise ValueError("bench_sub_probability must lie in [0, 1]")
+    per_player = dict(player_sub_probabilities or {})
+    for uid, probability in per_player.items():
+        if isinstance(probability, bool) or not (isinstance(probability, (int, float)) and 0.0 <= probability <= 1.0):
+            raise ValueError(f"player {uid}: bench sub probability must lie in [0, 1]")
     fx = payload["fixture"]
     fixture_uid = str(fx["uid"])
     sides = (str(fx["home_team_uid"]), str(fx["away_team_uid"]))
@@ -363,7 +411,8 @@ def parse_lineup_payload(payload: Mapping[str, Any], bench_sub_probability: floa
         bench = [str(u) for u in lineups[side].get("bench", [])]
         if len(starters) != 11:
             raise ValueError(f"fixture {fixture_uid} side {side}: expected 11 starters, got {len(starters)}")
-        for uid, p_start, p_sub in [(u, 1.0, 0.0) for u in starters] + [(u, 0.0, bench_sub_probability) for u in bench]:
+        bench_entries = [(u, 0.0, float(per_player.get(u, bench_sub_probability))) for u in bench]
+        for uid, p_start, p_sub in [(u, 1.0, 0.0) for u in starters] + bench_entries:
             if uid in seen:
                 raise ValueError(f"fixture {fixture_uid}: player {uid} listed twice")
             seen.add(uid)

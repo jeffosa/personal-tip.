@@ -25,7 +25,7 @@ readonly ARTIFACT_DIR="${PROP_ALPHA_ARTIFACT_DIR:-${REPO_ROOT}/ci-artifacts}"
 readonly PIP_VERSION="26.2.1"
 readonly MIN_PYTHON_MAJOR=3
 readonly MIN_PYTHON_MINOR=12
-readonly EXPECTED_TESTS=245
+readonly EXPECTED_TESTS=307
 
 log() { printf '%s [ci] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { log "FATAL: $*" >&2; exit 1; }
@@ -55,7 +55,8 @@ fi
 log "interpreter: $("${PYTHON_BIN}" -V 2>&1)"
 
 for required in \
-  requirements.txt schema.sql migrations/003_integrity_constraints.sql prop_alpha/__init__.py \
+  requirements.txt schema.sql migrations/003_integrity_constraints.sql migrations/004_merge_hardening.sql \
+  prop_alpha/__init__.py \
   tests/test_core.py tests/test_integrity.py tests/test_pipeline_concurrency.py tests/test_typing_contract.py; do
   [[ -f "${required}" ]] || die "repository is missing ${required}"
 done
@@ -122,8 +123,15 @@ if [[ -n "${PROP_ALPHA_CI_DATABASE_URL:-}" ]]; then
   psql_ci -c 'DROP SCHEMA IF EXISTS prop_alpha CASCADE'
   psql_ci -f schema.sql
   psql_ci -c 'SELECT * FROM prop_alpha.merge_staging_player_feed()'
-  psql_ci -f migrations/003_integrity_constraints.sql
+  # 004 on the current schema must be a no-op (idempotency).
+  psql_ci -f migrations/004_merge_hardening.sql
   psql_ci -c 'SELECT * FROM prop_alpha.merge_staging_player_feed()'
+  # Upgrade path: 003 reinstalls the v3.2 zero-argument body (an overload of the v3.3 function); 004 must
+  # drop it, so the zero-argument call in pipeline.MERGE_SQL resolves to the batched function again.
+  psql_ci -f migrations/003_integrity_constraints.sql
+  psql_ci -f migrations/004_merge_hardening.sql
+  psql_ci -c 'SELECT * FROM prop_alpha.merge_staging_player_feed()'
+  psql_ci -c 'SELECT * FROM prop_alpha.merge_staging_player_feed(1)'
   log "schema smoke test passed on ${db_name}"
 else
   log "stage 6/6 skipped: PROP_ALPHA_CI_DATABASE_URL is unset, so schema.sql was not executed in this run"

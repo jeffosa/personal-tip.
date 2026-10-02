@@ -17,7 +17,7 @@
 | Decision tree: reject any `E[X²] − μ²` form | `return_moments` in `market_scanner.py` computes \(\Sigma = R^\top\operatorname{diag}(\pi)R - \mu\mu^\top\), a subtraction form that is numerically safe there (condition number ≈ 1). The blanket rule would reject verified code. | §2.1 gate G1: banned outright in `engine.py` (AST-enforced); elsewhere permitted only with a proven condition-number bound. |
 | "k-dispersion boundaries or referee multipliers bounded above zero by strict floors" | The engine does not floor these values. It **rejects** non-finite or non-positive `game_state_k`, multiplier, \(\alpha\), \(\beta\) and \(\mu\). Flooring would silently convert corrupt inputs into plausible prices. The only clamp in the system is the relative-variance clamp, and it logs `[MATH_CLAMP]`. | §2.1 gate G2. |
 | Stage 4: all persistence "exclusively through `staging_player_feed`" | Staging carries only the vendor player-match feed. `lineup_expectations`, referee coefficients, `odds_lines`, `model_projections` and `bets` have their own write paths, and routing them through staging would break the T-60 latency path and the advisory-lock serialisation. | §3.4 routing table. |
-| "`merge_staging_player_feed()` stored procedure via the single-statement `DELETE … RETURNING` pattern" | It is a PL/pgSQL **function**. The *drain* is one statement; the function executes many statements in one transaction. Its current body lives in `schema.sql` and `migrations/003_integrity_constraints.sql`; the body in `002` is superseded. | §3.4, §4. |
+| "`merge_staging_player_feed()` stored procedure via the single-statement `DELETE … RETURNING` pattern" | It is a PL/pgSQL **function**. The *drain* is one statement; the function executes many statements in one transaction. Its current body lives in `schema.sql` and `migrations/004_merge_hardening.sql`; the bodies in `002` and `003` are superseded. | §3.4, §4. |
 | Matrix tokens `MIN_RELATIVE_VAR`, `RPS`, `migrations/002_*.sql`, `r.foul_strictness_coefficent`, `Sigma` | These names are not in the codebase. The real names are `MIN_RELATIVE_VARIANCE`, `DATA_VENDOR_RPS` / `TokenBucketRateLimiter(rate_per_sec=…)`, `migrations/003_integrity_constraints.sql`, `foul_strictness_coefficient`, and `cov` (returned by `return_moments`). | §4 matrix. |
 
 ---
@@ -29,7 +29,7 @@
 - **A1 — Verify before referencing.** Before naming any identifier in code or prose (function, parameter, column, constraint, environment variable), confirm that it exists with a repository search. Never invent an identifier and never "correct" one from memory. Section 4 is a starting index, not a substitute for searching.
 - **A2 — Report only what was executed.** State test results only from a run performed in the current change, quoting the pytest summary line. Tag every claim about SQL, deployment or live behaviour **[U]** or **[N]** unless it was executed. "Should pass" is prohibited wording.
 - **A3 — Never weaken a safeguard to make a change pass.** Without an explicit instruction from a human maintainer, do not alter:
-  - risk parameters: `risk_aversion`, `alpha_threshold`, `max_position_fraction`, `max_fixture_fraction`, `max_total_fraction`, `max_quote_age`, `min_stake`, `DEGENERATE_LOSS_PROBABILITY`;
+  - risk parameters: `risk_aversion`, `alpha_threshold`, `max_position_fraction`, `max_fixture_fraction`, `max_total_fraction`, `max_quote_age`, `min_stake`, `DEGENERATE_LOSS_PROBABILITY`, `MODEL_RISK_LOSS_FLOOR` (0.03, set by the maintainer on 2026-10-01; un-backtested);
   - numerical bounds: `MIN_RELATIVE_VARIANCE`, `MAX_RELATIVE_VARIANCE`, `MAX_MATCH_MINUTES`;
   - database constraints;
   - PRD go-live gates;
@@ -99,8 +99,9 @@
   - count-scale variance floors such as \(\max(\text{Var}, \mu + 10^{-5})\). This one moves \(P(\text{carded})\) from 0.1675 to 0.1199;
   - defaulting missing possession to 50%;
   - defaulting missing minutes to 90;
-  - flooring \(k\), the referee multiplier, \(\alpha\) or \(\beta\).
-- **F5 — The only clamp.** The relative variance \(v\) may be clamped to \([\texttt{MIN\_RELATIVE\_VARIANCE}, \texttt{MAX\_RELATIVE\_VARIANCE}] = [10^{-6}, 10^{3}]\), and only with a `[MATH_CLAMP]` warning (`test_math_clamp_is_logged`). No other clamp may be introduced without human approval.
+  - flooring \(k\), the referee multiplier, \(\alpha\) or \(\beta\);
+  - pricing without a fitted \(k\): `QuantEngine(game_state_k=...)` is required, and `fit_game_state_dispersion` raises rather than reporting "no overdispersion".
+- **F5 — The only clamp.** The relative variance \(v\) may be clamped up to \(\texttt{MIN\_RELATIVE\_VARIANCE} = 10^{-6}\), and only with a `[MATH_CLAMP]` warning (`test_math_clamp_is_logged`). A \(v\) above \(\texttt{MAX\_RELATIVE\_VARIANCE} = 10^{3}\), or non-finite, raises `ProjectionError`: the prior or history is degenerate (maintainer decision 3, 2026-10-01; `test_predictive_gamma_raises_under_extreme_overdispersion`). No other clamp may be introduced without human approval.
 - **F6 — Halting is scoped.** "Halt the processing chain" means halting the unit of work (H1–H5), never the process. Process-level failure is signalled by the process exit code: `ConcurrentIngestionEngine` CLI `main()` returns 1 when `SlateReport.fully_successful` is false.
 
 ### 1.4 Pure Transform Isolation
@@ -196,8 +197,9 @@ Execute this tree before modifying `prop_alpha/modeling/engine.py`, `prop_alpha/
 
 | Quantity | Validation | Raises |
 |---|---|---|
-| `game_state_k` | `QuantEngine.__init__`: finite and \(> 0\), or `None` | `ValueError` |
-| multiplier \(c\) | `predictive_gamma`: finite and \(> 0\) | `ProjectionError` |
+| `game_state_k` | `QuantEngine.__init__`: required keyword, finite and \(> 0\); `FactorProjection`, `game_state_quadrature`: finite and \(> 0\) | `TypeError` if omitted / `ValueError` / `ProjectionError` |
+| multiplier \(c\) | `predictive_gamma`, `rate_posterior`: finite and \(> 0\) | `ProjectionError` |
+| multiplier relative variance \(v_c\) | `predictive_gamma`, `rate_posterior`: finite and \(\ge 0\) | `ProjectionError` |
 | \(\alpha_n, \beta_n\) | `GammaPosterior.__post_init__` (\(> 0\)); `predictive_gamma` (finite) | `ValueError` / `ProjectionError` |
 | \(\mu\), derived rate | `predictive_gamma`: finite and \(> 0\) | `ProjectionError` |
 | `gamma_shape`, `gamma_rate` | `PropProjection.__post_init__` | `ProjectionError` |
@@ -207,44 +209,53 @@ Execute this tree before modifying `prop_alpha/modeling/engine.py`, `prop_alpha/
 
 ### 2.2 Variance and Mean-Variance Utility Invariants
 
-**V1 — Predictive distribution.** For posterior \(\text{Gamma}(\alpha_n, \beta_n)\), multiplier \(c\), game-state shape \(k\) and exposure \(t = m/90\):
+**V1 — Predictive distribution.** For posterior \(\text{Gamma}(\alpha_n, \beta_n)\), multiplier \(c\) with relative variance \(v_c\) (0 for count markets), game-state shape \(k\) and exposure \(t = m/90\):
 
 \[
 \mu = c\,\frac{\alpha_n}{\beta_n}, \qquad
-v = \frac{1}{\alpha_n} + \frac{1}{k} + \frac{1}{\alpha_n k}, \qquad
+v = \left(1 + \frac{1}{\alpha_n}\right)\left(1 + \frac{1}{k}\right)(1 + v_c) - 1, \qquad
 a^* = \frac{1}{v}, \qquad b^* = \frac{a^*}{\mu}, \qquad
 X \sim \text{NB}\!\left(a^*,\ \frac{b^*}{b^* + t}\right).
 \]
 
-A change to `predictive_gamma`, `PropProjection` or `count_distribution` MUST keep all of the following tests green:
+\(v\) is formed as `expm1(log1p(1/α) + log1p(1/k) + log1p(v_c))`, so no moment is subtracted; with \(v_c = 0\) it equals \(1/\alpha_n + 1/k + 1/(\alpha_n k)\) to within \(10^{-15}\). The allocator uses the unmatched form, `FactorProjection`: the rate posterior (with \(c\) and \(v_c\) folded in by `QuantEngine.rate_posterior`) and \(k\) kept apart, with \(X \mid G=g \sim \text{NB}(\alpha, \beta/(\beta + g t))\) and \(G \sim \text{Gamma}(k, k)\) shared by the fixture, integrated by `game_state_quadrature`.
+
+A change to `predictive_gamma`, `PropProjection`, `FactorProjection` or `count_distribution` MUST keep all of the following tests green:
 
 - `test_predictive_gamma_exact_without_game_state` (the \(k \to \infty\) limit)
 - `test_predictive_is_negative_binomial_with_posterior_mean`
 - `test_game_state_mixing_widens_but_preserves_mean`
 - `test_predictive_gamma_stable_where_subtraction_form_cancels`
-- `test_predictive_gamma_bounded_under_extreme_overdispersion`
+- `test_predictive_gamma_raises_under_extreme_overdispersion`
+- `test_relative_variance_without_multiplier_matches_the_additive_form`
 - `test_card_probability_not_distorted_by_variance_floor`
 - `test_side_probabilities_partition` (all void rules and lines)
+- `test_shared_game_state_covariance_matches_monte_carlo`
 
 **V2 — Posterior updating.** \(\alpha_n = \alpha_0 + \sum_j x_j\) and \(\beta_n = \beta_0 + \frac{1}{90}\sum_j m_j\). Exposure is measured in minutes, never in match counts. Inputs pass through `validate_exposure_vector(..., allow_empty=True)`, so prior-only projection remains valid (`test_gamma_update_uses_validation_and_allows_prior_only_history`).
 
-**U1 — Joint optimisation.** For each key \((\text{fixture\_id}, \text{player\_id}, \text{market\_type})\), the allocator solves
+**U1 — Joint optimisation.** For each fixture, the allocator solves
 
 \[
 \max_{f \in \mathbb{R}^J}\ f^\top\mu - \lambda_{\text{risk}}\, f^\top\Sigma f
-\quad\text{s.t.}\quad 0 \le f_j \le \min\!\left(f_j^{*}, f_{\text{pos}}\right),\qquad \mathbf{1}^\top f \le f_{\text{pos}},
+\quad\text{s.t.}\quad 0 \le f_j \le \min\!\left(f_j^{*}, f_{\text{pos}}, \tfrac{\text{max\_stake}_j}{B}\right),\qquad
+\mathbf{1}_m^\top f \le f_{\text{pos}} - \tfrac{E_m}{B}\ \ \forall m,\qquad
+\mathbf{1}_s^\top f \le \max_{j \in s} f_j^{*}\ \ \forall s,\qquad
+\mathbf{1}^\top f \le f_{\text{fix}} - \tfrac{E_{\text{fix}}}{B},
 \]
 
-jointly over all \(J\) candidates, with \(\mu = R^\top\pi\) and \(\Sigma = R^\top\operatorname{diag}(\pi)R - \mu\mu^\top\) computed exactly on the scenario × count grid from `outcome_model`.
+jointly over all \(J\) candidates of every player-market \(m\) in the fixture (`solve_grouped_mean_variance`). Every book is its own candidate; a slot \(s\) is one (line, side, void rule) quoted by several books. \(B\) is the bankroll net of open exposure and \(E\) is the exposure already open (`ExposureBook`, required by `allocate`). \(\mu\) and \(\Sigma\) come from `fixture_moments`: exact `outcome_model` grids given each quadrature node \(g_j\) of the shared factor \(G\), with cross-player moments \(E[R_aR_b] = \sum_j w_j m_a(g_j) m_b(g_j)\). \(f^*\) and \(\mu\) carry the model-risk haircut: at least `MODEL_RISK_LOSS_FLOOR` of win probability is moved to loss. The slate cap (net of open exposure) then scales all fixtures pro rata.
 
 **U2 — Prohibited reversions:**
 
 - selecting one line by \(\arg\max_j \mu_j\);
 - sizing lines independently, whether by Kelly or by \(\mu_j / (2\lambda\Sigma_{jj})\), when \(J > 1\);
-- replacing \(\Sigma\) with its diagonal;
+- replacing \(\Sigma\) with its diagonal, or dropping the cross-player blocks within a fixture;
 - estimating \(\mu\) or \(\Sigma\) by Monte Carlo when the exact grid is available;
 - removing the tail bucket;
-- applying fixture or slate caps *before* per-market optimisation.
+- applying fixture or slate caps *before* optimisation, or clipping book limits *after* it;
+- de-duplicating books to the best price, which hides depth at a worse price;
+- caps that ignore exposure already open.
 
 The following tests MUST remain green:
 
@@ -314,7 +325,8 @@ Execute the stages in order for every feature change, refactor or migration. Do 
 | Possession out of range: `101.0` | `ValueError` in `PlayerMatchRecord` | `test_parse_rejects_impossible_stats` pattern |
 | Bimodal substitution: `LineupExpectation(0.5, 0.5, 90.0, 15.0)` | side probabilities partition to 1 under all `VoidRule`s; \(p_{\text{void}} = 0\) under `VOID_IF_NO_APPEARANCE` | `test_side_probabilities_partition` (extend) |
 | Certain outcome: \(p_{\text{lose}} \le 10^{-6}\) | routed to `report.skipped`, never staked | `test_certain_outcome_is_flagged_not_staked` |
-| Extreme dispersion: `game_state_k=1e-9` | clamp to `MAX_RELATIVE_VARIANCE` with `[MATH_CLAMP]` | `test_predictive_gamma_bounded_under_extreme_overdispersion`, `test_math_clamp_is_logged` |
+| Extreme dispersion: `game_state_k=1e-9`, or league rate `1e-4` | `ProjectionError` (above `MAX_RELATIVE_VARIANCE`) | `test_predictive_gamma_raises_under_extreme_overdispersion`, `test_tiny_league_rate_raises_instead_of_pricing_a_needle` |
+| Near-Poisson inputs: \(v < 10^{-6}\) | clamp to `MIN_RELATIVE_VARIANCE` with `[MATH_CLAMP]` | `test_math_clamp_is_logged` |
 | Huge posterior: \(\alpha = 10^{17}\) | finite shape \(10^{6}\); no negative variance | `test_predictive_gamma_stable_where_subtraction_form_cancels` |
 | Minute logic: `minute_off < minute_on`, `minutes > 130` | `ValueError` in transform; L2 reject predicate present | `test_transform_rejects_minute_off_before_minute_on`, `test_merge_rejects_every_row_a_core_constraint_would_refuse` |
 | Transient DB error, statement timeout | retried, or failed closed without retry | `test_transient_database_error_is_retried`, `test_statement_timeout_fails_closed_without_retry` |
@@ -341,9 +353,9 @@ Execute the stages in order for every feature change, refactor or migration. Do 
 
 1. **Advisory lock first.** `PERFORM pg_advisory_xact_lock(hashtext('prop_alpha.merge_staging_player_feed'))` is the first statement. The key string must equal `referee_job.MERGE_LOCK_KEY` (`test_referee_job_shares_merge_advisory_lock_key`).
 2. **One-statement claim.** The drain is the single statement
-   `WITH drained AS (DELETE FROM prop_alpha.staging_player_feed RETURNING *) INSERT INTO claimed_feed SELECT * FROM drained;`
-   It claims exactly the rows visible to its snapshot. No read-then-delete sequence, and no `TRUNCATE`: `ACCESS EXCLUSIVE` lockout, plus silent loss of rows committed between read and truncate.
-3. **Reject before upsert.** Rows violating any core `CHECK` move to `staging_rejects` before any upsert (L2 parity).
+   `WITH oldest AS (SELECT batch_id … GROUP BY batch_id ORDER BY min(staged_at), batch_id LIMIT p_max_batches), drained AS (DELETE FROM prop_alpha.staging_player_feed s USING oldest o WHERE s.batch_id = o.batch_id RETURNING s.*) INSERT INTO claimed_feed SELECT * FROM drained;`
+   (migration 004). It claims whole batches visible to its snapshot, oldest first, at most `p_max_batches` (default 200) per call, so `statement_timeout` bounds one round; `merge_staging` loops until a round merges nothing. No read-then-delete sequence, and no `TRUNCATE`: `ACCESS EXCLUSIVE` lockout, plus silent loss of rows committed between read and truncate.
+3. **Reject before upsert.** Rows violating any core `CHECK` move to `staging_rejects` before any upsert (L2 parity), as do player rows with a NULL `minutes_played`, or a NULL market metric while `minutes_played > 0` (migration 004; mirrors the strict parsing in `transform.py`).
 4. **Latest row wins.** Each upsert selects `DISTINCT ON (<conflict key>) … ORDER BY <conflict key>, staged_at DESC`, and orders its insert by the conflict key for a consistent row-lock order.
 5. **Return signature.** `RETURNS TABLE (fixtures_merged integer, player_rows_merged integer, rows_rejected integer)` is unchanged; `MERGE_SQL` depends on it.
 
@@ -404,8 +416,8 @@ Every identifier below was verified against the v3.3 code.
 │                              │                                          │ [STATEMENT_TIMEOUT], SlateReport             │
 ├──────────────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────────┤
 │ Atomic staging drains        │ schema.sql,                              │ prop_alpha.staging_player_feed (UNLOGGED),   │
-│                              │ migrations/003_integrity_constraints.sql │ merge_staging_player_feed(), claimed_feed,   │
-│                              │ (002 body superseded)                    │ DELETE … RETURNING, pg_advisory_xact_lock,   │
+│                              │ migrations/004_merge_hardening.sql       │ merge_staging_player_feed(), claimed_feed,   │
+│                              │ (002 and 003 bodies superseded)          │ DELETE … RETURNING, pg_advisory_xact_lock,   │
 │                              │                                          │ staging_rejects, MERGE_SQL                   │
 ├──────────────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────────┤
 │ Confirmed team sheets (T-60) │ prop_alpha/ingestion/pipeline.py         │ lineup_expectations, LINEUP_UPSERT_SQL,      │
@@ -435,7 +447,7 @@ Every identifier below was verified against the v3.3 code.
 │                              │                                          │ chk_line_increment, uq_odds_snapshot         │
 ├──────────────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────────┤
 │ Agent & typing contracts     │ tests/test_agent_contract.py,            │ SANCTIONED_HANDLERS, PURE_MODULES,           │
-│                              │ tests/test_typing_contract.py            │ ci/bootstrap.sh EXPECTED_TESTS = 180         │
+│                              │ tests/test_typing_contract.py            │ ci/bootstrap.sh EXPECTED_TESTS = 307         │
 └──────────────────────────────┴──────────────────────────────────────────┴──────────────────────────────────────────────┘
 ```
 
@@ -449,40 +461,58 @@ def validate_exposure_vector(
     minutes: Sequence[float], counts: Sequence[int], *, allow_empty: bool = False
 ) -> tuple[np.ndarray, np.ndarray]: ...
 class QuantEngine:
-    def __init__(self, beta1: float = 1.0, beta2: float = 1.0, game_state_k: float | None = None) -> None: ...
+    def __init__(self, *, game_state_k: float, beta1: float = 1.0, beta2: float = 1.0) -> None: ...
     def referee_multiplier(self, referee: RefereeProfile, is_home: bool) -> float: ...
     @staticmethod
     def positional_prior(league_rate_per90: float, prior_strength_90s: float = 6.0) -> GammaPosterior: ...
     @staticmethod
     def gamma_poisson_update(prior: GammaPosterior, counts: Sequence[int], minutes: Sequence[float]) -> GammaPosterior: ...
-    def predictive_gamma(self, posterior: GammaPosterior, multiplier: float) -> tuple[float, float]: ...
+    def predictive_gamma(self, posterior: GammaPosterior, multiplier: float,
+                         multiplier_relative_variance: float) -> tuple[float, float]: ...
+    def rate_posterior(self, posterior: GammaPosterior, multiplier: float,
+                       multiplier_relative_variance: float) -> GammaPosterior: ...
     def project_count_market(self, *, fixture_id: int, player_id: int, market_type: str, counts: Sequence[int],
                              minutes: Sequence[float], league_rate_per90: float, referee: RefereeProfile,
                              is_home: bool, lineup: LineupExpectation, prior_strength_90s: float = 6.0) -> PropProjection: ...
+    def factor_count_market(self, *, ...same keywords as project_count_market...) -> FactorProjection: ...
+    def project_card_market(self, *, ..., card_multiplier_relative_variance: float, ...) -> PropProjection: ...
+    def factor_card_market(self, *, ..., card_multiplier_relative_variance: float, ...) -> FactorProjection: ...
 class PropProjection:
     def count_distribution(self, minutes: float) -> DiscreteDistribution: ...
     def side_probabilities(self, line: float, side: str,
                            void_rule: VoidRule | str = VoidRule.VOID_IF_NO_APPEARANCE) -> SideProbabilities: ...
+class FactorProjection:  # fixture_id, player_id, market_type, rate_posterior, game_state_k, lineup
+    def conditional(self, g: float) -> PropProjection: ...
+    def side_probabilities(self, line: float, side: str,
+                           void_rule: VoidRule | str = VoidRule.VOID_IF_NO_APPEARANCE) -> SideProbabilities: ...
+def game_state_quadrature(k: float, n_nodes: int = GAME_STATE_QUADRATURE_NODES) -> tuple[np.ndarray, np.ndarray]: ...
 
 # prop_alpha/scanner/market_scanner.py
 def outcome_model(projection: PropProjection, candidates: Sequence[Candidate]) -> tuple[np.ndarray, np.ndarray]: ...
 def return_moments(probabilities: np.ndarray, payoffs: np.ndarray) -> tuple[np.ndarray, np.ndarray]: ...
+def fixture_moments(grids: Sequence[MarketGrid], node_weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]: ...
+def solve_grouped_mean_variance(mu: np.ndarray, cov: np.ndarray, upper: np.ndarray,
+                                groups: Sequence[BudgetGroup], risk_aversion: float) -> tuple[np.ndarray, str]: ...
 def solve_mean_variance(mu: np.ndarray, cov: np.ndarray, upper: np.ndarray,
                         budget: float, risk_aversion: float) -> tuple[np.ndarray, str]: ...
+def stressed_probabilities(probabilities: SideProbabilities, loss_floor: float) -> SideProbabilities: ...
 class InstitutionalAssetManager:
-    def allocate(self, projections: Mapping[ProjectionKey, PropProjection], quotes: Iterable[LiveOddsQuote],
-                 now: datetime | None = None) -> AllocationReport: ...
+    def __init__(self, bankroll: float, risk_aversion: float = 2.0, ..., min_stake: float = 1.0, *,
+                 model_risk_loss_floor: float) -> None: ...
+    def allocate(self, projections: Mapping[ProjectionKey, FactorProjection], quotes: Iterable[LiveOddsQuote], *,
+                 now: datetime, exposure: ExposureBook) -> AllocationReport: ...
 
 # prop_alpha/ingestion/transform.py
 def parse_fixture_payload(payload: Mapping[str, Any], match_length: int = 90) -> ParsedFixture: ...
 def build_staging_rows(parsed: ParsedFixture, kappas: Mapping[str, float], batch_id: str) -> list[tuple]: ...
-def parse_lineup_payload(payload: Mapping[str, Any], bench_sub_probability: float) -> list[LineupEntry]: ...
+def parse_lineup_payload(payload: Mapping[str, Any], bench_sub_probability: float,
+                         player_sub_probabilities: Mapping[str, float] | None = None) -> list[LineupEntry]: ...
 
 # prop_alpha/ingestion/pipeline.py
 class ConcurrentIngestionEngine:
     def run_slate(self, fixture_uids: Iterable[str], job: str = "stats", deadline_s: float | None = None,
-                  merge: bool = True) -> SlateReport: ...
-    def merge_staging(self) -> MergeResult: ...
+                  merge: bool = True) -> SlateReport: ...  # RuntimeError if already running on this engine
+    def merge_staging(self, max_rounds: int = 50) -> MergeResult: ...
     def _with_transaction(self, fn: Callable[[Any], T]) -> tuple[T, int]: ...
 
 # prop_alpha/calibration/referee_job.py

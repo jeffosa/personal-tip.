@@ -7,7 +7,7 @@ Full rules for any code change: **AGENT.md**. Requirements and go-live gates: `p
 
 ## Status you must not overstate
 
-- **The SQL has never run against PostgreSQL:** `schema.sql`, the migrations, and `merge_staging_player_feed()`. Say so whenever you touch it.
+- **The SQL has never run against PostgreSQL:** `schema.sql`, the migrations (including `004_merge_hardening.sql`), and `merge_staging_player_feed()`. Say so whenever you touch it.
 - **Not built:** the odds poller, projection refresh, bet ledger and execution components.
 - **Model not validated:** no PRD go-live gate has been passed.
 - **Runtime floor is Python 3.12,** set by the numpy 2.5.1 and scipy 1.18.0 pins. The suite has only run on 3.14.6.
@@ -15,8 +15,8 @@ Full rules for any code change: **AGENT.md**. Requirements and go-live gates: `p
 ## Design philosophy
 
 - **I/O isolation.** Only `ingestion/pipeline.py` does network and pool I/O (and `calibration/referee_job.run_referee_job` for its own job, and `alerts/telegram.py` for outbound Telegram messages). Workers fetch and parse first, then take a pooled connection for one short transaction inside `ConcurrentIngestionEngine._with_transaction`, which is the only `pool.getconn()` call site. Never pass connections, cursors, pools or sessions into `transform.py`, `engine.py`, `market_scanner.py`, `fitting.py` or `backtest.py`.
-- **Mathematical conservatism.** The allocator maximises \(f^\top\mu - \lambda f^\top\Sigma f\) jointly over all lines for a player, using the exact covariance from `return_moments`. Never revert to nominal-EV selection or per-line sizing. Don't change risk defaults (`risk_aversion=2.0`, the caps, `alpha_threshold`) without an explicit human instruction.
-- **Fail closed.** Raise `ValueError` or `ProjectionError` at the point of detection. Catch only at the five handlers in AGENT.md §1.3, each of which records the failure. No fallback distributions, no silent floors. The one clamp (relative variance) logs `[MATH_CLAMP]`.
+- **Mathematical conservatism.** The allocator maximises \(f^\top\mu - \lambda f^\top\Sigma f\) jointly over every line, book and player in a fixture, using the exact covariance from `fixture_moments` (shared game-state factor), with caps net of open exposure (`ExposureBook`) and the model-risk loss floor (`MODEL_RISK_LOSS_FLOOR` = 0.03, un-backtested). Never revert to nominal-EV selection or per-line sizing. Don't change risk defaults (`risk_aversion=2.0`, the caps, `alpha_threshold`, `MODEL_RISK_LOSS_FLOOR`) without an explicit human instruction.
+- **Fail closed.** Raise `ValueError` or `ProjectionError` at the point of detection. Catch only at the sanctioned handlers in AGENT.md §1.3, each of which records the failure. No fallback distributions, no silent floors. The one clamp (relative variance up to its 1e-6 minimum) logs `[MATH_CLAMP]`; a relative variance above 1e3 raises.
 - **Type rigidity.** Follow these rules; they are enforced by `tests/test_typing_contract.py`:
   - `from __future__ import annotations` in every module;
   - every parameter and return annotated;
@@ -46,7 +46,7 @@ python3 -m venv .venv
 Tests:
 
 ```bash
-# Whole suite (180 tests). This is the command that counts.
+# Whole suite (307 tests). This is the command that counts.
 python -m pytest tests -q -p no:cacheprovider
 
 # Individual suites
@@ -61,7 +61,7 @@ python -m pytest tests/test_pipeline_concurrency.py -v -rs
 
 **Coverage.** `pytest-cov` is not in `requirements.txt`, so `--cov` errors with "unrecognized arguments". To use coverage, add an exact `pytest-cov==<version>` pin to `requirements.txt` in the same change, then run `python -m pytest tests --cov=prop_alpha --cov-report=term-missing`.
 
-Telegram alerts (sends messages only; never places bets). Only high-value bets are sent (`scanner/value_screen.py`): mispriced by the book, at least 4% expected profit per unit staked, and an edge that still returns at least 4% in more than 60% of 1,000 simulated match conditions:
+Telegram alerts (sends messages only; never places bets). Only high-value bets are sent (`scanner/value_screen.py`): mispriced by the book, at least 4% expected profit per unit staked, and an edge that still returns at least 4% in more than 60% of 1,000 simulated match conditions, all after the 0.03 model-risk loss floor. One alert per market, line, side and book per process (the sent set is in memory until the bet ledger exists). Each alert shows the minimum acceptable odds and an expiry:
 
 ```bash
 python -m prop_alpha.alerts.telegram --get-chat-id   # after sending /start to the bot
@@ -112,7 +112,7 @@ PROP_ALPHA_CI_DATABASE_URL="postgresql://postgres:${PGPASSWORD}@localhost:5432/p
 
 ## Before you say a change is done
 
-1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (180). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
+1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (307). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
 2. `bash ci/bootstrap.sh --preflight` passes.
 3. New behaviour has tests that failed before the change.
 4. Report what you actually ran, quoting the summary lines, and tag SQL or deployment claims **[U]** (not executed) or **[N]** (not built).
