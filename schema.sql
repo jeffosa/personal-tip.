@@ -1,6 +1,7 @@
 -- prop_alpha schema v3.3 (reconstructed): fresh install for PostgreSQL 15+.
--- Status [U]: this file has never been executed against PostgreSQL.
--- A fresh database gets this file only; it already embodies migrations 002 and 003.
+-- Status: installs cleanly on PostgreSQL 18.6 (ci/bootstrap.sh stage 6, 2026-10-02); the merge has only
+-- run on empty staging and on the fixtures in tests/test_merge_postgres.sql. Not run on PostgreSQL 15.
+-- A fresh database gets this file only; it already embodies migrations 002 to 005.
 -- Never apply migrations/002_staging_and_indexes.sql to a database built from this file: it would
 -- reinstall the v3.0 merge function and drop the minute-logic reject predicates.
 -- Run with: psql -v ON_ERROR_STOP=1 -f schema.sql
@@ -447,6 +448,26 @@ BEGIN
         dribbled_past_rate       = EXCLUDED.dribbled_past_rate,
         source_updated_at        = now();
     GET DIAGNOSTICS v_rows = ROW_COUNT;
+
+    -- A player's current team is the team of their latest fixture by kickoff, not of the latest staged row:
+    -- a backfilled old match must not move a transferred player back. The advisory lock serialises merges,
+    -- the only writer of players, so this UPDATE needs no lock ordering.
+    UPDATE prop_alpha.players AS pl
+    SET current_team_id = latest.team_id,
+        updated_at      = now()
+    FROM (
+        SELECT DISTINCT ON (s.player_id) s.player_id, s.team_id
+        FROM prop_alpha.player_match_stats s
+        JOIN prop_alpha.fixtures f ON f.fixture_id = s.fixture_id
+        WHERE s.player_id IN (
+            SELECT p.player_id
+            FROM claimed_feed c
+            JOIN prop_alpha.players p ON p.vendor_player_uid = c.vendor_player_uid
+        )
+        ORDER BY s.player_id, f.kickoff_at DESC, f.fixture_id DESC
+    ) latest
+    WHERE pl.player_id = latest.player_id
+      AND pl.current_team_id IS DISTINCT FROM latest.team_id;
 
     RETURN QUERY SELECT v_fixtures, v_rows, v_rejected;
 END;

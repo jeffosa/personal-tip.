@@ -257,13 +257,14 @@ def test_referee_job_takes_merge_lock_before_reading_and_updates_in_id_order(mon
     assert connection.closed
 
 
-# ---------------- SQL structure (schema.sql and migrations are [U]: never executed) ----------------
+# ---------------- SQL structure (text checks; ci/bootstrap.sh stage 6 executes the SQL on PostgreSQL) ----------------
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = (ROOT / "schema.sql").read_text(encoding="utf-8")
 MIGRATION_002 = (ROOT / "migrations" / "002_staging_and_indexes.sql").read_text(encoding="utf-8")
 MIGRATION_003 = (ROOT / "migrations" / "003_integrity_constraints.sql").read_text(encoding="utf-8")
 MIGRATION_004 = (ROOT / "migrations" / "004_merge_hardening.sql").read_text(encoding="utf-8")
-MERGE_SOURCES = {"schema.sql": SCHEMA, "003": MIGRATION_003, "004": MIGRATION_004}
+MIGRATION_005 = (ROOT / "migrations" / "005_player_current_team.sql").read_text(encoding="utf-8")
+MERGE_SOURCES = {"schema.sql": SCHEMA, "003": MIGRATION_003, "004": MIGRATION_004, "005": MIGRATION_005}
 CORE_CONSTRAINTS = (
     "chk_possession_bounds", "chk_minute_logic", "chk_tackles_won_le_attempted", "chk_duels_won_le_total",
 )
@@ -323,7 +324,7 @@ def _merge_stats_insert_columns(function: str) -> list[str]:
     return [column.strip() for column in match.group(1).replace("\n", " ").split(",")]
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "003", "004"])
+@pytest.mark.parametrize("source", ["schema.sql", "003", "004", "005"])
 def test_merge_rejects_every_row_a_core_constraint_would_refuse(source: str) -> None:
     block = _player_reject_block(_merge_function(MERGE_SOURCES[source]))
     for constraint, fragments in REJECT_PREDICATES.items():
@@ -333,7 +334,7 @@ def test_merge_rejects_every_row_a_core_constraint_would_refuse(source: str) -> 
         assert f"CONSTRAINT {constraint}" in SCHEMA
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "004"])
+@pytest.mark.parametrize("source", ["schema.sql", "004", "005"])
 def test_merge_rejects_null_market_metrics(source: str) -> None:
     block = _player_reject_block(_merge_function(MERGE_SOURCES[source]))
     for fragment in NULL_METRIC_PREDICATES:
@@ -342,12 +343,30 @@ def test_merge_rejects_null_market_metrics(source: str) -> None:
 
 
 def test_merge_function_identical_in_schema_and_latest_migration() -> None:
-    assert _merge_function(SCHEMA) == _merge_function(MIGRATION_004)
+    assert _merge_function(SCHEMA) == _merge_function(MIGRATION_005)
+    assert _merge_function(MIGRATION_004) != _merge_function(MIGRATION_005)
     assert _merge_function(MIGRATION_003) != _merge_function(MIGRATION_004)
 
 
-def test_migration_004_replaces_the_zero_argument_function_in_one_transaction() -> None:
-    body = _strip_comments(MIGRATION_004)
+CURRENT_TEAM_FROM_LATEST_KICKOFF = (
+    "SET current_team_id = latest.team_id",
+    "ORDER BY s.player_id, f.kickoff_at DESC, f.fixture_id DESC",
+    "AND pl.current_team_id IS DISTINCT FROM latest.team_id",
+)
+
+
+@pytest.mark.parametrize("source", ["schema.sql", "005"])
+def test_merge_moves_player_to_team_of_latest_fixture(source: str) -> None:
+    function = _merge_function(MERGE_SOURCES[source])
+    for fragment in CURRENT_TEAM_FROM_LATEST_KICKOFF:
+        assert fragment in function, f"missing current-team fragment {fragment!r}"
+    # After the stats upsert, so the player's newest row is already visible.
+    assert function.index("INSERT INTO prop_alpha.player_match_stats") < function.index("UPDATE prop_alpha.players")
+
+
+@pytest.mark.parametrize("source", ["004", "005"])
+def test_migration_replaces_the_zero_argument_function_in_one_transaction(source: str) -> None:
+    body = _strip_comments(MERGE_SOURCES[source])
     statements = [line.strip() for line in body.splitlines() if line.strip()]
     assert statements[:3] == [
         "SET lock_timeout = '5s';", "BEGIN;", "DROP FUNCTION IF EXISTS prop_alpha.merge_staging_player_feed();",
@@ -399,12 +418,12 @@ def test_index_changes_in_002_are_concurrent_and_outside_the_transaction() -> No
 
 
 def test_referee_job_shares_merge_advisory_lock_key() -> None:
-    for sql in (SCHEMA, MIGRATION_003, MIGRATION_004):
+    for sql in (SCHEMA, MIGRATION_003, MIGRATION_004, MIGRATION_005):
         keys = re.findall(r"pg_advisory_xact_lock\(hashtext\('([^']+)'\)\)", sql)
         assert keys == [referee_job.MERGE_LOCK_KEY]
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "003", "004"])
+@pytest.mark.parametrize("source", ["schema.sql", "003", "004", "005"])
 def test_merge_drains_by_single_delete_returning_after_taking_the_lock(source: str) -> None:
     function = _merge_function(MERGE_SOURCES[source])
     body = _strip_comments(function[function.index("\nBEGIN\n"):])
@@ -441,7 +460,7 @@ def test_merge_drains_by_single_delete_returning_after_taking_the_lock(source: s
 
 
 def test_no_truncate_in_any_sql() -> None:
-    for sql in (SCHEMA, MIGRATION_002, MIGRATION_003, MIGRATION_004):
+    for sql in (SCHEMA, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005):
         assert "TRUNCATE" not in _strip_comments(sql).upper()
 
 

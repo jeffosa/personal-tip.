@@ -7,6 +7,7 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from types import MappingProxyType
 from typing import Final, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -130,6 +131,16 @@ class Candidate:
         return VoidRule(self.quote.void_rule)
 
 
+def _is_projection_key(key: object) -> bool:
+    return (
+        isinstance(key, tuple)
+        and len(key) == 3
+        and all(isinstance(part, int) and not isinstance(part, bool) for part in key[:2])
+        and isinstance(key[2], str)
+        and bool(key[2])
+    )
+
+
 @dataclass(frozen=True)
 class ExposureBook:
     """Currency already committed (filled or still pending) per market. Supplied by the bet ledger ([N])."""
@@ -137,9 +148,14 @@ class ExposureBook:
     by_market: Mapping[ProjectionKey, float]
 
     def __post_init__(self) -> None:
-        for key, amount in self.by_market.items():
+        # Validate a private copy and freeze it: the caller's mapping can change after construction.
+        snapshot = dict(self.by_market)
+        for key, amount in snapshot.items():
+            if not _is_projection_key(key):
+                raise ValueError(f"exposure key {key!r} must be (fixture_id: int, player_id: int, market_type: str)")
             if not (math.isfinite(amount) and amount >= 0.0):
                 raise ValueError(f"exposure for {key} must be finite and non-negative")
+        object.__setattr__(self, "by_market", MappingProxyType(snapshot))
 
     @property
     def total(self) -> float:
@@ -480,6 +496,12 @@ class InstitutionalAssetManager:
         """
         if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() != timedelta(0):
             raise ValueError("now must be provided as a timezone-aware UTC datetime")
+        for key, projection in projections.items():
+            identity = (projection.fixture_id, projection.player_id, projection.market_type)
+            if identity != key:
+                # A misfiled projection would be priced against another market's quotes; the whole
+                # mapping is suspect, so refuse it rather than skip the one entry.
+                raise ValueError(f"projection filed under {key} identifies itself as {identity}")
         report = AllocationReport()
         available = self.bankroll - exposure.total
         if available <= 0.0:

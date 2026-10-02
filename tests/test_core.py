@@ -572,6 +572,30 @@ def test_exposure_book_rejects_invalid_amounts() -> None:
             ExposureBook({(1, 2, "tackles"): amount})
 
 
+def test_exposure_book_rejects_malformed_keys() -> None:
+    for key in ((1, 2), (1, "2", "tackles"), (True, 2, "tackles"), (1, 2, ""), "1-2-tackles"):
+        with pytest.raises(ValueError):
+            ExposureBook({key: 1.0})  # type: ignore[dict-item]
+
+
+def test_exposure_book_is_isolated_from_later_mutation_of_its_input() -> None:
+    source = {(9, 1, "tackles"): 100.0}
+    book = ExposureBook(source)
+    source[(9, 1, "tackles")] = -1e9
+    source[(9, 2, "tackles")] = 50.0
+    assert book.total == 100.0 and book.market_total((9, 2, "tackles")) == 0.0
+    with pytest.raises(TypeError):
+        book.by_market[(9, 1, "tackles")] = -1.0  # type: ignore[index]
+
+
+def test_allocate_rejects_projection_filed_under_another_key() -> None:
+    misfiled = FactorProjection(999, 999, "fouls", AUDIT_POSTERIOR, 6.0, STARTER)
+    with pytest.raises(ValueError, match="identifies itself as"):
+        _manager(1e6).allocate(
+            {(9, 1, "tackles"): misfiled}, [_quote(9, 1, 1.5, 1.714, None)], now=NOW, exposure=NO_EXPOSURE
+        )
+
+
 def _near_certain_under(price: float) -> tuple[dict[ProjectionKey, FactorProjection], LiveOddsQuote]:
     """0.31 tackles per 90 (posterior 14.4 / 46.0): Under 2.5 loses well under 1% of the time."""
     projection = FactorProjection(7, 7, "tackles", GammaPosterior(14.4, 46.0), 6.0, STARTER)
