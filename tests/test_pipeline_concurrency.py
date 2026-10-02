@@ -16,6 +16,9 @@ import requests  # noqa: E402
 from prop_alpha.ingestion.pipeline import (  # noqa: E402
     MAX_RETRY_AFTER_S,
     ConcurrentIngestionEngine,
+    FixtureResult,
+    MergeResult,
+    SlateReport,
     TokenBucketRateLimiter,
     VendorClient,
     build_arg_parser,
@@ -323,6 +326,28 @@ def test_merge_failure_is_recorded_and_staging_preserved() -> None:
     assert len(db.staging) == 2 * 5
     assert not report.fully_successful
     assert pool.in_use == 0
+
+
+def test_empty_slate_is_not_successful() -> None:
+    db, pool, vendor, _ = _setup(0)
+    with _engine(vendor, pool) as engine:
+        report = engine.run_slate([], job="stats")
+    assert report.results == {} and report.merge is None
+    assert not report.fully_successful
+
+
+def test_rejected_merge_rows_make_the_slate_unsuccessful() -> None:
+    ok = {"FX-0": FixtureResult("FX-0", True, 5, 1, 0.01)}
+    assert SlateReport("stats", results=dict(ok), merge=MergeResult(1, 4, 0)).fully_successful
+    assert not SlateReport("stats", results=dict(ok), merge=MergeResult(1, 4, 1)).fully_successful
+
+
+@pytest.mark.parametrize(
+    "base_url", ["http://vendor.invalid/api", "ftp://vendor.invalid", "vendor.invalid/api", "https://", ""]
+)
+def test_vendor_client_refuses_non_https_base_url(base_url: str) -> None:
+    with pytest.raises(ValueError, match="https"):
+        VendorClient(base_url, "test-key", TokenBucketRateLimiter(100.0, 10))
 
 
 def test_lineup_job_upserts_and_zeroes_absent_players() -> None:

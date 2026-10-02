@@ -46,7 +46,7 @@ python3 -m venv .venv
 Tests:
 
 ```bash
-# Whole suite (307 tests). This is the command that counts.
+# Whole suite (323 tests). This is the command that counts.
 python -m pytest tests -q -p no:cacheprovider
 
 # Individual suites
@@ -112,7 +112,7 @@ PROP_ALPHA_CI_DATABASE_URL="postgresql://postgres:${PGPASSWORD}@localhost:5432/p
 
 ## Before you say a change is done
 
-1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (307). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
+1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (323). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
 2. `bash ci/bootstrap.sh --preflight` passes.
 3. New behaviour has tests that failed before the change.
 4. Report what you actually ran, quoting the summary lines, and tag SQL or deployment claims **[U]** (not executed) or **[N]** (not built).

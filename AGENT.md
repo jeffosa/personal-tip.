@@ -447,7 +447,7 @@ Every identifier below was verified against the v3.3 code.
 │                              │                                          │ chk_line_increment, uq_odds_snapshot         │
 ├──────────────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────────┤
 │ Agent & typing contracts     │ tests/test_agent_contract.py,            │ SANCTIONED_HANDLERS, PURE_MODULES,           │
-│                              │ tests/test_typing_contract.py            │ ci/bootstrap.sh EXPECTED_TESTS = 307         │
+│                              │ tests/test_typing_contract.py            │ ci/bootstrap.sh EXPECTED_TESTS = 323         │
 └──────────────────────────────┴──────────────────────────────────────────┴──────────────────────────────────────────────┘
 ```
 

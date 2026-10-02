@@ -22,6 +22,7 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Callable, Final, Iterable, Mapping, TypeVar
+from urllib.parse import urlsplit
 
 import psycopg2
 import psycopg2.errors
@@ -156,6 +157,10 @@ class VendorClient:
     ) -> None:
         if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
             raise ValueError("max_retries must be a non-negative integer")
+        # The API key travels in a header on every request, so refuse anything but HTTPS.
+        parsed = urlsplit(base_url)
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise ValueError("base_url must be an https:// URL with a host; the API key is sent on every request")
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.rate_limiter = rate_limiter
@@ -178,7 +183,6 @@ class VendorClient:
             )
             adapter = HTTPAdapter(max_retries=retry_policy, pool_maxsize=2)
             session.mount("https://", adapter)
-            session.mount("http://", adapter)
             self._local.session = session
             with self._sessions_lock:
                 self._sessions.append(session)
@@ -259,7 +263,10 @@ class SlateReport:
 
     @property
     def fully_successful(self) -> bool:
-        return not self.failed and not self.timed_out and self.merge_error is None
+        """True only if at least one fixture ran, none failed or timed out, and the merge (if any) neither
+        failed nor rejected rows. An empty slate did no work, and a rejected row is data that never landed."""
+        rejected = self.merge is not None and self.merge.rows_rejected > 0
+        return bool(self.results) and not self.failed and not self.timed_out and self.merge_error is None and not rejected
 
 
 class ConcurrentIngestionEngine:
@@ -523,6 +530,10 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("FAILED %s: %s", uid, error)
     for uid in report.timed_out:
         logger.error("TIMED OUT %s", uid)
+    if not report.results and not report.timed_out:
+        logger.error("NO WORK: TARGET_FIXTURE_UIDS named no fixtures")
+    if report.merge is not None and report.merge.rows_rejected:
+        logger.error("REJECTED %d staged rows; see prop_alpha.staging_rejects", report.merge.rows_rejected)
     return 0 if report.fully_successful else 1
 
 
