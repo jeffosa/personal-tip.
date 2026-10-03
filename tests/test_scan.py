@@ -136,15 +136,15 @@ def _scan_one(tmp_path: Path, max_alerts: int) -> tuple[scan.ScanSummary, _Recor
     store = SentAlertStore(tmp_path / "mock.jsonl")
     notifier = _RecordingNotifier(store)
     report.directives.sort(key=lambda d: -d.ev_per_unit)
-    summary.alerts_sent = len(notifier.notify(report, projections, label=scan.MOCK_LABEL,
-                                              descriptions=scan.descriptions(FIXTURE, inputs, projections),
-                                              max_alerts=max_alerts))
+    summary.alerts_sent, _ = notifier.notify_digest(report, projections, label=scan.MOCK_LABEL,
+                                                    descriptions=scan.descriptions(FIXTURE, inputs, projections),
+                                                    max_alerts=max_alerts)
     return summary, notifier
 
 
 def test_alerts_carry_the_mock_label_names_and_respect_the_cap(tmp_path: Path) -> None:
     summary, notifier = _scan_one(tmp_path, max_alerts=1)
-    assert summary.alerts_sent == len(notifier.texts) <= 1
+    assert summary.alerts_sent == len(notifier.texts) == 1
     for text in notifier.texts:
         assert text.startswith(scan.MOCK_LABEL)
         assert "Walsall v Port Vale" in text and ("Regular Starter" in text or "Away Starter" in text)

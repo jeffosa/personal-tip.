@@ -35,7 +35,7 @@ from typing import Any, Callable, Final, Mapping, Sequence
 import numpy as np
 
 from prop_alpha.alerts.status import DEFAULT_DSN, DSN_ENV
-from prop_alpha.alerts.telegram import PAPER_LABEL, SentAlertStore, TelegramNotifier, load_config
+from prop_alpha.alerts.telegram import PAPER_LABEL, AlertContext, SentAlertStore, TelegramNotifier, load_config
 from prop_alpha.config import DEFAULT_ENV_FILE
 from prop_alpha.ingestion import oddspapi, sportmonks
 from prop_alpha.modeling.engine import FactorProjection, ProjectionError, QuantEngine
@@ -68,8 +68,9 @@ MOCK_STATE_FILE: Final[Path] = DEFAULT_ENV_FILE.parent / ".prop_alpha_state" / "
 BANKROLL_ENV: Final[str] = "PROP_ALPHA_BANKROLL"
 DEFAULT_BANKROLL: Final[float] = 1000.0
 MAX_ALERTS_ENV: Final[str] = "PROP_ALPHA_MAX_ALERTS"
-# Best expected profit first; the rest of the run's candidates are not sent (the summary says so).
-DEFAULT_MAX_ALERTS: Final[int] = 5
+# Best expected profit first, sent as digest messages of 5 (telegram.DIGEST_SIZE); the rest of the run's
+# candidates are not sent (the summary says so).
+DEFAULT_MAX_ALERTS: Final[int] = 10
 MAX_LISTING_PAGES: Final[int] = 5
 STATE_DIR: Final[Path] = DEFAULT_ENV_FILE.parent / ".prop_alpha_state"
 BOOKMAKERS_ENV: Final[str] = "ODDS_BOOKMAKERS"
@@ -218,12 +219,14 @@ def scan_fixture(
 
 def descriptions(
     fixture: UpcomingFixture, inputs: SlateInputs, projections: Mapping[ProjectionKey, FactorProjection]
-) -> dict[ProjectionKey, str]:
+) -> dict[ProjectionKey, AlertContext]:
     players = {p.player_id: p for p in inputs.squad}
     team_names = {fixture.home_team_uid: fixture.home_name, fixture.away_team_uid: fixture.away_name}
     return {
-        key: f"{fixture.name} ({fixture.kickoff_at:%a %d %b %H:%M} UTC) | {players[key[1]].name} "
-             f"({team_names[players[key[1]].team_uid]})"
+        key: AlertContext(
+            f"{fixture.name}, {fixture.kickoff_at:%a %d %b %H:%M} UTC",
+            f"{players[key[1]].name} ({team_names[players[key[1]].team_uid]})",
+        )
         for key in projections
     }
 
@@ -359,7 +362,7 @@ def run_scan(
     engine = QuantEngine(game_state_k=SCAN_GAME_STATE_K)
     combined = AllocationReport()
     all_projections: dict[ProjectionKey, FactorProjection] = {}
-    all_descriptions: dict[ProjectionKey, str] = {}
+    all_descriptions: dict[ProjectionKey, AlertContext] = {}
     exposure = store.exposure(now)
     for fixture, inputs in slate:
         projections, report, quotes = scan_fixture(fixture, inputs, now, quotes_for, manager, engine, summary, exposure)
@@ -373,9 +376,9 @@ def run_scan(
         all_descriptions.update(descriptions(fixture, inputs, projections))
     combined.directives.sort(key=lambda d: (-d.ev_per_unit, d.fixture_id, d.player_id, d.market_type, d.line_value))
     if notifier is not None:
-        summary.alerts_sent = len(notifier.notify(
+        summary.alerts_sent, _ = notifier.notify_digest(
             combined, all_projections, label=label, descriptions=all_descriptions, max_alerts=max_alerts
-        ))
+        )
     return summary
 
 

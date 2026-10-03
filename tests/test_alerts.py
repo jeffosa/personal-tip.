@@ -11,6 +11,7 @@ import pytest
 import requests
 
 from prop_alpha.alerts.telegram import (
+    AlertContext,
     DEFAULT_CRITERIA,
     MIN_SEND_INTERVAL_S,
     OPEN_POSITION_WINDOW,
@@ -305,3 +306,41 @@ def test_recent_chats_lists_senders() -> None:
 def test_env_file_is_gitignored() -> None:
     ignored = (Path(__file__).resolve().parents[1] / ".gitignore").read_text(encoding="utf-8").split()
     assert ".env" in ignored
+
+
+def _digest_notifier(n_bets: int, tmp_path: Path) -> tuple[TelegramNotifier, FakeSession, list[Any]]:
+    """A notifier whose screen passes `n_bets` distinct copies of the demo's high-value bet."""
+    projections, report = demo_case(NOW)
+    base = next(d for d in report.directives if d.line_value == 4.5)
+    assessment = assess_high_value(base, projections[(1001, 55, "tackles")], DEFAULT_CRITERIA, np.random.default_rng(1))
+    bets = [(replace(base, player_id=100 + i), assessment) for i in range(n_bets)]
+    session = FakeSession(*(_ok({"message_id": 50 + i}) for i in range(5)))
+    store = SentAlertStore(tmp_path / "sent.jsonl")
+    notifier = TelegramNotifier(TelegramConfig(FAKE_TOKEN, "987654321"), session=session, store=store,
+                                sleep=lambda seconds: None)
+    notifier._high_value = lambda *args: bets  # type: ignore[method-assign]
+    return notifier, session, bets
+
+
+@pytest.mark.parametrize(("n_bets", "expected_messages"), [(3, [3]), (7, [5, 2]), (10, [5, 5])])
+def test_digest_sends_at_most_five_bets_per_message(n_bets: int, expected_messages: list[int], tmp_path: Path) -> None:
+    notifier, session, bets = _digest_notifier(n_bets, tmp_path)
+    contexts = {(1001, 100 + i, "tackles"): AlertContext("Walsall v Port Vale, Sat 10 Oct 14:00 UTC",
+                                                         f"Player {i} (Walsall)") for i in range(n_bets)}
+    alerted, ids = notifier.notify_digest(AllocationReport(), {}, label="MOCK", descriptions=contexts)
+    texts = [call[1]["text"] for call in session.calls]
+    assert alerted == n_bets and len(ids) == len(texts) == len(expected_messages)
+    assert [text.count("   Player: ") for text in texts] == expected_messages
+    assert all(text.startswith("MOCK\n" + PAPER_LABEL) for text in texts)
+    if len(texts) > 1:
+        assert f"HIGH-VALUE BETS 6-{n_bets} of {n_bets} (message 2 of 2)" in texts[1]
+    first = texts[0]
+    assert "1. Walsall v Port Vale, Sat 10 Oct 14:00 UTC" in first and "   Player: Player 0 (Walsall)" in first
+    assert "   Bet: UNDER 4.5 tackles @ " in first and "SyntheticBookC" in first
+    assert len(SentAlertStore(tmp_path / "sent.jsonl").load()) == n_bets
+
+
+def test_digest_rejects_an_empty_page_size(tmp_path: Path) -> None:
+    notifier, _, _ = _digest_notifier(1, tmp_path)
+    with pytest.raises(ValueError):
+        notifier.notify_digest(AllocationReport(), {}, per_message=0)

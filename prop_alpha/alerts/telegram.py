@@ -40,7 +40,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Final, Mapping
+from typing import Any, Callable, Final, Mapping, Sequence
 
 import numpy as np
 import requests
@@ -76,6 +76,8 @@ _TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\d{5,15}:[A-Za-z0-9_-]{30
 _CHAT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^(-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,})$")
 
 AlertKey = tuple[int, int, str, float, str, str]
+# High-value bets per digest message (10 bets arrive as two messages of 5).
+DIGEST_SIZE: Final[int] = 5
 SeedKey = tuple[int, int, str, float, str, str, float]
 DEFAULT_CRITERIA: Final[HighValueCriteria] = HighValueCriteria(loss_floor=MODEL_RISK_LOSS_FLOOR)
 
@@ -203,21 +205,63 @@ def simulation_seed(directive: StakingDirective) -> int:
     return int.from_bytes(hashlib.sha256(repr(key).encode("utf-8")).digest()[:8], "big")
 
 
+@dataclass(frozen=True)
+class AlertContext:
+    """Readable names for one projection key: the match ("Walsall v Port Vale, Sat 10 Oct 14:00 UTC") and the
+    player with his club ("Alex Hunt (York City)")."""
+
+    match: str
+    player: str
+
+
+def format_digest(
+    entries: Sequence[tuple[StakingDirective, HighValueAssessment, AlertContext | None]],
+    first_number: int,
+    total: int,
+    part: int,
+    parts: int,
+    label: str = "",
+    bankroll_currency: str = "",
+) -> str:
+    """One plain-text message listing several high-value bets, numbered from `first_number` of `total`."""
+    currency = f"{bankroll_currency} " if bankroll_currency else ""
+    last = first_number + len(entries) - 1
+    lines = [
+        *((label,) if label else ()),
+        PAPER_LABEL,
+        f"HIGH-VALUE BETS {first_number}-{last} of {total}" + (f" (message {part} of {parts})" if parts > 1 else ""),
+    ]
+    for number, (directive, assessment, context) in enumerate(entries, first_number):
+        lines += [
+            "",
+            f"{number}. {context.match if context else f'Fixture {directive.fixture_id}'}",
+            f"   Player: {context.player if context else f'player {directive.player_id}'}",
+            f"   Bet: {directive.side.upper()} {directive.line_value:g} {directive.market_type} "
+            f"@ {directive.decimal_odds:.2f} ({directive.sportsbook})",
+            f"   Take it only at {directive.min_acceptable_odds:.2f} or better, until {directive.expires_at:%H:%M} UTC",
+            f"   Edge: {assessment.ev_per_unit:+.1%} expected profit | model {assessment.model_win_probability:.0%} "
+            f"v book {assessment.book_win_probability:.0%} | held in {assessment.survival_rate:.0%} of "
+            f"{assessment.n_simulations:,} simulations",
+            f"   Stake: {currency}{directive.stake:.2f} ({directive.fraction:.1%} of bankroll)",
+        ]
+    return "\n".join(lines)
+
+
 def format_directive(
     directive: StakingDirective,
     assessment: HighValueAssessment,
     bankroll_currency: str = "",
     label: str = "",
-    description: str | None = None,
+    context: AlertContext | None = None,
 ) -> str:
     """Plain-text alert (no parse_mode, so nothing needs escaping). `label` (e.g. MOCK ODDS) heads the message;
-    `description` (match and player names) replaces the bare ids."""
+    `context` (match and player names) replaces the bare ids."""
     currency = f"{bankroll_currency} " if bankroll_currency else ""
     return "\n".join((
         *((label,) if label else ()),
         PAPER_LABEL,
         "HIGH-VALUE BET",
-        f"{description} | {directive.market_type}" if description
+        f"{context.match} | {context.player} | {directive.market_type}" if context
         else f"Fixture {directive.fixture_id} | player {directive.player_id} | {directive.market_type}",
         f"{directive.side.upper()} {directive.line_value:g} @ {directive.decimal_odds:.3f} "
         f"({directive.sportsbook}, {directive.void_rule})",
@@ -310,7 +354,7 @@ class TelegramNotifier:
         criteria: HighValueCriteria = DEFAULT_CRITERIA,
         bankroll_currency: str = "",
         label: str = "",
-        descriptions: Mapping[ProjectionKey, str] | None = None,
+        descriptions: Mapping[ProjectionKey, AlertContext] | None = None,
         max_alerts: int | None = None,
     ) -> list[int]:
         """Send each directive in report.directives whose market/line/side/book has not been alerted yet
@@ -324,15 +368,70 @@ class TelegramNotifier:
         With a store, each alert is recorded before it is sent: if the send then fails, the alert is lost
         rather than repeated on the next run, because a repeat could double a position.
         """
+        message_ids: list[int] = []
+        for directive, assessment in self._high_value(report, projections, criteria, max_alerts):
+            context = (descriptions or {}).get((directive.fixture_id, directive.player_id, directive.market_type))
+            text = format_directive(directive, assessment, bankroll_currency, label, context)
+            self._record(directive)
+            message_ids.append(self.send_message(text))
+            logger.info("alert sent for %s", alert_key(directive))
+        return message_ids
+
+    def notify_digest(
+        self,
+        report: AllocationReport,
+        projections: Mapping[ProjectionKey, FactorProjection],
+        criteria: HighValueCriteria = DEFAULT_CRITERIA,
+        bankroll_currency: str = "",
+        label: str = "",
+        descriptions: Mapping[ProjectionKey, AlertContext] | None = None,
+        max_alerts: int | None = None,
+        per_message: int = DIGEST_SIZE,
+    ) -> tuple[int, list[int]]:
+        """As notify, but the high-value bets go out as numbered lists of at most `per_message` per message
+        (10 bets: two messages of 5), in report order. Returns (bets alerted, message ids). Every bet of a
+        message is recorded before that message is sent."""
+        if per_message < 1:
+            raise ValueError("per_message must be at least 1")
+        passing = list(self._high_value(report, projections, criteria, max_alerts))
+        parts = -(-len(passing) // per_message)
+        message_ids: list[int] = []
+        for part in range(parts):
+            chunk = passing[part * per_message:(part + 1) * per_message]
+            entries = [
+                (d, a, (descriptions or {}).get((d.fixture_id, d.player_id, d.market_type))) for d, a in chunk
+            ]
+            text = format_digest(entries, part * per_message + 1, len(passing), part + 1, parts, label, bankroll_currency)
+            for directive, _ in chunk:
+                self._record(directive)
+            message_ids.append(self.send_message(text))
+            logger.info("digest message %d/%d sent with %d bets", part + 1, parts, len(chunk))
+        return len(passing), message_ids
+
+    def _record(self, directive: StakingDirective) -> None:
+        if self._config.chat_id is None:
+            raise ValueError(f"{CHAT_ID_ENV} is not set; run with --get-chat-id to find it")
+        if self._store is not None:
+            self._store.append(SentAlert(alert_key(directive), directive.stake, datetime.now(timezone.utc)))
+        self._sent.add(alert_key(directive))
+
+    def _high_value(
+        self,
+        report: AllocationReport,
+        projections: Mapping[ProjectionKey, FactorProjection],
+        criteria: HighValueCriteria,
+        max_alerts: int | None,
+    ) -> list[tuple[StakingDirective, HighValueAssessment]]:
+        """Directives not alerted before that pass the high-value screen, at most `max_alerts`, in report order."""
         if max_alerts is not None and max_alerts < 0:
             raise ValueError("max_alerts must be non-negative")
-        message_ids: list[int] = []
+        passing: list[tuple[StakingDirective, HighValueAssessment]] = []
         for directive in report.directives:
-            if max_alerts is not None and len(message_ids) >= max_alerts:
+            if max_alerts is not None and len(passing) >= max_alerts:
                 logger.info("alert cap of %d reached; remaining directives not screened", max_alerts)
                 break
             key = alert_key(directive)
-            if key in self._sent:
+            if key in self._sent or any(alert_key(d) == key for d, _ in passing):
                 continue
             projection = projections.get((directive.fixture_id, directive.player_id, directive.market_type))
             if projection is None:
@@ -348,16 +447,8 @@ class TelegramNotifier:
                     assessment.surviving_simulations, assessment.n_simulations,
                 )
                 continue
-            description = (descriptions or {}).get((directive.fixture_id, directive.player_id, directive.market_type))
-            text = format_directive(directive, assessment, bankroll_currency, label, description)
-            if self._config.chat_id is None:
-                raise ValueError(f"{CHAT_ID_ENV} is not set; run with --get-chat-id to find it")
-            if self._store is not None:
-                self._store.append(SentAlert(key, directive.stake, datetime.now(timezone.utc)))
-            self._sent.add(key)
-            message_ids.append(self.send_message(text))
-            logger.info("alert sent for %s", key)
-        return message_ids
+            passing.append((directive, assessment))
+        return passing
 
 
 def reference_projection() -> FactorProjection:
