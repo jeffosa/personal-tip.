@@ -5,9 +5,11 @@
 repository. Where a document prints code verbatim it was copied. Everything else was written from prose
 descriptions, and any behaviour the documents do not pin down is an interpretation, listed below.
 
-- No PRD go-live gate has been passed.
-- All SQL is **[U]**: it has never run against PostgreSQL.
-- The odds poller, projection refresh, bet ledger and execution components are **[N]**.
+- No PRD go-live gate has been passed. Gate 1: only the fresh-install half of criterion 1 is met
+  (see [Verification, 2026-10-02](#verification-2026-10-02-postgresql-186)).
+- SQL has run on **PostgreSQL 18.6** (CI stage 6): `schema.sql` installs, 003 → 004 → 005 upgrade, and
+  `tests/test_merge_postgres.sql` passes. Not run: 002 on a v2 database, real vendor data, PostgreSQL 15–17.
+- The odds poller, projection refresh, bet ledger, closing-line capture and execution components are **[N]**.
 
 ## Source hierarchy used
 
@@ -42,10 +44,10 @@ Mixed files list each part separately.
 | `tests/conftest.py` | none (shared payload builders) | RECONSTRUCTED | step 3 |
 | `tests/test_integrity.py` | ESSENTIALS §1.1, §2.3, §3.1; AGENT §3.3 boundary catalogue | RECONSTRUCTED | step 3 (SQL parts in step 4) |
 | `tests/test_pipeline_concurrency.py` (including the in-memory fakes) | ARCHITECTURE §2.1–§2.3; PRD §2.1, B1–B2; AGENT §3.3 | RECONSTRUCTED | step 3 |
-| `migrations/002_staging_and_indexes.sql` | refactor TASK 3 | VERBATIM (byte-exact; superseded by 003, never apply to a v3.2+ schema) **[U]** | step 4 |
-| `migrations/003_integrity_constraints.sql` | ESSENTIALS §3.4 | VERBATIM (byte-exact) **[U]** | step 4 |
-| `schema.sql` | ESSENTIALS §3.3 (`player_match_stats`, `odds_lines`), §3.4 (merge function); refactor TASK 3 (staging DDL); everything else from column usage in code and documents | Mixed: see [schema.sql](#schemasql-mixed-u) **[U]** | step 4 |
-| `ci/bootstrap.sh` | ESSENTIALS §4.3 | VERBATIM except `EXPECTED_TESTS` (as instructed) | step 4 |
+| `migrations/002_staging_and_indexes.sql` | refactor TASK 3 | VERBATIM (byte-exact; superseded by 003, never apply to a v3.2+ schema) **[U]**: no v2 database to apply it to | step 4 |
+| `migrations/003_integrity_constraints.sql` | ESSENTIALS §3.4 | VERBATIM (byte-exact); executed on PostgreSQL 18.6 | step 4 |
+| `schema.sql` | ESSENTIALS §3.3 (`player_match_stats`, `odds_lines`), §3.4 (merge function); refactor TASK 3 (staging DDL); everything else from column usage in code and documents | Mixed: see [schema.sql](#schemasql-mixed); executed on PostgreSQL 18.6 | step 4 |
+| `ci/bootstrap.sh` | ESSENTIALS §4.3 | ADAPTED: `EXPECTED_TESTS`; 004/005 and `tests/test_merge_postgres.sql` in stage 6; Windows `psql` discovery | step 4 (2026-10-02) |
 | `.gitattributes` | none (forces LF on `*.sh` and `*.sql`; bash rejects CRLF) | RECONSTRUCTED | step 4 |
 | `tests/test_typing_contract.py` | ESSENTIALS §2.1 R-TYPE-1 to R-TYPE-3 | RECONSTRUCTED | step 5 |
 | `tests/test_agent_contract.py` | AGENT §1.1 A3–A4, §1.2 Z1, §1.3 F2–F6, §1.4 P1–P5, §2.1 G1 | RECONSTRUCTED | step 5 |
@@ -54,6 +56,13 @@ Mixed files list each part separately.
 | `prop_alpha/scanner/value_screen.py`, `tests/test_value_screen.py` | **Not in any document.** High-value definition set by the maintainer. | NEW | step 7 |
 | `.env.example` | none (empty template; the real `.env` is gitignored) | NEW | step 6 |
 | `AGENT.md` (row H6), `CLAUDE.md` (I/O isolation, secrets, alert commands) | edited to match step 6 | EDITED | step 6 |
+| `migrations/004_merge_hardening.sql` | remediation D1, D2 | NEW; executed on PostgreSQL 18.6 | remediation |
+| `migrations/005_player_current_team.sql` | review finding: `current_team_id` never updated | NEW; executed on PostgreSQL 18.6 | 2026-10-02 |
+| `tests/test_merge_postgres.sql` | none (behavioural merge test run by CI stage 6) | NEW | 2026-10-02 |
+| `prop_alpha/ingestion/sportmonks.py`, `tests/test_sportmonks.py` | audit C1: no adapter for any real vendor. Mapping verified on Sportmonks fixture 19727702 | NEW | 2026-10-02 |
+| `prop_alpha/config.py` | `.env` parsing moved out of `alerts/telegram.py` so ingestion can read credentials | NEW | 2026-10-02 |
+| `pipeline.py` quota guard, `telegram.py` `SentAlertStore`, `backtest.py` zero-minute rows | audit C2, C3, C4 | EDITED | 2026-10-02 |
+| `CLAUDE.md` (status, Local PostgreSQL) | edited after the first PostgreSQL run | EDITED | 2026-10-02 |
 
 ## Interpretations by file
 
@@ -353,16 +362,17 @@ No code in any document; signatures are interpretations.
   - moving the vendor fetch inside `_with_transaction`: `3 failed, 10 passed`;
   - restored: `122 passed`.
 
-### `schema.sql` (mixed; [U])
+### `schema.sql` (mixed)
 
-**Status [U]:** never executed against PostgreSQL. There is no PostgreSQL, Docker or psql on this
-machine.
+**Status:** installs cleanly on PostgreSQL 18.6 (native Windows install, 2026-10-02). Until then there was
+no PostgreSQL on this machine, and everything below was written without executing it. Its merge
+behaviour on real rows is covered only by `tests/test_merge_postgres.sql`, not by vendor data.
 
 | Part | Status |
 |---|---|
 | `player_match_stats` and `odds_lines` | VERBATIM (ESSENTIALS §3.3) |
 | `staging_player_feed` and `staging_rejects` | VERBATIM (migration 002 DDL) |
-| `merge_staging_player_feed()` | VERBATIM, byte-identical to migration 003. A test enforces this (AGENT M4, Z5). |
+| `merge_staging_player_feed()` | Started VERBATIM from migration 003; now byte-identical to the latest migration, 005 (004 added D1/D2, 005 the current-team update). `test_merge_function_identical_in_schema_and_latest_migration` enforces this (AGENT M4, Z5). |
 | `leagues`, `teams`, `players`, `referees`, `fixtures`, `lineup_expectations`, `raw_payloads`, `model_projections`, `bets`, indexes | RECONSTRUCTED |
 
 - **Q-S1 — Unqualified names.** The verbatim excerpts use unqualified table names, so the file runs
@@ -713,3 +723,37 @@ direction and stay **[N]**.
 
 The audit prototype (`audit/hardened_allocator.py`, `audit/check_hardened_allocator.py`, added in `d140c30`)
 is superseded by the package code and was deleted; it remains in git history at that commit.
+
+### Verification (2026-10-02, PostgreSQL 18.6)
+
+PostgreSQL 18.6 was installed natively (EDB installer, service `postgresql-x64-18`, port 5432). The
+password is in `%APPDATA%\postgresql\pgpass.conf`, outside the repository. CI used the disposable database
+`prop_alpha_ci`. This supersedes the "stage 6 not run" row of the 2026-10-01 table above.
+
+| Command | Result |
+|---|---|
+| `psql -f schema.sql` (one transaction) | exit 0; 13 tables, `staging_player_feed` the only unlogged one |
+| `SELECT * FROM prop_alpha.merge_staging_player_feed()` on empty staging | `0 / 0 / 0` |
+| `tests/test_merge_postgres.sql` with the 004 merge | fails: `a transferred player moves to their new team` (the defect 005 fixes) |
+| `tests/test_merge_postgres.sql` with 005 | every check passes |
+| `PROP_ALPHA_CI_DATABASE_URL=postgresql://postgres@localhost:5432/prop_alpha_ci bash ci/bootstrap.sh` | `junit totals: {'tests': 323, 'failures': 0, 'errors': 0, 'skipped': 0}`; `schema smoke test passed on prop_alpha_ci`; `SUCCESS` |
+
+| Suite | Tests |
+|---|---|
+| Core | 115 |
+| Integrity | 71 |
+| Agent contract | 42 |
+| Typing contract | 33 |
+| Concurrency | 27 |
+| Alerts | 16 |
+| Value screen | 19 |
+| **Total** | **323** |
+
+**PRD gate status.** No gate is passed.
+
+| Gate | Status |
+|---|---|
+| 1 | Environment met (PRD: "PostgreSQL 15+"; 18.6 qualifies). Criterion 1: fresh install met (`merge_staging_player_feed(integer)` resolves; `idx_odds_fixture_captured` present, `idx_odds_captured_brin` absent); the v2 → 002 upgrade cannot be run, because no v2 schema exists (M-1). Criteria 2–7 (1,000-fixture backfill, zero rejects, reconciliation, idempotency, concurrency soak, lineups) need vendor access and are not started. |
+| 2 | Blocked by Gate 1's backfill; fitting runs and the market-benchmark dataset not started. The backtest's neutral referee cannot evaluate referee-sensitive markets. |
+| 3 | Projection refresh, bet-ledger writer and closing-line capture are **[N]**. |
+| 4 | Execution component, restriction telemetry and the bench estimator are **[N]**. |

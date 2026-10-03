@@ -12,7 +12,7 @@ import numpy as np
 from numpy.typing import ArrayLike
 from scipy.special import xlogy
 
-from prop_alpha.modeling.engine import MAX_MATCH_MINUTES, LineupExpectation, QuantEngine, RefereeProfile
+from prop_alpha.modeling.engine import MAX_MATCH_MINUTES, LineupExpectation, ProjectionError, QuantEngine, RefereeProfile
 from prop_alpha.scanner.market_scanner import devig_two_way
 
 
@@ -95,8 +95,8 @@ class PlayerMatchObservation:
             raise ValueError(f"minutes_played must lie in [0, {MAX_MATCH_MINUTES}]")
         if isinstance(self.count, bool) or not isinstance(self.count, int) or self.count < 0:
             raise ValueError("count must be a non-negative integer")
-        if self.count > 0 and self.minutes_played == 0.0:
-            raise ValueError("a positive count cannot be recorded with zero minutes played")
+        # A positive count with zero minutes is valid data (an unused substitute booked on the bench) and
+        # is stored by ingestion; walk_forward_over_probability keeps it out of the per-minute rate.
 
 
 @dataclass(frozen=True)
@@ -108,6 +108,13 @@ class BacktestPrediction:
     p_over: float
     outcome: int
     n_history: int
+
+
+@dataclass(frozen=True)
+class BacktestFailure:
+    player_id: int
+    fixture_id: int
+    error: str
 
 
 _NEUTRAL_REFEREE: Final[RefereeProfile] = RefereeProfile(1.0, 0.0, 0.0, 0.0)
@@ -122,6 +129,7 @@ def walk_forward_over_probability(
     prior_strength_90s: float = 6.0,
     default_start_minutes: float = 85.0,
     default_sub_minutes: float = 20.0,
+    failures: list[BacktestFailure] | None = None,
 ) -> list[BacktestPrediction]:
     """P(count > line) for every appearance, using only that player's observations strictly before kickoff.
 
@@ -130,6 +138,10 @@ def walk_forward_over_probability(
     minutes are the player's prior mean when starting / coming on, else the defaults (as LINEUP_UPSERT_SQL).
     The referee is neutral (multiplier 1): observations carry no referee, so referee-sensitive markets
     are evaluated without the referee adjustment.
+
+    Without `failures`, the first appearance that cannot be priced raises. With a list, each such appearance
+    is appended to it and skipped (sanctioned handler H7), so one bad row cannot stop a full-season run;
+    report len(failures) next to the scores, because skipped rows are not scored.
     """
     if not (math.isfinite(line) and line >= 0.0 and line * 2.0 % 2.0 == 1.0):
         raise ValueError("walk-forward evaluation needs a half line (e.g. 1.5) so every outcome settles")
@@ -144,36 +156,63 @@ def walk_forward_over_probability(
             prior = [o for o in history if o.kickoff_at < target.kickoff_at]
             if not target.started and target.minutes_played == 0.0:
                 continue
-            start_minutes = [o.minutes_played for o in prior if o.started and o.minutes_played > 0.0]
-            sub_minutes = [o.minutes_played for o in prior if not o.started and o.minutes_played > 0.0]
-            lineup = LineupExpectation(
-                p_start=1.0 if target.started else 0.0,
-                p_sub_appearance=0.0 if target.started else 1.0,
-                exp_minutes_start=float(np.mean(start_minutes)) if start_minutes else default_start_minutes,
-                exp_minutes_sub=float(np.mean(sub_minutes)) if sub_minutes else default_sub_minutes,
-            )
-            projection = engine.project_count_market(
-                fixture_id=target.fixture_id,
-                player_id=player_id,
-                market_type=market_type,
-                counts=[o.count for o in prior],
-                minutes=[o.minutes_played for o in prior],
-                league_rate_per90=league_rate_per90,
-                referee=_NEUTRAL_REFEREE,
-                is_home=True,
-                lineup=lineup,
-                prior_strength_90s=prior_strength_90s,
-            )
+            try:
+                p_over = _over_probability(
+                    target, prior, line, league_rate_per90, engine, market_type, prior_strength_90s,
+                    default_start_minutes, default_sub_minutes,
+                )
+            except (ProjectionError, ValueError, FloatingPointError) as exc:
+                if failures is None:
+                    raise
+                failures.append(BacktestFailure(player_id, target.fixture_id, f"{type(exc).__name__}: {exc}"))
+                continue
             predictions.append(BacktestPrediction(
                 player_id=player_id,
                 fixture_id=target.fixture_id,
                 kickoff_at=target.kickoff_at,
                 line=line,
-                p_over=projection.side_probabilities(line, "over").p_win,
+                p_over=p_over,
                 outcome=int(target.count > line),
                 n_history=len(prior),
             ))
     return sorted(predictions, key=lambda p: (p.kickoff_at, p.fixture_id, p.player_id))
+
+
+def _over_probability(
+    target: PlayerMatchObservation,
+    prior: Sequence[PlayerMatchObservation],
+    line: float,
+    league_rate_per90: float,
+    engine: QuantEngine,
+    market_type: str,
+    prior_strength_90s: float,
+    default_start_minutes: float,
+    default_sub_minutes: float,
+) -> float:
+    # Only time on the pitch informs a per-minute rate: zero-minute rows (including bench bookings,
+    # which the engine's exposure validation rejects) are left out of the rate inputs.
+    on_pitch = [o for o in prior if o.minutes_played > 0.0]
+    start_minutes = [o.minutes_played for o in on_pitch if o.started]
+    sub_minutes = [o.minutes_played for o in on_pitch if not o.started]
+    lineup = LineupExpectation(
+        p_start=1.0 if target.started else 0.0,
+        p_sub_appearance=0.0 if target.started else 1.0,
+        exp_minutes_start=float(np.mean(start_minutes)) if start_minutes else default_start_minutes,
+        exp_minutes_sub=float(np.mean(sub_minutes)) if sub_minutes else default_sub_minutes,
+    )
+    projection = engine.project_count_market(
+        fixture_id=target.fixture_id,
+        player_id=target.player_id,
+        market_type=market_type,
+        counts=[o.count for o in on_pitch],
+        minutes=[o.minutes_played for o in on_pitch],
+        league_rate_per90=league_rate_per90,
+        referee=_NEUTRAL_REFEREE,
+        is_home=True,
+        lineup=lineup,
+        prior_strength_90s=prior_strength_90s,
+    )
+    return projection.side_probabilities(line, "over").p_win
 
 
 def summarize(predictions: Sequence[BacktestPrediction]) -> dict[str, float]:

@@ -19,6 +19,7 @@ from prop_alpha.calibration.fitting import (
 )
 from prop_alpha.calibration.referee_job import FixtureDiscipline, compute_referee_coefficients
 from prop_alpha.evaluation.backtest import (
+    BacktestFailure,
     PlayerMatchObservation,
     brier_score,
     calibration_table,
@@ -1003,6 +1004,42 @@ def test_walk_forward_uses_only_strictly_prior_observations() -> None:
     assert {p.fixture_id: p.p_over for p in later if p.fixture_id != 6} == {p.fixture_id: p.p_over for p in predictions}
     with pytest.raises(ValueError):
         walk_forward_over_probability(observations, 2.0, 2.2, engine)
+
+
+def test_walk_forward_accepts_bench_booking_and_keeps_it_out_of_the_rate() -> None:
+    """An unused substitute booked on the bench (0 minutes, 1 card) is stored by ingestion; it must not
+    abort the backtest, and it must not change any player's on-pitch rate."""
+    clean = [
+        _observation(1, 1, True, 90.0, 1),
+        _observation(2, 8, True, 90.0, 0),
+        _observation(4, 22, True, 90.0, 2),
+    ]
+    with_bench_card = clean + [_observation(3, 15, False, 0.0, 1)]
+    engine = QuantEngine(game_state_k=6.0)
+    predictions = walk_forward_over_probability(with_bench_card, 0.5, 0.2, engine, market_type="yellow_card")
+    baseline = walk_forward_over_probability(clean, 0.5, 0.2, engine, market_type="yellow_card")
+    assert {p.fixture_id for p in predictions} == {1, 2, 4}
+    assert {p.fixture_id: p.p_over for p in predictions} == {p.fixture_id: p.p_over for p in baseline}
+
+
+def test_one_unpriceable_player_is_recorded_not_fatal_when_failures_are_collected() -> None:
+    """Audit H4 / handler H7: one bad player used to stop a whole-season backtest."""
+
+    class RefusesPlayer10(QuantEngine):
+        def project_count_market(self, **kwargs: Any) -> PropProjection:
+            if kwargs["player_id"] == 10:
+                raise ProjectionError("degenerate history")
+            return super().project_count_market(**kwargs)
+
+    observations = [_observation(1, 1, True, 90.0, 3), _observation(2, 8, True, 90.0, 1),
+                    _observation(3, 8, True, 90.0, 6, player=10)]
+    engine = RefusesPlayer10(game_state_k=6.0)
+    with pytest.raises(ProjectionError):
+        walk_forward_over_probability(observations, 1.5, 2.2, engine)
+    failures: list[BacktestFailure] = []
+    predictions = walk_forward_over_probability(observations, 1.5, 2.2, engine, failures=failures)
+    assert [p.fixture_id for p in predictions] == [1, 2]
+    assert failures == [BacktestFailure(10, 3, "ProjectionError: degenerate history")]
 
 
 def test_summarize_reports_brier_skill_against_climatology() -> None:

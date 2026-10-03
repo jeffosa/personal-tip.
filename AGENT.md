@@ -81,6 +81,8 @@
 | H4 | `ingestion/pipeline.py` → `ConcurrentIngestionEngine._with_transaction` | `RETRYABLE_DB_ERRORS` | one attempt; the last error is re-raised after `max_db_attempts` | `logger.warning` per attempt |
 | H5 | `scanner/market_scanner.py` → `InstitutionalAssetManager.allocate` | `(ProjectionError, ValueError, FloatingPointError)` | one player-market key | `report.skipped` (`"projection unusable: …"`) and `logger.error` |
 | H6 | `alerts/telegram.py` → `TelegramNotifier._call` | `requests.RequestException` | one Telegram API call | re-raised as `TelegramError` without the request URL, which contains the bot token (`from None`). **Added in the reconstruction at the maintainer's request for Telegram alerts; awaiting formal approval.** |
+| H7 | `evaluation/backtest.py` → `walk_forward_over_probability` | `(ProjectionError, ValueError, FloatingPointError)` | one player appearance; only when the caller passes a `failures` list, otherwise re-raised | `BacktestFailure` appended to `failures`. **Approved by the maintainer on 2026-10-03 (audit finding H4: one bad row stopped a whole-season backtest).** |
+| H8 | `alerts/status.py` → `database_section` | `psycopg2.Error` | one status read; nothing is written | the report line "Database: UNREACHABLE (…)" and `logger.error`. **Added on 2026-10-03 with the 4-hourly Telegram status report the maintainer requested; awaiting formal approval.** |
 
   Enforcement:
   - `test_only_sanctioned_exception_handlers_exist` requires the handler set to equal `SANCTIONED_HANDLERS` exactly.
@@ -447,7 +449,7 @@ Every identifier below was verified against the v3.3 code.
 │                              │                                          │ chk_line_increment, uq_odds_snapshot         │
 ├──────────────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────────┤
 │ Agent & typing contracts     │ tests/test_agent_contract.py,            │ SANCTIONED_HANDLERS, PURE_MODULES,           │
-│                              │ tests/test_typing_contract.py            │ ci/bootstrap.sh EXPECTED_TESTS = 323         │
+│                              │ tests/test_typing_contract.py            │ ci/bootstrap.sh EXPECTED_TESTS = 363         │
 └──────────────────────────────┴──────────────────────────────────────────┴──────────────────────────────────────────────┘
 ```
 

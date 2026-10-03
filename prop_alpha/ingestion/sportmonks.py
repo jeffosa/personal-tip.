@@ -1,0 +1,247 @@
+"""Pure adapters from Sportmonks Football API v3 responses to the payload shapes transform.py parses (no I/O).
+
+Sportmonks lists a player statistic only when it is non-zero, so an absent TACKLES row means 0 tackles. That
+defeats transform.py's per-player "required field" guard against vendor schema drift, so the guard moves here
+to the fixture: a finished fixture whose lineups carry no MINUTES_PLAYED, TACKLES or FOULS rows at all, or a
+player who started without MINUTES_PLAYED, raises instead of manufacturing zeros.
+
+Field mapping verified on fixture 19727702 (League Two, 2026-09-19): SUBSTITUTION events carry the incoming
+player as player_id and the outgoing one as related_player_id; GOAL events credit participant_id; lineup
+type_id 11 is the starting XI and 12 the bench.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Final, Mapping
+
+BASE_URL: Final[str] = "https://api.sportmonks.com/v3/football"
+STATS_INCLUDE: Final[str] = "participants;lineups.details.type;events.type;referees;state;scores;statistics.type"
+LINEUPS_INCLUDE: Final[str] = "participants;lineups"
+STATS_PATH: Final[str] = "fixtures/{uid}?include=" + STATS_INCLUDE
+LINEUPS_PATH: Final[str] = "fixtures/{uid}?include=" + LINEUPS_INCLUDE
+
+STARTING_XI: Final[int] = 11
+BENCH: Final[int] = 12
+POSITIONS: Final[Mapping[int, str]] = {24: "GK", 25: "DEF", 26: "MID", 27: "ATT"}
+
+FINAL_STATES: Final[frozenset[str]] = frozenset({"FT", "AET", "FT_PEN"})
+SCHEDULED_STATES: Final[frozenset[str]] = frozenset({"NS", "TBA"})
+LIVE_STATES: Final[frozenset[str]] = frozenset({
+    "INPLAY_1ST_HALF", "HT", "INPLAY_2ND_HALF", "BREAK", "INPLAY_ET", "EXTRA_TIME_BREAK", "INPLAY_PENALTIES", "PEN_BREAK",
+})
+POSTPONED_STATES: Final[frozenset[str]] = frozenset({"POSTPONED", "DELAYED"})
+GOAL_EVENTS: Final[frozenset[str]] = frozenset({"GOAL", "PENALTY"})
+OWN_GOAL_EVENT: Final[str] = "OWNGOAL"
+
+# Sportmonks player detail -> transform.py stats key. Absent detail = 0 (Sportmonks omits zeros).
+DETAIL_FIELDS: Final[Mapping[str, str]] = {
+    "TACKLES": "tackles_attempted",
+    "TACKLES_WON": "tackles_won",
+    "INTERCEPTIONS": "interceptions",
+    "DRIBBLED_PAST": "dribbled_past",
+    "TOTAL_DUELS": "duels_total",
+    "DUELS_WON": "duels_won",
+    "FOULS": "fouls_committed",
+    "FOULS_DRAWN": "fouls_drawn",
+}
+COVERAGE_DETAILS: Final[tuple[str, ...]] = ("MINUTES_PLAYED", "TACKLES", "FOULS")
+
+
+def _data(body: Mapping[str, Any]) -> Mapping[str, Any]:
+    data = body.get("data")
+    if not isinstance(data, Mapping):
+        raise ValueError("Sportmonks response has no 'data' object")
+    return data
+
+
+def _type_name(item: Mapping[str, Any]) -> str:
+    kind = item.get("type")
+    return str(kind.get("developer_name")) if isinstance(kind, Mapping) else ""
+
+
+def _status(fixture: Mapping[str, Any]) -> str:
+    state = fixture.get("state")
+    name = str(state.get("developer_name")) if isinstance(state, Mapping) else ""
+    if name in FINAL_STATES:
+        return "final"
+    if name in SCHEDULED_STATES:
+        return "scheduled"
+    if name in LIVE_STATES:
+        return "live"
+    if name in POSTPONED_STATES:
+        return "postponed"
+    raise ValueError(f"fixture {fixture.get('id')}: unsupported Sportmonks state {name!r}")
+
+
+def _sides(fixture: Mapping[str, Any]) -> tuple[str, str]:
+    by_location: dict[str, str] = {}
+    for participant in fixture.get("participants") or []:
+        meta = participant.get("meta") or {}
+        by_location[str(meta.get("location"))] = str(participant["id"])
+    if "home" not in by_location or "away" not in by_location:
+        raise ValueError(f"fixture {fixture.get('id')}: participants lack a home and an away side")
+    return by_location["home"], by_location["away"]
+
+
+def _kickoff(fixture: Mapping[str, Any]) -> str:
+    timestamp = fixture.get("starting_at_timestamp")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+        raise ValueError(f"fixture {fixture.get('id')}: starting_at_timestamp missing")
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+
+def _current_score(fixture: Mapping[str, Any], home: str, away: str) -> tuple[int | None, int | None]:
+    goals: dict[str, int] = {}
+    for score in fixture.get("scores") or []:
+        if score.get("description") == "CURRENT":
+            goals[str(score["participant_id"])] = int(score["score"]["goals"])
+    return goals.get(home), goals.get(away)
+
+
+def _goals(fixture: Mapping[str, Any], home: str, away: str, final_score: tuple[int | None, int | None]) -> list[dict[str, Any]]:
+    """Goal events credited to the scoring side. Own-goal attribution is not documented, so both readings are
+    tried and the one that reproduces the final score is used; if neither or both do, the fixture fails."""
+    regular: list[dict[str, Any]] = []
+    own: list[tuple[int, str]] = []
+    for event in fixture.get("events") or []:
+        name = _type_name(event)
+        if name in GOAL_EVENTS:
+            regular.append({"minute": int(event["minute"]), "team_uid": str(event["participant_id"])})
+        elif name == OWN_GOAL_EVENT:
+            own.append((int(event["minute"]), str(event["participant_id"])))
+    if final_score[0] is None or final_score[1] is None:
+        if own:
+            raise ValueError(f"fixture {fixture.get('id')}: own goal without a final score to attribute it")
+        return regular
+    other = {home: away, away: home}
+    readings = [regular] if not own else [
+        regular + [{"minute": minute, "team_uid": team} for minute, team in own],
+        regular + [{"minute": minute, "team_uid": other[team]} for minute, team in own],
+    ]
+    matching = [
+        reading for reading in readings
+        if (sum(g["team_uid"] == home for g in reading), sum(g["team_uid"] == away for g in reading)) == final_score
+    ]
+    if len(matching) != 1:
+        raise ValueError(f"fixture {fixture.get('id')}: goal events do not uniquely reproduce the score {final_score}")
+    return matching[0]
+
+
+def _possession(fixture: Mapping[str, Any]) -> dict[str, dict[str, float]]:
+    teams: dict[str, dict[str, float]] = {}
+    for statistic in fixture.get("statistics") or []:
+        if _type_name(statistic) == "BALL_POSSESSION":
+            teams[str(statistic["participant_id"])] = {"possession_pct": float(statistic["data"]["value"])}
+    return teams
+
+
+def _substitution_minutes(fixture: Mapping[str, Any]) -> tuple[dict[str, int], dict[str, int]]:
+    """(minute_on by incoming player, minute_off by outgoing player) from SUBSTITUTION events."""
+    on: dict[str, int] = {}
+    off: dict[str, int] = {}
+    for event in fixture.get("events") or []:
+        if _type_name(event) == "SUBSTITUTION":
+            minute = int(event["minute"])
+            if event.get("player_id") is not None:
+                on[str(event["player_id"])] = minute
+            if event.get("related_player_id") is not None:
+                off[str(event["related_player_id"])] = minute
+    return on, off
+
+
+def _details(row: Mapping[str, Any]) -> dict[str, int]:
+    values: dict[str, int] = {}
+    for detail in row.get("details") or []:
+        name = _type_name(detail)
+        value = (detail.get("data") or {}).get("value")
+        if name and isinstance(value, (int, float)) and not isinstance(value, bool):
+            if isinstance(value, float) and not value.is_integer() and (name in DETAIL_FIELDS or name == "MINUTES_PLAYED"):
+                raise ValueError(f"player {row.get('player_id')}: {name} is not a whole number ({value!r})")
+            values[name] = int(value)
+    return values
+
+
+def fixture_payload(body: Mapping[str, Any]) -> dict[str, Any]:
+    """A Sportmonks fixture (fetched with STATS_INCLUDE) as the payload parse_fixture_payload expects."""
+    fixture = _data(body)
+    status = _status(fixture)
+    home, away = _sides(fixture)
+    final_score = _current_score(fixture, home, away)
+    referee = next(
+        (r for r in fixture.get("referees") or [] if r.get("type_id") == 6 or _type_name(r) == "REFEREE"), None
+    )
+    lineups = fixture.get("lineups") or []
+    on_events, off_events = _substitution_minutes(fixture)
+
+    players: list[dict[str, Any]] = []
+    seen_details: set[str] = set()
+    for row in lineups:
+        kind = row.get("type_id")
+        if kind not in (STARTING_XI, BENCH):
+            raise ValueError(f"fixture {fixture.get('id')}: unknown lineup type_id {kind!r}")
+        uid = str(row["player_id"])
+        details = _details(row)
+        seen_details.update(details)
+        started = kind == STARTING_XI
+        if status == "final" and started and "MINUTES_PLAYED" not in details:
+            raise ValueError(f"fixture {fixture.get('id')}: starter {uid} has no MINUTES_PLAYED")
+        minutes = details.get("MINUTES_PLAYED", 0)
+        stats: dict[str, int] = {"minutes": minutes}
+        for source, target in DETAIL_FIELDS.items():
+            stats[target] = details.get(source, 0)
+        stats["yellow_cards"] = details.get("YELLOWCARDS", 0) + details.get("YELLOWREDCARDS", 0)
+        stats["red_cards"] = details.get("REDCARDS", 0) + details.get("YELLOWREDCARDS", 0)
+        player: dict[str, Any] = {
+            "uid": uid,
+            "name": " ".join(str(row.get("player_name") or uid).split()),
+            "position": POSITIONS.get(row.get("position_id") or 0, f"P{row.get('position_id')}"),
+            "team_uid": str(row["team_id"]),
+            "started": started,
+            "stats": stats,
+        }
+        if minutes > 0:
+            minute_on = 0 if started else on_events.get(uid)
+            if minute_on is not None:
+                player["minute_on"] = minute_on
+                minute_off = off_events.get(uid)
+                player["minute_off"] = max(minute_off, minute_on) if minute_off is not None else minute_on + minutes
+        players.append(player)
+
+    if status == "final":
+        missing = [name for name in COVERAGE_DETAILS if name not in seen_details]
+        if missing:
+            raise ValueError(f"fixture {fixture.get('id')}: no {missing} in any lineup (coverage gap or schema drift)")
+
+    return {
+        "fixture": {
+            "uid": str(fixture["id"]),
+            "home_team_uid": home,
+            "away_team_uid": away,
+            "kickoff_at": _kickoff(fixture),
+            "status": status,
+            "home_score": final_score[0],
+            "away_score": final_score[1],
+        },
+        "referee": {"uid": str(referee["referee_id"]), "name": f"Sportmonks referee {referee['referee_id']}"}
+        if referee is not None else None,
+        "teams": _possession(fixture),
+        "goals": _goals(fixture, home, away, final_score) if status in ("final", "live") else [],
+        "players": players,
+    }
+
+
+def lineup_payload(body: Mapping[str, Any]) -> dict[str, Any]:
+    """A Sportmonks fixture (fetched with LINEUPS_INCLUDE) as the payload parse_lineup_payload expects."""
+    fixture = _data(body)
+    home, away = _sides(fixture)
+    sheets: dict[str, dict[str, list[str]]] = {home: {"starters": [], "bench": []}, away: {"starters": [], "bench": []}}
+    for row in fixture.get("lineups") or []:
+        team = str(row["team_id"])
+        if team not in sheets:
+            raise ValueError(f"fixture {fixture.get('id')}: lineup row for unknown team {team}")
+        kind = row.get("type_id")
+        if kind not in (STARTING_XI, BENCH):
+            raise ValueError(f"fixture {fixture.get('id')}: unknown lineup type_id {kind!r}")
+        sheets[team]["starters" if kind == STARTING_XI else "bench"].append(str(row["player_id"]))
+    return {"fixture": {"uid": str(fixture["id"]), "home_team_uid": home, "away_team_uid": away}, "lineups": sheets}

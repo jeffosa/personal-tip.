@@ -25,7 +25,7 @@ readonly ARTIFACT_DIR="${PROP_ALPHA_ARTIFACT_DIR:-${REPO_ROOT}/ci-artifacts}"
 readonly PIP_VERSION="26.2.1"
 readonly MIN_PYTHON_MAJOR=3
 readonly MIN_PYTHON_MINOR=12
-readonly EXPECTED_TESTS=323
+readonly EXPECTED_TESTS=363
 
 log() { printf '%s [ci] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { log "FATAL: $*" >&2; exit 1; }
@@ -114,7 +114,13 @@ PY
 
 if [[ -n "${PROP_ALPHA_CI_DATABASE_URL:-}" ]]; then
   log "stage 6/6: PostgreSQL schema smoke test"
+  # The Windows (EDB) installer does not put psql on PATH: fall back to the newest installed version.
+  if ! command -v psql >/dev/null 2>&1; then
+    pg_bin="$(ls -d "/c/Program Files/PostgreSQL"/*/bin 2>/dev/null | sort -V | tail -n 1 || true)"
+    [[ -n "${pg_bin}" ]] && PATH="${pg_bin}:${PATH}"
+  fi
   command -v psql >/dev/null 2>&1 || die "psql is required when PROP_ALPHA_CI_DATABASE_URL is set"
+  log "psql: $(command -v psql) ($(psql --version))"
   psql_ci() { psql "${PROP_ALPHA_CI_DATABASE_URL}" -X -q -v ON_ERROR_STOP=1 "$@"; }
   db_name="$(psql_ci -At -c 'SELECT current_database()')"
   [[ "${db_name}" == *_ci ]] || die "refusing to reset database '${db_name}': CI database names must end in _ci"

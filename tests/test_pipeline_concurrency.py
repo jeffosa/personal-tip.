@@ -18,9 +18,11 @@ from prop_alpha.ingestion.pipeline import (  # noqa: E402
     ConcurrentIngestionEngine,
     FixtureResult,
     MergeResult,
+    QuotaExhaustedError,
     SlateReport,
     TokenBucketRateLimiter,
     VendorClient,
+    VendorError,
     build_arg_parser,
 )
 
@@ -454,10 +456,52 @@ class ScriptedSession:
         return self.responses.pop(0)
 
 
-def _client(session: ScriptedSession, limiter: CountingLimiter) -> VendorClient:
-    client = VendorClient("https://vendor.invalid/api", "test-key", limiter)
+def _client(session: ScriptedSession, limiter: CountingLimiter, **kwargs: Any) -> VendorClient:
+    client = VendorClient("https://vendor.invalid/api", "test-key", limiter, **{"max_retries": 2, **kwargs})
     client._local.session = session
     return client
+
+
+def test_vendor_client_retries_once_by_default() -> None:
+    """C2: every retry spends vendor quota, so the default is one retry (two attempts), not two."""
+    assert VendorClient("https://vendor.invalid/api", "k", TokenBucketRateLimiter(100.0, 10)).max_retries == 1
+
+
+def test_error_body_with_http_200_is_a_failure_not_data() -> None:
+    """C2: API-Football answers HTTP 200 with {"errors": {...}} when the daily quota is spent."""
+    session = ScriptedSession(_response(200, {"errors": {"requests": "You have reached the request limit for the day"}}))
+    with pytest.raises(VendorError, match="request limit"):
+        _client(session, CountingLimiter()).get_json("fixtures/FX-1/stats")
+    ok = ScriptedSession(_response(200, {"errors": [], "response": [1]}))
+    assert _client(ok, CountingLimiter()).get_json("fixtures/FX-1/stats")["response"] == [1]
+
+
+def test_vendor_remaining_quota_header_stops_further_requests() -> None:
+    """C2: the vendor's own counter spans runs and days; at or below the reserve nothing more is sent."""
+    session = ScriptedSession(
+        _response(200, {"n": 1}, headers={"x-ratelimit-requests-remaining": "6"}),
+        _response(200, {"n": 2}, headers={"x-ratelimit-requests-remaining": "5"}),
+        _response(200, {"n": 3}),
+    )
+    client = _client(session, CountingLimiter(), quota_reserve=5)
+    assert client.get_json("a")["n"] == 1
+    assert client.get_json("b")["n"] == 2          # this answer is kept; it reported the reserve
+    with pytest.raises(QuotaExhaustedError, match="5 requests remaining"):
+        client.get_json("c")
+    assert session.requests == 2
+
+
+def test_per_run_request_cap_counts_retries() -> None:
+    session = ScriptedSession(_response(503), _response(200, {"n": 1}), _response(200, {"n": 2}))
+    client = _client(session, CountingLimiter(), max_requests=2)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(time, "sleep", lambda seconds: None)
+        assert client.get_json("a")["n"] == 1      # 503 then 200: two requests
+    with pytest.raises(QuotaExhaustedError, match="cap of 2"):
+        client.get_json("b")
+    assert session.requests == 2 and client.requests_sent == 2
+    with pytest.raises(ValueError):
+        VendorClient("https://vendor.invalid/api", "k", TokenBucketRateLimiter(100.0, 10), max_requests=0)
 
 
 def test_every_vendor_attempt_takes_a_rate_limiter_token(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -500,7 +544,8 @@ def test_short_retry_after_is_honoured_and_exhaustion_raises(monkeypatch: pytest
 def test_adapter_retries_only_connects_which_never_reach_the_vendor() -> None:
     client = VendorClient("https://vendor.invalid/api", "test-key", TokenBucketRateLimiter(100.0, 10))
     retries = client._session().get_adapter("https://vendor.invalid").max_retries
-    assert (retries.total, retries.connect, retries.read, retries.status) == (None, 2, 0, 0)
+    assert (retries.total, retries.connect, retries.read, retries.status) == (None, client.max_retries, 0, 0)
+    assert client.max_retries == 1
     client.close()
 
 

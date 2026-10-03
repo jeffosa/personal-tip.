@@ -43,13 +43,20 @@ UPDATE_SQL: Final[str] = """
         yellow_card_propensity      = v.yellow_card_propensity,
         red_card_propensity         = v.red_card_propensity,
         home_bias_ratio             = v.home_bias_ratio
-    FROM (VALUES %s) AS v(referee_id, foul_strictness_coefficient, yellow_card_propensity,
+    FROM (VALUES %s) AS v(referee_id, league_id, foul_strictness_coefficient, yellow_card_propensity,
                           red_card_propensity, home_bias_ratio)
     WHERE r.referee_id = v.referee_id
+      AND r.league_id = v.league_id
 """
-UPDATE_TEMPLATE: Final[str] = "(%s::int, %s::numeric, %s::numeric, %s::numeric, %s::numeric)"
+# league_id guard: a referee seen in several leagues is registered to one (referees.league_id, set when the
+# merge first inserts them). Only that league's run may write their coefficients, so running league A and
+# then league B no longer leaves a referee with whichever league ran last.
+UPDATE_TEMPLATE: Final[str] = "(%s::int, %s::int, %s::numeric, %s::numeric, %s::numeric, %s::numeric)"
 
 ADVISORY_LOCK_SQL: Final[str] = "SELECT pg_advisory_xact_lock(hashtext(%s))"
+# The job holds the merge's advisory lock for its whole transaction, so it must not wait or run unbounded:
+# lock_timeout bounds the wait for a running merge; statement_timeout bounds the read and the update.
+CONNECTION_OPTIONS: Final[str] = "-c lock_timeout=10000 -c statement_timeout=60000"
 
 
 @dataclass(frozen=True)
@@ -147,7 +154,7 @@ def run_referee_job(dsn: str, league_id: int, lookback_days: int = 730, shrink_m
     import psycopg2
     import psycopg2.extras
 
-    conn = psycopg2.connect(dsn)
+    conn = psycopg2.connect(dsn, options=CONNECTION_OPTIONS)
     try:
         with conn:
             with conn.cursor() as cur:
@@ -156,7 +163,7 @@ def run_referee_job(dsn: str, league_id: int, lookback_days: int = 730, shrink_m
                 rows = [FixtureDiscipline(*(int(value) for value in record)) for record in cur.fetchall()]
                 coefficients = compute_referee_coefficients(rows, shrink_matches)
                 values = [
-                    (c.referee_id, c.strictness_coefficient, c.yellow_card_propensity,
+                    (c.referee_id, league_id, c.strictness_coefficient, c.yellow_card_propensity,
                      c.red_card_propensity, c.home_bias_ratio)
                     for c in coefficients
                 ]

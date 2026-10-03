@@ -7,14 +7,15 @@ Full rules for any code change: **AGENT.md**. Requirements and go-live gates: `p
 
 ## Status you must not overstate
 
-- **The SQL has never run against PostgreSQL:** `schema.sql`, the migrations (including `004_merge_hardening.sql`), and `merge_staging_player_feed()`. Say so whenever you touch it.
-- **Not built:** the odds poller, projection refresh, bet ledger and execution components.
-- **Model not validated:** no PRD go-live gate has been passed.
+- **SQL has run on PostgreSQL 18.6 only, and only in CI's database stage.** `schema.sql` installs cleanly; migrations 003 → 004 → 005 upgrade cleanly; `tests/test_merge_postgres.sql` passes (transfer, backfill, one reject). The PRD minimum is 15+, so 18 qualifies; 15–17 are untested. **Not run:** migration 002 on a real v2 database (none exists), the merge on real vendor data, and any concurrency soak. Tag claims beyond this **[U]**.
+- **Not built:** the odds poller, projection refresh, bet ledger, closing-line capture and execution components.
+- **Ingestion runs on real data via Sportmonks only,** verified on one League Two fixture (19727702) into the local database. Sportmonks is on a trial that ends **2026-10-16**. API-Football, The Odds API and OddsPapi have keys but no adapter or caller.
+- **Model not validated: no PRD go-live gate has been passed.** Gate 1: the fresh-install half of criterion 1 is met; the v2 upgrade half and criteria 2–7 need a 1,000-fixture vendor backfill. Gates 2–4 depend on Gate 1 and on the components above.
 - **Runtime floor is Python 3.12,** set by the numpy 2.5.1 and scipy 1.18.0 pins. The suite has only run on 3.14.6.
 
 ## Design philosophy
 
-- **I/O isolation.** Only `ingestion/pipeline.py` does network and pool I/O (and `calibration/referee_job.run_referee_job` for its own job, and `alerts/telegram.py` for outbound Telegram messages). Workers fetch and parse first, then take a pooled connection for one short transaction inside `ConcurrentIngestionEngine._with_transaction`, which is the only `pool.getconn()` call site. Never pass connections, cursors, pools or sessions into `transform.py`, `engine.py`, `market_scanner.py`, `fitting.py` or `backtest.py`.
+- **I/O isolation.** Only `ingestion/pipeline.py` does network and pool I/O (and `calibration/referee_job.run_referee_job` for its own job, and `alerts/telegram.py` for outbound Telegram messages and its sent-alert state file, and `alerts/status.py` for its read-only status query). `config.py` reads `.env`. Vendor adapters such as `ingestion/sportmonks.py` are pure: response in, transform payload out. Workers fetch and parse first, then take a pooled connection for one short transaction inside `ConcurrentIngestionEngine._with_transaction`, which is the only `pool.getconn()` call site. Never pass connections, cursors, pools or sessions into `transform.py`, `engine.py`, `market_scanner.py`, `fitting.py` or `backtest.py`.
 - **Mathematical conservatism.** The allocator maximises \(f^\top\mu - \lambda f^\top\Sigma f\) jointly over every line, book and player in a fixture, using the exact covariance from `fixture_moments` (shared game-state factor), with caps net of open exposure (`ExposureBook`) and the model-risk loss floor (`MODEL_RISK_LOSS_FLOOR` = 0.03, un-backtested). Never revert to nominal-EV selection or per-line sizing. Don't change risk defaults (`risk_aversion=2.0`, the caps, `alpha_threshold`, `MODEL_RISK_LOSS_FLOOR`) without an explicit human instruction.
 - **Fail closed.** Raise `ValueError` or `ProjectionError` at the point of detection. Catch only at the sanctioned handlers in AGENT.md §1.3, each of which records the failure. No fallback distributions, no silent floors. The one clamp (relative variance up to its 1e-6 minimum) logs `[MATH_CLAMP]`; a relative variance above 1e3 raises.
 - **Type rigidity.** Follow these rules; they are enforced by `tests/test_typing_contract.py`:
@@ -46,7 +47,7 @@ python3 -m venv .venv
 Tests:
 
 ```bash
-# Whole suite (323 tests). This is the command that counts.
+# Whole suite (363 tests). This is the command that counts.
 python -m pytest tests -q -p no:cacheprovider
 
 # Individual suites
@@ -61,37 +62,53 @@ python -m pytest tests/test_pipeline_concurrency.py -v -rs
 
 **Coverage.** `pytest-cov` is not in `requirements.txt`, so `--cov` errors with "unrecognized arguments". To use coverage, add an exact `pytest-cov==<version>` pin to `requirements.txt` in the same change, then run `python -m pytest tests --cov=prop_alpha --cov-report=term-missing`.
 
-Telegram alerts (sends messages only; never places bets). Only high-value bets are sent (`scanner/value_screen.py`): mispriced by the book, at least 4% expected profit per unit staked, and an edge that still returns at least 4% in more than 60% of 1,000 simulated match conditions, all after the 0.03 model-risk loss floor. One alert per market, line, side and book per process (the sent set is in memory until the bet ledger exists). Each alert shows the minimum acceptable odds and an expiry:
+Ingestion (Sportmonks by default; the token comes from the environment or `.env`). The two clubs of every fixture must already be rows in `prop_alpha.teams` with `vendor_team_uid` = the Sportmonks team id, or the merge rejects the fixture:
+
+```bash
+TARGET_FIXTURE_UIDS=19727702 DATA_VENDOR_MAX_REQUESTS=50 DATA_VENDOR_QUOTA_RESERVE=100 \
+PROP_ALPHA_DB_DSN=postgresql://postgres@localhost:5432/prop_alpha_ci python -m prop_alpha.ingestion.pipeline stats
+```
+
+Every attempt, retries included, spends vendor quota. The client retries once by default, stops at `DATA_VENDOR_MAX_REQUESTS` per run, and stops for the run once the vendor reports `DATA_VENDOR_QUOTA_RESERVE` or fewer requests left (from a header, or Sportmonks' `rate_limit` body field). A 2xx reply with an `errors` body counts as a failure.
+
+Telegram alerts (sends messages only; never places bets). Only high-value bets are sent (`scanner/value_screen.py`): mispriced by the book, at least 4% expected profit per unit staked, and an edge that still returns at least 4% in more than 60% of 1,000 simulated match conditions, all after the 0.03 model-risk loss floor. One alert per market, line, side and book. With a `SentAlertStore` (`.prop_alpha_state/sent_alerts.jsonl`, gitignored), that holds across runs, and `store.exposure(now)` must be passed to `allocate` so that a new run sizes net of earlier alerts. Until the bet ledger exists, every alert from the last 4 days counts as open exposure. The `--demo` stays in memory. Each alert shows the minimum acceptable odds and an expiry:
 
 ```bash
 python -m prop_alpha.alerts.telegram --get-chat-id   # after sending /start to the bot
 python -m prop_alpha.alerts.telegram --check         # token check + one test message
 python -m prop_alpha.alerts.telegram --demo          # synthetic reference-case alerts, labelled as such
+python -m prop_alpha.alerts.status [--send]          # status report (database, alerts, trial days); no vendor calls
 ```
 
-## Local PostgreSQL sandbox
+A Windows Task Scheduler task, `prop_alpha\Telegram status`, sends the status report every 4 hours (00:00, 04:00, …), running `scripts/telegram_status.cmd` with `.venv`, which CI never deletes. It logs to `.prop_alpha_state\status.log`. It runs on battery, catches up after sleep, and needs the user to be logged in. It reads the `prop_alpha` database, never `prop_alpha_ci`. To stop it: `schtasks /Delete /TN "prop_alpha\Telegram status" /F`.
 
-This recipe is **untested here**: the authoring machine has no Docker. Use a throwaway database whose name ends in `_ci`; `ci/bootstrap.sh` refuses to reset any other.
+## Local PostgreSQL
+
+Supported: **PostgreSQL 15 or newer** (the schema needs 15 for `UNIQUE NULLS NOT DISTINCT`; CI refuses older servers). Verified: **18.6**, installed natively on this machine with the EDB Windows installer:
+
+- service `postgresql-x64-18`, port 5432, superuser `postgres`;
+- binaries in `C:\Program Files\PostgreSQL\18\bin`, which the installer does **not** add to PATH. `ci/bootstrap.sh` finds the newest version there by itself; for manual use, call `psql` by full path or add that folder to PATH. A tool that reports "no psql" has usually only checked PATH;
+- the password is in `%APPDATA%\postgresql\pgpass.conf` (outside the repo; `psql` reads it automatically). Never put it in a URL, file or command in the repo;
+- CI database: `prop_alpha_ci`. Use only databases whose name ends in `_ci`: CI stage 6 runs `DROP SCHEMA prop_alpha CASCADE`, and `ci/bootstrap.sh` refuses any other name.
+
+Run the full pipeline, including the database stage (from Git Bash):
 
 ```bash
-export PGPASSWORD="$(openssl rand -hex 16)"            # never commit a password
-docker run --name prop_alpha_sandbox -e POSTGRES_DB=prop_alpha_ci -e POSTGRES_PASSWORD="$PGPASSWORD" \
-  -p 5432:5432 -d postgres:15-alpine
+PROP_ALPHA_CI_DATABASE_URL="postgresql://postgres@localhost:5432/prop_alpha_ci" bash ci/bootstrap.sh
+```
+
+Stage 6 then: drops and reinstalls the schema from `schema.sql`; runs the merge on empty staging; runs `tests/test_merge_postgres.sql` (it rolls itself back); re-applies 005 to check it is idempotent; replays the upgrade path 003 → 004 → 005; and runs the merge test again. Without `PROP_ALPHA_CI_DATABASE_URL`, stage 6 is skipped and says so.
+
+Manual checks (PowerShell):
+
+```powershell
+& "C:\Program Files\PostgreSQL\18\bin\psql.exe" -w -h localhost -U postgres -d prop_alpha_ci -X -v ON_ERROR_STOP=1 -f schema.sql
+& "C:\Program Files\PostgreSQL\18\bin\psql.exe" -w -h localhost -U postgres -d prop_alpha_ci -X -v ON_ERROR_STOP=1 -f tests/test_merge_postgres.sql
 ```
 
 A **fresh database gets `schema.sql` only**, because it already includes every migration. Never apply `migrations/002_staging_and_indexes.sql` to a v3.2+ schema: it reinstalls the superseded v3.0 merge function and drops the minute-logic reject predicates. Migrations are for upgrading existing databases, in numeric order.
 
-```bash
-docker exec -i prop_alpha_sandbox psql -U postgres -d prop_alpha_ci -v ON_ERROR_STOP=1 < schema.sql
-docker exec -i prop_alpha_sandbox psql -U postgres -d prop_alpha_ci -v ON_ERROR_STOP=1 \
-  -c 'SELECT * FROM prop_alpha.merge_staging_player_feed();'   # PL/pgSQL is only fully checked on first execution
-```
-
-Or, with host `psql` installed, let CI run the whole schema stage:
-
-```bash
-PROP_ALPHA_CI_DATABASE_URL="postgresql://postgres:${PGPASSWORD}@localhost:5432/prop_alpha_ci" bash ci/bootstrap.sh
-```
+On a machine without a native install, Docker works too (untested here): `docker run --name prop_alpha_sandbox -e POSTGRES_DB=prop_alpha_ci -e POSTGRES_PASSWORD="$PGPASSWORD" -p 5432:5432 -d postgres:18-alpine`, with `PGPASSWORD` from `openssl rand -hex 16`, then the same CI command with `postgres:${PGPASSWORD}@` in the URL.
 
 ## Conventions
 
@@ -112,7 +129,8 @@ PROP_ALPHA_CI_DATABASE_URL="postgresql://postgres:${PGPASSWORD}@localhost:5432/p
 
 ## Before you say a change is done
 
-1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (323). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
+1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (363). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
 2. `bash ci/bootstrap.sh --preflight` passes.
-3. New behaviour has tests that failed before the change.
-4. Report what you actually ran, quoting the summary lines, and tag SQL or deployment claims **[U]** (not executed) or **[N]** (not built).
+3. If you touched SQL: the full pipeline with `PROP_ALPHA_CI_DATABASE_URL` set ends with `schema smoke test passed`, and any new merge behaviour has a check in `tests/test_merge_postgres.sql`.
+4. New behaviour has tests that failed before the change.
+5. Report what you actually ran, quoting the summary lines, and tag SQL or deployment claims **[U]** (not executed) or **[N]** (not built).

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,10 +12,14 @@ import requests
 
 from prop_alpha.alerts.telegram import (
     DEFAULT_CRITERIA,
+    MIN_SEND_INTERVAL_S,
+    OPEN_POSITION_WINDOW,
     PAPER_LABEL,
+    SentAlertStore,
     TelegramConfig,
     TelegramError,
     TelegramNotifier,
+    _reference_manager,
     alert_key,
     demo_case,
     format_directive,
@@ -25,7 +29,8 @@ from prop_alpha.alerts.telegram import (
     reference_report,
     simulation_seed,
 )
-from prop_alpha.scanner.market_scanner import AllocationReport
+from prop_alpha.modeling.engine import VoidRule
+from prop_alpha.scanner.market_scanner import AllocationReport, ExposureBook, LiveOddsQuote, price_for_ev
 from prop_alpha.scanner.value_screen import HighValueCriteria, assess_high_value
 
 # Assembled at runtime so the repository secrets scan never sees a token-shaped literal.
@@ -63,7 +68,44 @@ def _ok(result: Any) -> FakeResponse:
 
 def _notifier(*responses: FakeResponse | Exception) -> tuple[TelegramNotifier, FakeSession]:
     session = FakeSession(*responses)
-    return TelegramNotifier(TelegramConfig(FAKE_TOKEN, "987654321"), session=session), session
+    return TelegramNotifier(TelegramConfig(FAKE_TOKEN, "987654321"), session=session, sleep=lambda s: None), session
+
+
+def _flood(retry_after: float) -> FakeResponse:
+    return FakeResponse(429, {"ok": False, "error_code": 429, "description": "Too Many Requests",
+                              "parameters": {"retry_after": retry_after}})
+
+
+def test_telegram_rate_limit_is_waited_out_once() -> None:
+    """Audit H3: a burst hit Telegram's 429 and aborted the rest of the batch."""
+    waits: list[float] = []
+    session = FakeSession(_flood(3), _ok({"message_id": 9}))
+    notifier = TelegramNotifier(TelegramConfig(FAKE_TOKEN, "1"), session=session, sleep=waits.append)
+    assert notifier.send_message("hi") == 9 and waits == [3.0]
+    twice = FakeSession(_flood(3), _flood(3))
+    with pytest.raises(TelegramError, match="Too Many Requests"):
+        TelegramNotifier(TelegramConfig(FAKE_TOKEN, "1"), session=twice, sleep=lambda s: None).send_message("hi")
+    too_long = FakeSession(_flood(600))
+    with pytest.raises(TelegramError, match="Too Many Requests"):
+        TelegramNotifier(TelegramConfig(FAKE_TOKEN, "1"), session=too_long, sleep=lambda s: None).send_message("hi")
+
+
+def test_messages_are_spaced_to_telegram_per_chat_limit() -> None:
+    waits: list[float] = []
+    now = [100.0]
+    notifier = TelegramNotifier(TelegramConfig(FAKE_TOKEN, "1"), session=FakeSession(_ok({"message_id": 1}),
+                                _ok({"message_id": 2})), sleep=waits.append, clock=lambda: now[0])
+    notifier.send_message("a")
+    now[0] += 0.3
+    notifier.send_message("b")
+    assert waits == [pytest.approx(MIN_SEND_INTERVAL_S - 0.3)]
+
+
+def test_malformed_env_line_does_not_block_alerts_configured_in_the_environment() -> None:
+    environ = {"TELEGRAM_BOT_TOKEN": FAKE_TOKEN, "TELEGRAM_CHAT_ID": "42"}
+    assert TelegramConfig.from_sources(environ, "SPORTMONKS API TOKEN = oops\n").chat_id == "42"
+    with pytest.raises(ValueError, match="line 1"):
+        TelegramConfig.from_sources({"TELEGRAM_BOT_TOKEN": FAKE_TOKEN}, "SPORTMONKS API TOKEN = oops\n")
 
 
 def test_env_file_parsing_handles_comments_quotes_and_export() -> None:
@@ -120,6 +162,57 @@ def test_notify_sends_only_high_value_bets_and_each_once() -> None:
     assert notifier.notify(report, projections) == []
     assert len(session.calls) == 1
     assert "UNDER 4.5" in session.calls[0][1]["text"]
+
+
+def test_a_new_run_does_not_resend_and_sizes_net_of_earlier_alerts(tmp_path: Path) -> None:
+    """C3: run 2 is a fresh process. Before the store, it re-sent the same bet at full stake."""
+    store = SentAlertStore(tmp_path / "state" / "sent_alerts.jsonl")
+    projections, report = demo_case(NOW)
+    first = TelegramNotifier(TelegramConfig(FAKE_TOKEN, "987654321"), session=FakeSession(_ok({"message_id": 1})),
+                             store=store)
+    assert first.notify(report, projections) == [1]
+    sent = next(d for d in report.directives if d.line_value == 4.5)
+
+    second_session = FakeSession()
+    second = TelegramNotifier(TelegramConfig(FAKE_TOKEN, "987654321"), session=second_session, store=store)
+    assert second.notify(report, projections) == [] and second_session.calls == []
+
+    now = datetime.now(timezone.utc)
+    book = store.exposure(now)
+    assert book.market_total((1001, 55, "tackles")) == pytest.approx(sent.stake)
+    projection = projections[(1001, 55, "tackles")]
+    quote = LiveOddsQuote(1001, 55, "tackles", 4.5, None, price_for_ev(projection.side_probabilities(4.5, "under"), 0.08),
+                          500.0, "SyntheticBookC", now, VoidRule.VOID_IF_NO_APPEARANCE)
+    fresh = _reference_manager().allocate(projections, [quote], now=now, exposure=ExposureBook({}))
+    netted = _reference_manager().allocate(projections, [quote], now=now, exposure=book)
+    fresh_stake = sum(d.stake for d in fresh.directives)
+    assert fresh_stake > 0.0 and sum(d.stake for d in netted.directives) < fresh_stake
+    assert store.exposure(now + OPEN_POSITION_WINDOW + timedelta(seconds=1)).total == 0.0
+
+
+def test_alert_is_recorded_before_sending_so_a_failed_send_is_not_repeated(tmp_path: Path) -> None:
+    store = SentAlertStore(tmp_path / "sent_alerts.jsonl")
+    projections, report = demo_case(NOW)
+    notifier = TelegramNotifier(TelegramConfig(FAKE_TOKEN, "987654321"),
+                                session=FakeSession(requests.ConnectionError("down")), store=store)
+    with pytest.raises(TelegramError):
+        notifier.notify(report, projections)
+    assert len(store.load()) == 1
+
+
+def test_corrupt_alert_state_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "sent_alerts.jsonl"
+    for bad in ('{"key": [1, 2, "tackles", 1.5, "over"], "stake": 1, "sent_at": "2026-01-01T00:00:00+00:00"}',
+                '{"key": [1, 2, "tackles", 1.5, "sideways", "A"], "stake": 1, "sent_at": "2026-01-01T00:00:00+00:00"}',
+                '{"key": [1, 2, "tackles", 1.5, "over", "A"], "stake": -1, "sent_at": "2026-01-01T00:00:00+00:00"}',
+                "not json"):
+        path.write_text(bad + "\n", encoding="utf-8")
+        with pytest.raises(ValueError):
+            SentAlertStore(path).load()
+
+
+def test_alert_state_is_gitignored() -> None:
+    assert ".prop_alpha_state/" in (Path(__file__).resolve().parents[1] / ".gitignore").read_text(encoding="utf-8")
 
 
 def test_reference_bets_are_screened_out() -> None:

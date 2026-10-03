@@ -246,14 +246,19 @@ def test_referee_job_takes_merge_lock_before_reading_and_updates_in_id_order(mon
     import psycopg2
 
     connection = _RecordingConnection()
-    monkeypatch.setattr(psycopg2, "connect", lambda dsn: connection)
+    options: list[str] = []
+    monkeypatch.setattr(psycopg2, "connect", lambda dsn, **kwargs: options.append(kwargs.get("options", "")) or connection)
     assert referee_job.run_referee_job("postgresql://unused", league_id=7) == 2
     statements = [entry for entry in connection.log if entry[0] != "row"]
     assert statements[0] == (referee_job.ADVISORY_LOCK_SQL, (referee_job.MERGE_LOCK_KEY,))
     assert "player_match_stats" in statements[1][0] and statements[1][1] == (7, 730)
     assert "UPDATE prop_alpha.referees AS r" in statements[2][0]
-    updated_ids = [args[0] for kind, args in connection.log if kind == "row"]
-    assert updated_ids == [1, 2]
+    rows = [args for kind, args in connection.log if kind == "row"]
+    assert [row[0] for row in rows] == [1, 2]
+    # Audit H2: bounded waits while holding the merge lock, and only this league's referees are written.
+    assert options == [referee_job.CONNECTION_OPTIONS]
+    assert "lock_timeout" in options[0] and "statement_timeout" in options[0]
+    assert all(row[1] == 7 for row in rows) and "AND r.league_id = v.league_id" in referee_job.UPDATE_SQL
     assert connection.closed
 
 
@@ -507,7 +512,8 @@ def test_application_sql_references_existing_columns() -> None:
     referees = set(_table_columns(SCHEMA, "referees"))
     updated = set(re.findall(r"(\w+)\s+= v\.", referee_job.UPDATE_SQL))
     assert updated == {
-        "referee_id", "foul_strictness_coefficient", "yellow_card_propensity", "red_card_propensity", "home_bias_ratio",
+        "referee_id", "league_id", "foul_strictness_coefficient", "yellow_card_propensity", "red_card_propensity",
+        "home_bias_ratio",
     }
     assert updated <= referees
     stats = set(_table_columns(SCHEMA, "player_match_stats"))

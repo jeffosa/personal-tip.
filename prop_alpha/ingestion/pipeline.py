@@ -32,6 +32,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from prop_alpha.config import credential
+from prop_alpha.ingestion import sportmonks
 from prop_alpha.ingestion.transform import (
     DEFAULT_KAPPAS,
     STAGING_COLUMNS,
@@ -56,6 +58,23 @@ RETRYABLE_HTTP_STATUS: Final[frozenset[int]] = frozenset({429, 500, 502, 503, 50
 # review it with DATA_VENDOR_RPS against the vendor contract.
 MAX_RETRY_AFTER_S: Final[float] = 2.0
 _RETRY_AFTER_SECONDS: Final[re.Pattern[str]] = re.compile(r"\d+(\.\d+)?")
+# Remaining-quota headers sent by the vendors in use (API-Football, The Odds API, generic). The vendor counts
+# across processes and days, so these keep a quota intact across runs, which a per-run counter cannot.
+QUOTA_REMAINING_HEADERS: Final[tuple[str, ...]] = (
+    "x-ratelimit-requests-remaining", "x-requests-remaining", "x-ratelimit-remaining",
+)
+_NON_NEGATIVE_INT: Final[re.Pattern[str]] = re.compile(r"\d+")
+
+
+PayloadAdapter = Callable[[Mapping[str, Any]], dict[str, Any]]
+
+
+class QuotaExhaustedError(RuntimeError):
+    """The vendor request budget is spent: no further request is sent this run."""
+
+
+class VendorError(ValueError):
+    """The vendor answered 2xx but reported an error in the body (API-Football does this when over quota)."""
 
 INSERT_RAW_SQL: Final[str] = """
     INSERT INTO prop_alpha.raw_payloads (source, vendor_fixture_uid, payload, payload_sha256)
@@ -153,10 +172,32 @@ class VendorClient:
         api_key: str,
         rate_limiter: TokenBucketRateLimiter,
         timeout: float = 5.0,
-        max_retries: int = 2,
+        max_retries: int = 1,
+        max_requests: int | None = None,
+        quota_reserve: int = 0,
+        *,
+        auth_header: str = "Authorization",
+        auth_prefix: str = "Bearer ",
+        stats_path: str = "fixtures/{uid}/stats",
+        lineups_path: str = "fixtures/{uid}/lineups",
+        stats_adapter: PayloadAdapter | None = None,
+        lineups_adapter: PayloadAdapter | None = None,
     ) -> None:
+        """Every attempt, retries included, spends vendor quota. `max_requests` caps attempts for this
+        client's lifetime; `quota_reserve` stops all further requests once the vendor's remaining-quota
+        header reports that many or fewer, leaving them for manual use.
+
+        The key is sent as `{auth_header}: {auth_prefix}{api_key}`. The adapters are pure functions from the
+        vendor's response to the shapes transform.py parses (e.g. ingestion.sportmonks); they run in the
+        worker before any connection is taken, and the adapted payload is what raw_payloads stores."""
+        if "{uid}" not in stats_path or "{uid}" not in lineups_path:
+            raise ValueError("stats_path and lineups_path must contain {uid}")
         if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
             raise ValueError("max_retries must be a non-negative integer")
+        if max_requests is not None and (isinstance(max_requests, bool) or not isinstance(max_requests, int) or max_requests < 1):
+            raise ValueError("max_requests must be a positive integer or None")
+        if isinstance(quota_reserve, bool) or not isinstance(quota_reserve, int) or quota_reserve < 0:
+            raise ValueError("quota_reserve must be a non-negative integer")
         # The API key travels in a header on every request, so refuse anything but HTTPS.
         parsed = urlsplit(base_url)
         if parsed.scheme != "https" or not parsed.hostname:
@@ -166,6 +207,17 @@ class VendorClient:
         self.rate_limiter = rate_limiter
         self.timeout = timeout
         self.max_retries = max_retries
+        self.max_requests = max_requests
+        self.quota_reserve = quota_reserve
+        self.auth_header = auth_header
+        self.auth_prefix = auth_prefix
+        self.stats_path = stats_path
+        self.lineups_path = lineups_path
+        self.stats_adapter = stats_adapter
+        self.lineups_adapter = lineups_adapter
+        self.requests_sent = 0
+        self._quota_stop: str | None = None
+        self._quota_lock = threading.Lock()
         self._local = threading.local()
         self._sessions: list[requests.Session] = []
         self._sessions_lock = threading.Lock()
@@ -174,7 +226,7 @@ class VendorClient:
         session = getattr(self._local, "session", None)
         if session is None:
             session = requests.Session()
-            session.headers.update({"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"})
+            session.headers.update({self.auth_header: f"{self.auth_prefix}{self.api_key}", "Accept": "application/json"})
             # Only failed connects are retried here: they never reach the vendor, so they spend no quota.
             # Read errors and retryable statuses are handled (or raised) by get_json, one token per attempt.
             retry_policy = Retry(
@@ -188,17 +240,48 @@ class VendorClient:
                 self._sessions.append(session)
         return session
 
+    def _spend_request(self) -> None:
+        """Reserve one request of the budget, or raise without sending anything."""
+        with self._quota_lock:
+            if self._quota_stop is not None:
+                raise QuotaExhaustedError(self._quota_stop)
+            if self.max_requests is not None and self.requests_sent >= self.max_requests:
+                self._quota_stop = f"per-run request cap of {self.max_requests} reached"
+                raise QuotaExhaustedError(self._quota_stop)
+            self.requests_sent += 1
+
+    def _record_remaining_quota(self, headers: Mapping[str, str]) -> None:
+        for name in QUOTA_REMAINING_HEADERS:
+            value = headers.get(name)
+            if value is not None and _NON_NEGATIVE_INT.fullmatch(value.strip()):
+                remaining = int(value.strip())
+                if remaining <= self.quota_reserve:
+                    with self._quota_lock:
+                        self._quota_stop = (
+                            f"vendor reports {remaining} requests remaining ({name}); reserve is {self.quota_reserve}"
+                        )
+                    logger.error("[QUOTA] %s; no further requests this run", self._quota_stop)
+                return
+
     def get_json(self, path: str) -> dict[str, Any]:
         url = f"{self.base_url}/{path.lstrip('/')}"
         failure = "no attempt made"
         for attempt in range(self.max_retries + 1):
+            self._spend_request()
             self.rate_limiter.acquire()
             resp = self._session().get(url, timeout=self.timeout)
+            self._record_remaining_quota(resp.headers)
             if resp.status_code not in RETRYABLE_HTTP_STATUS:
                 resp.raise_for_status()
                 body = resp.json()
                 if not isinstance(body, dict):
                     raise ValueError(f"expected a JSON object from {path}")
+                errors = body.get("errors")
+                if errors:
+                    raise VendorError(f"{path}: vendor reported errors: {errors}")
+                rate_limit = body.get("rate_limit")  # Sportmonks reports its quota in the body, per entity
+                if isinstance(rate_limit, Mapping) and isinstance(rate_limit.get("remaining"), int):
+                    self._record_remaining_quota({"x-ratelimit-remaining": str(rate_limit["remaining"])})
                 return body
             failure = f"HTTP {resp.status_code}"
             delay = 0.25 * (2 ** attempt)
@@ -215,10 +298,12 @@ class VendorClient:
         raise requests.HTTPError(f"{path}: failed after {self.max_retries + 1} attempts ({failure})")
 
     def get_fixture_feed(self, fixture_vendor_uid: str) -> dict[str, Any]:
-        return self.get_json(f"fixtures/{fixture_vendor_uid}/stats")
+        body = self.get_json(self.stats_path.format(uid=fixture_vendor_uid))
+        return self.stats_adapter(body) if self.stats_adapter is not None else body
 
     def get_lineups(self, fixture_vendor_uid: str) -> dict[str, Any]:
-        return self.get_json(f"fixtures/{fixture_vendor_uid}/lineups")
+        body = self.get_json(self.lineups_path.format(uid=fixture_vendor_uid))
+        return self.lineups_adapter(body) if self.lineups_adapter is not None else body
 
     def close(self) -> None:
         with self._sessions_lock:
@@ -497,6 +582,33 @@ def load_kappas(raw: str | None) -> dict[str, float]:
     return kappas
 
 
+VENDORS: Final[tuple[str, ...]] = ("sportmonks", "generic")
+
+
+def build_vendor_client(environ: Mapping[str, str]) -> VendorClient:
+    """DATA_VENDOR=sportmonks (the default) reads SPORTMONKS_API_TOKEN from the environment or `.env`;
+    DATA_VENDOR=generic uses DATA_VENDOR_BASE_URL and DATA_VENDOR_API_KEY with a Bearer header and payloads
+    already in transform.py's shape. Quota: DATA_VENDOR_MAX_REQUESTS (per run) and DATA_VENDOR_QUOTA_RESERVE."""
+    vendor = environ.get("DATA_VENDOR", "sportmonks")
+    if vendor not in VENDORS:
+        raise ValueError(f"DATA_VENDOR must be one of {VENDORS}, got {vendor!r}")
+    limiter = TokenBucketRateLimiter(rate_per_sec=float(environ.get("DATA_VENDOR_RPS", "5")), burst=10)
+    max_requests = int(environ["DATA_VENDOR_MAX_REQUESTS"]) if environ.get("DATA_VENDOR_MAX_REQUESTS") else None
+    quota_reserve = int(environ.get("DATA_VENDOR_QUOTA_RESERVE", "0"))
+    if vendor == "sportmonks":
+        return VendorClient(
+            sportmonks.BASE_URL, credential("SPORTMONKS_API_TOKEN", environ), limiter,
+            max_requests=max_requests, quota_reserve=quota_reserve,
+            auth_header="Authorization", auth_prefix="",
+            stats_path=sportmonks.STATS_PATH, lineups_path=sportmonks.LINEUPS_PATH,
+            stats_adapter=sportmonks.fixture_payload, lineups_adapter=sportmonks.lineup_payload,
+        )
+    return VendorClient(
+        environ["DATA_VENDOR_BASE_URL"], environ["DATA_VENDOR_API_KEY"], limiter,
+        max_requests=max_requests, quota_reserve=quota_reserve,
+    )
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Concurrent slate ingestion.")
     parser.add_argument("job", choices=ConcurrentIngestionEngine.JOBS)
@@ -511,11 +623,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
     fixture_uids = [u.strip() for u in os.environ.get("TARGET_FIXTURE_UIDS", "").split(",") if u.strip()]
-    client = VendorClient(
-        os.environ["DATA_VENDOR_BASE_URL"],
-        os.environ["DATA_VENDOR_API_KEY"],
-        TokenBucketRateLimiter(rate_per_sec=float(os.environ.get("DATA_VENDOR_RPS", "5")), burst=10),
-    )
+    client = build_vendor_client(os.environ)
     pool = build_pool(os.environ["PROP_ALPHA_DB_DSN"], args.workers)
     try:
         with ConcurrentIngestionEngine(

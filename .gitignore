@@ -9,3 +9,4 @@ __pycache__/
 .coverage
 htmlcov/
 .env
+.prop_alpha_state/

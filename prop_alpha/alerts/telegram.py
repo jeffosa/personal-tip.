@@ -13,9 +13,11 @@ Only high-value bets are sent (prop_alpha.scanner.value_screen): mispriced by th
 expected profit per unit staked, and an edge that still returns at least 4% in more than 60% of 1,000
 simulated match conditions, all after the model-risk loss floor (MODEL_RISK_LOSS_FLOOR).
 
-One alert is sent per market, line, side and book for the life of the process, whatever the price does
-afterwards, so a person following the alerts is not told to stack the same position on every price tick.
-The sent set is in memory only: persisting it across restarts needs the bet ledger ([N]).
+One alert is sent per market, line, side and book, whatever the price does afterwards, so a person
+following the alerts is not told to stack the same position on every price tick. With a SentAlertStore
+(default `.prop_alpha_state/sent_alerts.jsonl`, gitignored) this holds across runs, and
+SentAlertStore.exposure() gives the allocator the stakes already suggested, so a second run sizes net of
+the first. Until the bet ledger ([N]) records real fills, every recent alert counts as an open position.
 
 Usage:
     python -m prop_alpha.alerts.telegram --check        # getMe + one test message
@@ -27,18 +29,23 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
+import math
 import os
 import re
 import sys
+import time
+from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Final, Mapping
+from typing import Any, Callable, Final, Mapping
 
 import numpy as np
 import requests
 
+from prop_alpha.config import DEFAULT_ENV_FILE, parse_env_file
 from prop_alpha.modeling.engine import FactorProjection, LineupExpectation, QuantEngine, RefereeProfile, VoidRule
 from prop_alpha.scanner.market_scanner import (
     MODEL_RISK_LOSS_FLOOR,
@@ -57,7 +64,13 @@ logger = logging.getLogger("prop_alpha.alerts")
 TELEGRAM_API_BASE: Final[str] = "https://api.telegram.org"
 TOKEN_ENV: Final[str] = "TELEGRAM_BOT_TOKEN"
 CHAT_ID_ENV: Final[str] = "TELEGRAM_CHAT_ID"
-DEFAULT_ENV_FILE: Final[Path] = Path(__file__).resolve().parents[2] / ".env"
+DEFAULT_STATE_FILE: Final[Path] = Path(__file__).resolve().parents[2] / ".prop_alpha_state" / "sent_alerts.jsonl"
+# How long an alerted stake counts as open exposure. Player props settle within a day or two of kickoff and
+# alerts go out before kickoff; 4 days over-counts rather than under-counts until the ledger records fills.
+OPEN_POSITION_WINDOW: Final[timedelta] = timedelta(days=4)
+# Telegram allows about one message per second per chat and answers 429 with parameters.retry_after.
+MIN_SEND_INTERVAL_S: Final[float] = 1.1
+MAX_TELEGRAM_RETRY_AFTER_S: Final[float] = 30.0
 PAPER_LABEL: Final[str] = "PAPER ONLY - model not validated, no PRD go-live gate passed. Not betting advice."
 _TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\d{5,15}:[A-Za-z0-9_-]{30,}$")
 _CHAT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^(-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,})$")
@@ -69,25 +82,6 @@ DEFAULT_CRITERIA: Final[HighValueCriteria] = HighValueCriteria(loss_floor=MODEL_
 
 class TelegramError(RuntimeError):
     """A Telegram call failed. The message never contains the bot token."""
-
-
-def parse_env_file(text: str) -> dict[str, str]:
-    """KEY=VALUE lines; blank lines and # comments ignored; optional `export` prefix and matching quotes."""
-    values: dict[str, str] = {}
-    for number, raw in enumerate(text.splitlines(), start=1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].lstrip()
-        key, separator, value = line.partition("=")
-        key, value = key.strip(), value.strip()
-        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-            raise ValueError(f".env line {number} is not KEY=VALUE")
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        values[key] = value
-    return values
 
 
 @dataclass(frozen=True)
@@ -103,8 +97,10 @@ class TelegramConfig:
 
     @classmethod
     def from_sources(cls, environ: Mapping[str, str], env_file_text: str | None) -> TelegramConfig:
-        """Process environment first, then the .env file."""
-        file_values = parse_env_file(env_file_text) if env_file_text is not None else {}
+        """Process environment first, then the .env file. The file is parsed only when the environment lacks
+        a value, so a malformed line elsewhere in .env cannot stop alerts whose credentials are set."""
+        complete = bool(environ.get(TOKEN_ENV)) and bool(environ.get(CHAT_ID_ENV))
+        file_values = parse_env_file(env_file_text) if env_file_text is not None and not complete else {}
         return cls(
             bot_token=environ.get(TOKEN_ENV) or file_values.get(TOKEN_ENV, ""),
             chat_id=environ.get(CHAT_ID_ENV) or file_values.get(CHAT_ID_ENV) or None,
@@ -114,6 +110,83 @@ class TelegramConfig:
 def load_config(env_file: Path = DEFAULT_ENV_FILE) -> TelegramConfig:
     text = env_file.read_text(encoding="utf-8") if env_file.is_file() else None
     return TelegramConfig.from_sources(os.environ, text)
+
+
+@dataclass(frozen=True)
+class SentAlert:
+    key: AlertKey
+    stake: float
+    sent_at: datetime
+
+    def __post_init__(self) -> None:
+        _, _, market_type, line_value, side, sportsbook = self.key
+        if not market_type or not sportsbook or side not in ("over", "under") or not math.isfinite(line_value):
+            raise ValueError(f"malformed alert key {self.key!r}")
+        if not (math.isfinite(self.stake) and self.stake >= 0.0):
+            raise ValueError("alert stake must be finite and non-negative")
+        if self.sent_at.tzinfo is None or self.sent_at.utcoffset() != timedelta(0):
+            raise ValueError("sent_at must be a timezone-aware UTC datetime")
+
+
+class SentAlertStore:
+    """Append-only JSON-lines record of every alert, read at start-up. A corrupt line raises: guessing what
+    was sent could double a position."""
+
+    def __init__(self, path: Path = DEFAULT_STATE_FILE) -> None:
+        self.path = path
+
+    def load(self) -> list[SentAlert]:
+        if not self.path.is_file():
+            return []
+        alerts: list[SentAlert] = []
+        for number, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            record: Any = json.loads(line)
+            key: Any = record.get("key") if isinstance(record, dict) else None
+            if not (
+                isinstance(key, list) and len(key) == 6
+                and all(isinstance(part, int) and not isinstance(part, bool) for part in key[:2])
+                and all(isinstance(part, str) for part in (key[2], key[4], key[5]))
+                and isinstance(key[3], (int, float)) and not isinstance(key[3], bool)
+                and isinstance(record.get("stake"), (int, float)) and isinstance(record.get("sent_at"), str)
+            ):
+                raise ValueError(f"{self.path.name} line {number} is not a sent-alert record")
+            alerts.append(SentAlert(
+                key=(int(key[0]), int(key[1]), str(key[2]), float(key[3]), str(key[4]), str(key[5])),
+                stake=float(record["stake"]),
+                sent_at=datetime.fromisoformat(str(record["sent_at"])),
+            ))
+        return alerts
+
+    def append(self, alert: SentAlert) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({"key": list(alert.key), "stake": alert.stake, "sent_at": alert.sent_at.isoformat()})
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def exposure(self, now: datetime, window: timedelta = OPEN_POSITION_WINDOW) -> ExposureBook:
+        """Stakes alerted within `window` before `now`, per market: pass this to allocate() as `exposure`."""
+        if now.tzinfo is None or now.utcoffset() != timedelta(0):
+            raise ValueError("now must be a timezone-aware UTC datetime")
+        totals: dict[ProjectionKey, float] = defaultdict(float)
+        for alert in self.load():
+            if alert.sent_at > now - window:
+                totals[(alert.key[0], alert.key[1], alert.key[2])] += alert.stake
+        return ExposureBook(dict(totals))
+
+
+def _flood_wait_seconds(body: Any) -> float | None:
+    """Seconds Telegram asks to wait on a 429 (parameters.retry_after), else None."""
+    if not isinstance(body, dict) or body.get("error_code") != 429:
+        return None
+    parameters: Any = body.get("parameters")
+    retry_after: Any = parameters.get("retry_after") if isinstance(parameters, dict) else None
+    if isinstance(retry_after, bool) or not isinstance(retry_after, (int, float)) or retry_after < 0:
+        return None
+    return float(retry_after)
 
 
 def alert_key(directive: StakingDirective) -> AlertKey:
@@ -152,17 +225,30 @@ def format_directive(
 
 
 class TelegramNotifier:
-    """Sends one message per new directive. Remembers what it sent for its own lifetime only."""
+    """Sends one message per new directive. Without a store it remembers what it sent for its own lifetime
+    only (the synthetic demo); with one, across runs."""
 
-    def __init__(self, config: TelegramConfig, session: Any | None = None, timeout_s: float = 10.0) -> None:
+    def __init__(
+        self,
+        config: TelegramConfig,
+        session: Any | None = None,
+        timeout_s: float = 10.0,
+        store: SentAlertStore | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         if not timeout_s > 0.0:
             raise ValueError("timeout_s must be positive")
         self._config = config
         self._session = session if session is not None else requests.Session()
         self._timeout_s = timeout_s
-        self._sent: set[AlertKey] = set()
+        self._sleep = sleep
+        self._clock = clock
+        self._last_send: float | None = None
+        self._store = store
+        self._sent: set[AlertKey] = {alert.key for alert in store.load()} if store is not None else set()
 
-    def _call(self, method: str, payload: Mapping[str, Any]) -> Any:
+    def _call(self, method: str, payload: Mapping[str, Any], *, retry_on_flood: bool = True) -> Any:
         url = f"{TELEGRAM_API_BASE}/bot{self._config.bot_token}/{method}"
         try:
             response = self._session.post(url, json=dict(payload), timeout=self._timeout_s)
@@ -171,6 +257,11 @@ class TelegramNotifier:
             raise TelegramError(f"{method} failed: {type(exc).__name__} (details withheld: they contain the token)") from None
         if not isinstance(body, dict) or body.get("ok") is not True:
             description = body.get("description", "no description") if isinstance(body, dict) else "malformed reply"
+            retry_after = _flood_wait_seconds(body)
+            if retry_on_flood and retry_after is not None and retry_after <= MAX_TELEGRAM_RETRY_AFTER_S:
+                logger.warning("Telegram rate limit on %s; waiting %.0fs and retrying once", method, retry_after)
+                self._sleep(retry_after)
+                return self._call(method, payload, retry_on_flood=False)
             raise TelegramError(f"{method} rejected by Telegram (HTTP {response.status_code}): {description}")
         return body["result"]
 
@@ -195,6 +286,11 @@ class TelegramNotifier:
             raise ValueError("message text must not be empty")
         if self._config.chat_id is None:
             raise ValueError(f"{CHAT_ID_ENV} is not set; run with --get-chat-id to find it")
+        if self._last_send is not None:
+            wait = MIN_SEND_INTERVAL_S - (self._clock() - self._last_send)
+            if wait > 0.0:
+                self._sleep(wait)
+        self._last_send = self._clock()
         result = self._call(
             "sendMessage", {"chat_id": self._config.chat_id, "text": text[:4096], "disable_web_page_preview": True}
         )
@@ -214,6 +310,9 @@ class TelegramNotifier:
         A directive without its projection cannot be screened: it is logged at ERROR and skipped, and
         the rest of the report is still screened (maintainer decision 5, 2026-10-01). A failed send
         raises TelegramError; directives sent before it stay marked as sent.
+
+        With a store, each alert is recorded before it is sent: if the send then fails, the alert is lost
+        rather than repeated on the next run, because a repeat could double a position.
         """
         message_ids: list[int] = []
         for directive in report.directives:
@@ -234,8 +333,13 @@ class TelegramNotifier:
                     assessment.surviving_simulations, assessment.n_simulations,
                 )
                 continue
-            message_ids.append(self.send_message(format_directive(directive, assessment, bankroll_currency)))
+            text = format_directive(directive, assessment, bankroll_currency)
+            if self._config.chat_id is None:
+                raise ValueError(f"{CHAT_ID_ENV} is not set; run with --get-chat-id to find it")
+            if self._store is not None:
+                self._store.append(SentAlert(key, directive.stake, datetime.now(timezone.utc)))
             self._sent.add(key)
+            message_ids.append(self.send_message(text))
             logger.info("alert sent for %s", key)
         return message_ids
 

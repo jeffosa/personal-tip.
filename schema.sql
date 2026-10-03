@@ -261,7 +261,7 @@ CREATE TABLE bets (
 );
 
 -- ============================================================
--- merge_staging_player_feed(): identical to migrations/004_merge_hardening.sql (AGENT M4, Z5).
+-- merge_staging_player_feed(): identical to migrations/005_player_current_team.sql (AGENT M4, Z5).
 -- Call: SELECT * FROM prop_alpha.merge_staging_player_feed();  -- claims at most 200 batches per call
 -- ============================================================
 CREATE OR REPLACE FUNCTION prop_alpha.merge_staging_player_feed(p_max_batches integer DEFAULT 200)

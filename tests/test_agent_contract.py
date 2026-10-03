@@ -31,6 +31,11 @@ SANCTIONED_HANDLERS: frozenset[tuple[str, str, str]] = frozenset({
     ("prop_alpha/scanner/market_scanner.py", "InstitutionalAssetManager.allocate", "(ProjectionError, ValueError, FloatingPointError)"),
     # H6, added with the Telegram alerts at the maintainer's request; pending formal approval (RECONSTRUCTION.md Q6).
     ("prop_alpha/alerts/telegram.py", "TelegramNotifier._call", "requests.RequestException"),
+    # H7, approved by the maintainer on 2026-10-03 (audit H4): one appearance per failure, recorded in `failures`.
+    ("prop_alpha/evaluation/backtest.py", "walk_forward_over_probability", "(ProjectionError, ValueError, FloatingPointError)"),
+    # H8, added on 2026-10-03 with the 4-hourly status report the maintainer asked for: an unreachable
+    # database becomes a line in the report instead of silencing it.
+    ("prop_alpha/alerts/status.py", "database_section", "psycopg2.Error"),
 })
 
 PURE_MODULES: tuple[str, ...] = (
@@ -41,6 +46,8 @@ PURE_MODULES: tuple[str, ...] = (
     "prop_alpha/evaluation/backtest.py",
     # Added with the high-value screen; same no-I/O and determinism rules as the AGENT P1 modules.
     "prop_alpha/scanner/value_screen.py",
+    # Vendor adapter: response -> transform payload, same no-I/O and determinism rules.
+    "prop_alpha/ingestion/sportmonks.py",
 )
 IO_LIBRARIES = frozenset({
     "psycopg2", "requests", "urllib3", "socket", "http", "sqlite3", "threading", "concurrent", "asyncio", "subprocess",
