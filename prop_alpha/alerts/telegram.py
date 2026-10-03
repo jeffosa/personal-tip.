@@ -204,14 +204,21 @@ def simulation_seed(directive: StakingDirective) -> int:
 
 
 def format_directive(
-    directive: StakingDirective, assessment: HighValueAssessment, bankroll_currency: str = ""
+    directive: StakingDirective,
+    assessment: HighValueAssessment,
+    bankroll_currency: str = "",
+    label: str = "",
+    description: str | None = None,
 ) -> str:
-    """Plain-text alert (no parse_mode, so nothing needs escaping)."""
+    """Plain-text alert (no parse_mode, so nothing needs escaping). `label` (e.g. MOCK ODDS) heads the message;
+    `description` (match and player names) replaces the bare ids."""
     currency = f"{bankroll_currency} " if bankroll_currency else ""
     return "\n".join((
+        *((label,) if label else ()),
         PAPER_LABEL,
         "HIGH-VALUE BET",
-        f"Fixture {directive.fixture_id} | player {directive.player_id} | {directive.market_type}",
+        f"{description} | {directive.market_type}" if description
+        else f"Fixture {directive.fixture_id} | player {directive.player_id} | {directive.market_type}",
         f"{directive.side.upper()} {directive.line_value:g} @ {directive.decimal_odds:.3f} "
         f"({directive.sportsbook}, {directive.void_rule})",
         f"Do not bet below {directive.min_acceptable_odds:.3f}; valid until {directive.expires_at:%H:%M:%S} UTC",
@@ -302,6 +309,9 @@ class TelegramNotifier:
         projections: Mapping[ProjectionKey, FactorProjection],
         criteria: HighValueCriteria = DEFAULT_CRITERIA,
         bankroll_currency: str = "",
+        label: str = "",
+        descriptions: Mapping[ProjectionKey, str] | None = None,
+        max_alerts: int | None = None,
     ) -> list[int]:
         """Send each directive in report.directives whose market/line/side/book has not been alerted yet
         and that passes the high-value screen.
@@ -314,8 +324,13 @@ class TelegramNotifier:
         With a store, each alert is recorded before it is sent: if the send then fails, the alert is lost
         rather than repeated on the next run, because a repeat could double a position.
         """
+        if max_alerts is not None and max_alerts < 0:
+            raise ValueError("max_alerts must be non-negative")
         message_ids: list[int] = []
         for directive in report.directives:
+            if max_alerts is not None and len(message_ids) >= max_alerts:
+                logger.info("alert cap of %d reached; remaining directives not screened", max_alerts)
+                break
             key = alert_key(directive)
             if key in self._sent:
                 continue
@@ -333,7 +348,8 @@ class TelegramNotifier:
                     assessment.surviving_simulations, assessment.n_simulations,
                 )
                 continue
-            text = format_directive(directive, assessment, bankroll_currency)
+            description = (descriptions or {}).get((directive.fixture_id, directive.player_id, directive.market_type))
+            text = format_directive(directive, assessment, bankroll_currency, label, description)
             if self._config.chat_id is None:
                 raise ValueError(f"{CHAT_ID_ENV} is not set; run with --get-chat-id to find it")
             if self._store is not None:

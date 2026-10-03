@@ -33,7 +33,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from prop_alpha.config import credential
-from prop_alpha.ingestion import sportmonks
+from prop_alpha.ingestion import oddspapi, sportmonks
 from prop_alpha.ingestion.transform import (
     DEFAULT_KAPPAS,
     STAGING_COLUMNS,
@@ -178,6 +178,7 @@ class VendorClient:
         *,
         auth_header: str = "Authorization",
         auth_prefix: str = "Bearer ",
+        auth_query_param: str | None = None,
         stats_path: str = "fixtures/{uid}/stats",
         lineups_path: str = "fixtures/{uid}/lineups",
         stats_adapter: PayloadAdapter | None = None,
@@ -187,7 +188,8 @@ class VendorClient:
         client's lifetime; `quota_reserve` stops all further requests once the vendor's remaining-quota
         header reports that many or fewer, leaving them for manual use.
 
-        The key is sent as `{auth_header}: {auth_prefix}{api_key}`. The adapters are pure functions from the
+        The key is sent as `{auth_header}: {auth_prefix}{api_key}`, or as the query parameter `auth_query_param`
+        when that is set (OddsPapi). Errors never quote the request URL, which may carry the key. The adapters are pure functions from the
         vendor's response to the shapes transform.py parses (e.g. ingestion.sportmonks); they run in the
         worker before any connection is taken, and the adapted payload is what raw_payloads stores."""
         if "{uid}" not in stats_path or "{uid}" not in lineups_path:
@@ -211,6 +213,7 @@ class VendorClient:
         self.quota_reserve = quota_reserve
         self.auth_header = auth_header
         self.auth_prefix = auth_prefix
+        self.auth_query_param = auth_query_param
         self.stats_path = stats_path
         self.lineups_path = lineups_path
         self.stats_adapter = stats_adapter
@@ -226,7 +229,9 @@ class VendorClient:
         session = getattr(self._local, "session", None)
         if session is None:
             session = requests.Session()
-            session.headers.update({self.auth_header: f"{self.auth_prefix}{self.api_key}", "Accept": "application/json"})
+            session.headers.update({"Accept": "application/json"})
+            if self.auth_query_param is None:
+                session.headers.update({self.auth_header: f"{self.auth_prefix}{self.api_key}"})
             # Only failed connects are retried here: they never reach the vendor, so they spend no quota.
             # Read errors and retryable statuses are handled (or raised) by get_json, one token per attempt.
             retry_policy = Retry(
@@ -264,24 +269,48 @@ class VendorClient:
                 return
 
     def get_json(self, path: str) -> dict[str, Any]:
+        body = self.get_json_value(path)
+        if not isinstance(body, dict):
+            raise ValueError(f"expected a JSON object from {path}")
+        return body
+
+    def _get(self, url: str) -> requests.Response:
+        params = {self.auth_query_param: self.api_key} if self.auth_query_param is not None else None
+        try:
+            return self._session().get(url, params=params, timeout=self.timeout)
+        except requests.RequestException as exc:
+            # requests quotes the full URL in its messages; with query authentication that includes the key.
+            detail = "details withheld: the URL carries the API key" if params is not None else str(exc)
+            raise requests.ConnectionError(f"{type(exc).__name__} ({detail})") from None
+
+    def _scrub(self, text: str) -> str:
+        """A response body for an error message: at most 300 characters, never the key."""
+        return text[:300].replace(self.api_key, "<key>") if self.api_key else text[:300]
+
+    def get_json_value(self, path: str, empty_on: frozenset[int] = frozenset()) -> Any:
+        """Any JSON value (object or list) from `path`; retries, quota and error rules as get_json. A status in
+        `empty_on` returns None: for OddsPapi, HTTP 400 and 404 are also how "this bookmaker has no fixtures here" is reported."""
         url = f"{self.base_url}/{path.lstrip('/')}"
         failure = "no attempt made"
         for attempt in range(self.max_retries + 1):
             self._spend_request()
             self.rate_limiter.acquire()
-            resp = self._session().get(url, timeout=self.timeout)
+            resp = self._get(url)
             self._record_remaining_quota(resp.headers)
             if resp.status_code not in RETRYABLE_HTTP_STATUS:
-                resp.raise_for_status()
+                if resp.status_code in empty_on:
+                    logger.info("%s: HTTP %d treated as no data: %s", path, resp.status_code, self._scrub(resp.text))
+                    return None
+                if resp.status_code >= 400:
+                    raise requests.HTTPError(f"{path}: HTTP {resp.status_code}: {self._scrub(resp.text)}")
                 body = resp.json()
-                if not isinstance(body, dict):
-                    raise ValueError(f"expected a JSON object from {path}")
-                errors = body.get("errors")
-                if errors:
-                    raise VendorError(f"{path}: vendor reported errors: {errors}")
-                rate_limit = body.get("rate_limit")  # Sportmonks reports its quota in the body, per entity
-                if isinstance(rate_limit, Mapping) and isinstance(rate_limit.get("remaining"), int):
-                    self._record_remaining_quota({"x-ratelimit-remaining": str(rate_limit["remaining"])})
+                if isinstance(body, dict):
+                    errors = body.get("errors")
+                    if errors:
+                        raise VendorError(f"{path}: vendor reported errors: {errors}")
+                    rate_limit = body.get("rate_limit")  # Sportmonks reports its quota in the body, per entity
+                    if isinstance(rate_limit, Mapping) and isinstance(rate_limit.get("remaining"), int):
+                        self._record_remaining_quota({"x-ratelimit-remaining": str(rate_limit["remaining"])})
                 return body
             failure = f"HTTP {resp.status_code}"
             delay = 0.25 * (2 ** attempt)
@@ -606,6 +635,17 @@ def build_vendor_client(environ: Mapping[str, str]) -> VendorClient:
     return VendorClient(
         environ["DATA_VENDOR_BASE_URL"], environ["DATA_VENDOR_API_KEY"], limiter,
         max_requests=max_requests, quota_reserve=quota_reserve,
+    )
+
+
+def build_odds_client(environ: Mapping[str, str]) -> VendorClient:
+    """OddsPapi client: key from ODDSPAPI_KEY (environment or `.env`) as the apiKey query parameter, at most one
+    request per second (the vendor's cooldown), no automatic retries (each attempt spends the 250-request free
+    quota), and at most ODDS_MAX_REQUESTS (default 8) requests per run."""
+    return VendorClient(
+        oddspapi.BASE_URL, credential("ODDSPAPI_KEY", environ), TokenBucketRateLimiter(rate_per_sec=0.9, burst=1),
+        timeout=60.0, max_retries=0, max_requests=int(environ.get("ODDS_MAX_REQUESTS", "8")),
+        auth_query_param=oddspapi.AUTH_QUERY_PARAM,
     )
 
 

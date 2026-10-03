@@ -275,3 +275,46 @@ def lineup_payload(body: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(f"fixture {fixture.get('id')}: unknown lineup type_id {kind!r}")
         sheets[team]["starters" if kind == STARTING_XI else "bench"].append(str(row["player_id"]))
     return {"fixture": {"uid": str(fixture["id"]), "home_team_uid": home, "away_team_uid": away}, "lineups": sheets}
+
+
+# Leagues the opportunity scan covers (Sportmonks league id -> prop_alpha.leagues.name).
+SCAN_LEAGUES: Final[Mapping[int, str]] = {12: "League One", 14: "League Two"}
+UPCOMING_INCLUDE: Final[str] = "participants;state"
+
+
+def upcoming_path(start: datetime, end: datetime, page: int) -> str:
+    """Listing of SCAN_LEAGUES fixtures between two UTC dates (inclusive), one page of 50."""
+    leagues = ",".join(str(league) for league in sorted(SCAN_LEAGUES))
+    return (
+        f"fixtures/between/{start:%Y-%m-%d}/{end:%Y-%m-%d}?filters=fixtureLeagues:{leagues}"
+        f"&include={UPCOMING_INCLUDE}&per_page=50&page={page}"
+    )
+
+
+def upcoming_fixtures(body: Mapping[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    """(not-started fixtures in SCAN_LEAGUES, whether another page follows) from one listing page."""
+    data = body.get("data")
+    if not isinstance(data, list):
+        raise ValueError("Sportmonks listing has no 'data' list")
+    fixtures: list[dict[str, Any]] = []
+    for fixture in data:
+        league = SCAN_LEAGUES.get(fixture.get("league_id"))
+        state = fixture.get("state")
+        if league is None or not isinstance(state, Mapping) or state.get("developer_name") not in SCHEDULED_STATES:
+            continue
+        names = {
+            (participant.get("meta") or {}).get("location"): str(participant.get("name"))
+            for participant in fixture.get("participants") or []
+        }
+        home, away = _sides(fixture)
+        fixtures.append({
+            "fixture_id": int(fixture["id"]),
+            "league": league,
+            "home_team_uid": home,
+            "away_team_uid": away,
+            "home_name": names.get("home", home),
+            "away_name": names.get("away", away),
+            "kickoff_at": datetime.fromisoformat(_kickoff(fixture)),
+        })
+    pagination = body.get("pagination")
+    return fixtures, bool(isinstance(pagination, Mapping) and pagination.get("has_more"))

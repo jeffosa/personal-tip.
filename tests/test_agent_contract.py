@@ -36,6 +36,12 @@ SANCTIONED_HANDLERS: frozenset[tuple[str, str, str]] = frozenset({
     # H8, added on 2026-10-03 with the 4-hourly status report the maintainer asked for: an unreachable
     # database becomes a line in the report instead of silencing it.
     ("prop_alpha/alerts/status.py", "database_section", "psycopg2.Error"),
+    # H9, added on 2026-10-03 with the 4-hourly opportunity scan the maintainer asked for: one fixture that
+    # cannot be priced is recorded in the run summary and skipped; pending formal approval.
+    ("prop_alpha/alerts/scan.py", "scan_fixture", "(ProjectionError, ValueError, FloatingPointError)"),
+    # H10, added on 2026-10-03 with the odds collector: OddsPapi takes its key as a query parameter, and
+    # requests quotes the URL in its messages, so transport errors are re-raised without it (as H6).
+    ("prop_alpha/ingestion/pipeline.py", "VendorClient._get", "requests.RequestException"),
 })
 
 PURE_MODULES: tuple[str, ...] = (
@@ -48,6 +54,9 @@ PURE_MODULES: tuple[str, ...] = (
     "prop_alpha/scanner/value_screen.py",
     # Vendor adapter: response -> transform payload, same no-I/O and determinism rules.
     "prop_alpha/ingestion/sportmonks.py",
+    "prop_alpha/ingestion/oddspapi.py",
+    # Scan slate: projections and mock quotes for the 4-hourly opportunity scan.
+    "prop_alpha/scanner/slate.py",
 )
 IO_LIBRARIES = frozenset({
     "psycopg2", "requests", "urllib3", "socket", "http", "sqlite3", "threading", "concurrent", "asyncio", "subprocess",

@@ -208,7 +208,7 @@ def test_vendor_client_sends_sportmonks_auth_and_adapts_responses(tmp_path: Path
     seen: list[str] = []
 
     class Session:
-        def get(self, url: str, timeout: float) -> requests.Response:
+        def get(self, url: str, timeout: float, params: dict[str, str] | None = None) -> requests.Response:
             seen.append(url)
             response = requests.Response()
             response.status_code = 200

@@ -12,7 +12,13 @@ import numpy as np
 from numpy.typing import ArrayLike
 from scipy.special import xlogy
 
-from prop_alpha.modeling.engine import MAX_MATCH_MINUTES, LineupExpectation, ProjectionError, QuantEngine, RefereeProfile
+from prop_alpha.modeling.engine import (
+    MAX_MATCH_MINUTES,
+    NEUTRAL_REFEREE,
+    LineupExpectation,
+    ProjectionError,
+    QuantEngine,
+)
 from prop_alpha.scanner.market_scanner import devig_two_way
 
 
@@ -117,7 +123,6 @@ class BacktestFailure:
     error: str
 
 
-_NEUTRAL_REFEREE: Final[RefereeProfile] = RefereeProfile(1.0, 0.0, 0.0, 0.0)
 
 
 def walk_forward_over_probability(
@@ -207,7 +212,7 @@ def _over_probability(
         counts=[o.count for o in on_pitch],
         minutes=[o.minutes_played for o in on_pitch],
         league_rate_per90=league_rate_per90,
-        referee=_NEUTRAL_REFEREE,
+        referee=NEUTRAL_REFEREE,
         is_home=True,
         lineup=lineup,
         prior_strength_90s=prior_strength_90s,

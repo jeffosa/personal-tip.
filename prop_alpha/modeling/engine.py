@@ -106,6 +106,11 @@ class RefereeProfile:
             raise ValueError("home_bias_ratio must lie strictly inside (-1, 1)")
 
 
+# Multiplier 1 and no card propensity: used when no referee is known (backtest observations, pre-appointment
+# scans). Referee-sensitive markets are then priced without a referee adjustment.
+NEUTRAL_REFEREE: Final[RefereeProfile] = RefereeProfile(1.0, 0.0, 0.0, 0.0)
+
+
 @dataclass(frozen=True)
 class GammaPosterior:
     alpha: float

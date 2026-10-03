@@ -451,7 +451,7 @@ class ScriptedSession:
         self.responses = list(responses)
         self.requests = 0
 
-    def get(self, url: str, timeout: float) -> requests.Response:
+    def get(self, url: str, timeout: float, params: dict[str, str] | None = None) -> requests.Response:
         self.requests += 1
         return self.responses.pop(0)
 
