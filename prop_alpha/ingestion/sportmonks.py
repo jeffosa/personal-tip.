@@ -8,12 +8,21 @@ player who started without MINUTES_PLAYED, raises instead of manufacturing zeros
 Field mapping verified on fixture 19727702 (League Two, 2026-09-19): SUBSTITUTION events carry the incoming
 player as player_id and the outgoing one as related_player_id; GOAL events credit participant_id; lineup
 type_id 11 is the starting XI and 12 the bench.
+
+TACKLES is the tackle count the tackles market prices. TACKLES_WON comes from a different count: in the
+2025/26 League One backfill it exceeded TACKLES in about a third of fixtures, and TACKLES_WON_PERCENTAGE
+disagrees with both (e.g. 4 tackles, 4 won, 80%). By maintainer decision (2026-10-03) tackles_won is stored
+as min(TACKLES_WON, TACKLES), each capped player is logged, and the original figure stays in
+`vendor_response`. tackles_won is not a pricing input.
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any, Final, Mapping
+
+logger = logging.getLogger("prop_alpha.ingestion.sportmonks")
 
 BASE_URL: Final[str] = "https://api.sportmonks.com/v3/football"
 STATS_INCLUDE: Final[str] = "participants;lineups.details.type;events.type;referees;state;scores;statistics.type"
@@ -176,12 +185,21 @@ def fixture_payload(body: Mapping[str, Any]) -> dict[str, Any]:
 
     players: list[dict[str, Any]] = []
     seen_details: set[str] = set()
+    capped: list[str] = []
+    unidentified_bench: list[str] = []
     for row in lineups:
         kind = row.get("type_id")
         if kind not in (STARTING_XI, BENCH):
             raise ValueError(f"fixture {fixture.get('id')}: unknown lineup type_id {kind!r}")
-        uid = str(row["player_id"])
         details = _details(row)
+        if row.get("player_id") is None:
+            # Seen on ~9% of 2025/26 League One fixtures: an unregistered squad player on the bench. An unused
+            # substitute has no statistics, so nothing is lost by leaving them out; anyone who played is.
+            if kind == BENCH and details.get("MINUTES_PLAYED", 0) == 0:
+                unidentified_bench.append(str(row.get("player_name") or "unnamed"))
+                continue
+            raise ValueError(f"fixture {fixture.get('id')}: lineup row without a player_id (unidentified player)")
+        uid = str(row["player_id"])
         seen_details.update(details)
         started = kind == STARTING_XI
         if status == "final" and started and "MINUTES_PLAYED" not in details:
@@ -190,6 +208,9 @@ def fixture_payload(body: Mapping[str, Any]) -> dict[str, Any]:
         stats: dict[str, int] = {"minutes": minutes}
         for source, target in DETAIL_FIELDS.items():
             stats[target] = details.get(source, 0)
+        if stats["tackles_won"] > stats["tackles_attempted"]:
+            capped.append(f"{uid} ({stats['tackles_won']} won > {stats['tackles_attempted']} tackles)")
+            stats["tackles_won"] = stats["tackles_attempted"]
         stats["yellow_cards"] = details.get("YELLOWCARDS", 0) + details.get("YELLOWREDCARDS", 0)
         stats["red_cards"] = details.get("REDCARDS", 0) + details.get("YELLOWREDCARDS", 0)
         player: dict[str, Any] = {
@@ -208,6 +229,11 @@ def fixture_payload(body: Mapping[str, Any]) -> dict[str, Any]:
                 player["minute_off"] = max(minute_off, minute_on) if minute_off is not None else minute_on + minutes
         players.append(player)
 
+    if unidentified_bench:
+        logger.warning("fixture %s: skipped unused substitutes without a player_id: %s", fixture.get("id"),
+                       ", ".join(unidentified_bench))
+    if capped:
+        logger.warning("fixture %s: TACKLES_WON capped at TACKLES for %s", fixture.get("id"), ", ".join(capped))
     if status == "final":
         missing = [name for name in COVERAGE_DETAILS if name not in seen_details]
         if missing:
@@ -228,6 +254,10 @@ def fixture_payload(body: Mapping[str, Any]) -> dict[str, Any]:
         "teams": _possession(fixture),
         "goals": _goals(fixture, home, away, final_score) if status in ("final", "live") else [],
         "players": players,
+        # The untouched vendor object rides along so raw_payloads keeps every Sportmonks statistic, not only
+        # the mapped ones: a paid backfill can then be re-derived later without re-fetching.
+        # parse_fixture_payload ignores this key.
+        "vendor_response": dict(fixture),
     }
 
 

@@ -9,7 +9,7 @@ Full rules for any code change: **AGENT.md**. Requirements and go-live gates: `p
 
 - **SQL has run on PostgreSQL 18.6 only, and only in CI's database stage.** `schema.sql` installs cleanly; migrations 003 → 004 → 005 upgrade cleanly; `tests/test_merge_postgres.sql` passes (transfer, backfill, one reject). The PRD minimum is 15+, so 18 qualifies; 15–17 are untested. **Not run:** migration 002 on a real v2 database (none exists), the merge on real vendor data, and any concurrency soak. Tag claims beyond this **[U]**.
 - **Not built:** the odds poller, projection refresh, bet ledger, closing-line capture and execution components.
-- **Ingestion runs on real data via Sportmonks only,** verified on one League Two fixture (19727702) into the local database. Sportmonks is on a trial that ends **2026-10-16**. API-Football, The Odds API and OddsPapi have keys but no adapter or caller.
+- **Ingestion runs on real data via Sportmonks only.** Backfill on 2026-10-03 into the working `prop_alpha` database: 1,243 of 1,306 finished League One and League Two fixtures (2025/26 complete, 2026/27 to that date), ~44,500 player rows, 0 merge rejects. The 63 not loaded are refused by the converter: 52 have an unidentified player who played, 2 have goal events that don't reproduce the score, 1 has duels won > duels, and 8 were network failures (re-runnable). `tackles_won` is capped at `TACKLES` (see `ingestion/sportmonks.py`). Clubs that changed league between seasons have their earlier home fixtures filed under their current league (fixtures take the home club's league). Sportmonks is on a trial that ends **2026-10-16**. API-Football, The Odds API and OddsPapi have keys but no adapter or caller.
 - **Model not validated: no PRD go-live gate has been passed.** Gate 1: the fresh-install half of criterion 1 is met; the v2 upgrade half and criteria 2–7 need a 1,000-fixture vendor backfill. Gates 2–4 depend on Gate 1 and on the components above.
 - **Runtime floor is Python 3.12,** set by the numpy 2.5.1 and scipy 1.18.0 pins. The suite has only run on 3.14.6.
 
@@ -47,7 +47,7 @@ python3 -m venv .venv
 Tests:
 
 ```bash
-# Whole suite (363 tests). This is the command that counts.
+# Whole suite (367 tests). This is the command that counts.
 python -m pytest tests -q -p no:cacheprovider
 
 # Individual suites
@@ -80,7 +80,7 @@ python -m prop_alpha.alerts.telegram --demo          # synthetic reference-case 
 python -m prop_alpha.alerts.status [--send]          # status report (database, alerts, trial days); no vendor calls
 ```
 
-A Windows Task Scheduler task, `prop_alpha\Telegram status`, sends the status report every 4 hours (00:00, 04:00, …), running `scripts/telegram_status.cmd` with `.venv`, which CI never deletes. It logs to `.prop_alpha_state\status.log`. It runs on battery, catches up after sleep, and needs the user to be logged in. It reads the `prop_alpha` database, never `prop_alpha_ci`. To stop it: `schtasks /Delete /TN "prop_alpha\Telegram status" /F`.
+A Windows Task Scheduler task, `prop_alpha\Telegram status`, sends the status report every 4 hours (00:00, 04:00, …), running `scripts/telegram_status.cmd` with `.venv`, which CI never deletes. It logs to `.prop_alpha_state\status.log`. It runs on battery, catches up after sleep, starts only when a network is available, retries a failed run every 5 minutes up to 3 times, and needs the user to be logged in. A run that still fails leaves a traceback in the log; the most common cause is no network after waking from sleep. It reads the `prop_alpha` database, never `prop_alpha_ci`. To stop it: `schtasks /Delete /TN "prop_alpha\Telegram status" /F`.
 
 ## Local PostgreSQL
 
@@ -89,7 +89,7 @@ Supported: **PostgreSQL 15 or newer** (the schema needs 15 for `UNIQUE NULLS NOT
 - service `postgresql-x64-18`, port 5432, superuser `postgres`;
 - binaries in `C:\Program Files\PostgreSQL\18\bin`, which the installer does **not** add to PATH. `ci/bootstrap.sh` finds the newest version there by itself; for manual use, call `psql` by full path or add that folder to PATH. A tool that reports "no psql" has usually only checked PATH;
 - the password is in `%APPDATA%\postgresql\pgpass.conf` (outside the repo; `psql` reads it automatically). Never put it in a URL, file or command in the repo;
-- CI database: `prop_alpha_ci`. Use only databases whose name ends in `_ci`: CI stage 6 runs `DROP SCHEMA prop_alpha CASCADE`, and `ci/bootstrap.sh` refuses any other name.
+- CI database: `prop_alpha_ci`. CI stage 6 runs `DROP SCHEMA prop_alpha CASCADE`, so `ci/bootstrap.sh` accepts only the database named exactly `prop_alpha_ci` (`CI_DATABASE_NAME`).
 
 Run the full pipeline, including the database stage (from Git Bash):
 
@@ -129,7 +129,7 @@ On a machine without a native install, Docker works too (untested here): `docker
 
 ## Before you say a change is done
 
-1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (363). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
+1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (367). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
 2. `bash ci/bootstrap.sh --preflight` passes.
 3. If you touched SQL: the full pipeline with `PROP_ALPHA_CI_DATABASE_URL` set ends with `schema smoke test passed`, and any new merge behaviour has a check in `tests/test_merge_postgres.sql`.
 4. New behaviour has tests that failed before the change.

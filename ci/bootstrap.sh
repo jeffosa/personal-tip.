@@ -9,7 +9,7 @@
 #   PROP_ALPHA_PYTHON             interpreter used to build the venv          (default: python3)
 #   PROP_ALPHA_VENV_DIR           virtual environment location                (default: <repo>/.venv-ci)
 #   PROP_ALPHA_ARTIFACT_DIR       pip freeze and JUnit output                 (default: <repo>/ci-artifacts)
-#   PROP_ALPHA_CI_DATABASE_URL    disposable PostgreSQL 15+ database whose name ends in _ci; enables stage 6.
+#   PROP_ALPHA_CI_DATABASE_URL    disposable PostgreSQL 15+ database named exactly prop_alpha_ci; enables stage 6.
 #                                 Inject from the CI secret store. Never commit it.
 #
 # The test suite needs no vendor credentials or production database: tests use in-memory fakes.
@@ -25,7 +25,8 @@ readonly ARTIFACT_DIR="${PROP_ALPHA_ARTIFACT_DIR:-${REPO_ROOT}/ci-artifacts}"
 readonly PIP_VERSION="26.2.1"
 readonly MIN_PYTHON_MAJOR=3
 readonly MIN_PYTHON_MINOR=12
-readonly EXPECTED_TESTS=363
+readonly CI_DATABASE_NAME="prop_alpha_ci"
+readonly EXPECTED_TESTS=367
 
 log() { printf '%s [ci] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { log "FATAL: $*" >&2; exit 1; }
@@ -123,7 +124,10 @@ if [[ -n "${PROP_ALPHA_CI_DATABASE_URL:-}" ]]; then
   log "psql: $(command -v psql) ($(psql --version))"
   psql_ci() { psql "${PROP_ALPHA_CI_DATABASE_URL}" -X -q -v ON_ERROR_STOP=1 "$@"; }
   db_name="$(psql_ci -At -c 'SELECT current_database()')"
-  [[ "${db_name}" == *_ci ]] || die "refusing to reset database '${db_name}': CI database names must end in _ci"
+  # Stage 6 drops the prop_alpha schema, so only the one known disposable database is accepted: a suffix
+  # match would also accept a shared database that merely happens to end in _ci.
+  [[ "${db_name}" == "${CI_DATABASE_NAME}" ]] \
+    || die "refusing to reset database '${db_name}': the CI database must be named exactly ${CI_DATABASE_NAME}"
   server_version_num="$(psql_ci -At -c 'SHOW server_version_num')"
   (( server_version_num >= 150000 )) || die "PostgreSQL 15+ required; server_version_num=${server_version_num}"
   psql_ci -c 'DROP SCHEMA IF EXISTS prop_alpha CASCADE'

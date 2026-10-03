@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +82,56 @@ def test_fixture_maps_to_a_payload_transform_accepts() -> None:
     assert (fx.home_score, fx.away_score, fx.status, fx.kickoff_at) == (2, 0, "final", "2026-09-19T11:30:00+00:00")
     assert parsed.referee is not None and parsed.referee.vendor_uid == "19057"
     assert len(parsed.players) == 25
+
+
+def test_payload_carries_the_untouched_vendor_response() -> None:
+    """raw_payloads stores the payload, so a paid backfill keeps every statistic, mapped or not."""
+    body = _fixture()
+    body["data"]["lineups"][0]["details"].append(_detail("AERIALS_WON", 3))
+    payload = sportmonks.fixture_payload(body)
+    assert payload["vendor_response"] == body["data"]
+    assert payload["vendor_response"]["lineups"][0]["details"][-1]["data"] == {"value": 3}
+    assert parse_fixture_payload(payload).fixture.vendor_uid == "19727702"
+
+
+def test_tackles_won_above_tackles_is_capped_logged_and_kept_raw(caplog: pytest.LogCaptureFixture) -> None:
+    """Real 2025/26 row (fixture 19432768): 1 tackle, 2 won. Previously the whole fixture was refused."""
+    body = _fixture()
+    row = body["data"]["lineups"][0]
+    row["details"] = [d for d in row["details"] if d["type"]["developer_name"] not in ("TACKLES", "TACKLES_WON")]
+    row["details"] += [_detail("TACKLES", 1), _detail("TACKLES_WON", 2)]
+    with caplog.at_level(logging.WARNING, logger="prop_alpha.ingestion.sportmonks"):
+        payload = sportmonks.fixture_payload(body)
+    player = parse_fixture_payload(payload).players[0]
+    assert (player.tackles_attempted, player.tackles_won) == (1, 1)
+    assert f"{row['player_id']} (2 won > 1 tackles)" in caplog.text
+    raw = {d["type"]["developer_name"]: d["data"]["value"] for d in payload["vendor_response"]["lineups"][0]["details"]}
+    assert raw["TACKLES_WON"] == 2
+
+
+def test_unidentified_player_who_played_fails_the_fixture() -> None:
+    body = _fixture()
+    starter = next(row for row in body["data"]["lineups"] if row["type_id"] == sportmonks.STARTING_XI)
+    starter["player_id"] = None
+    with pytest.raises(ValueError, match="without a player_id"):
+        sportmonks.fixture_payload(body)
+
+
+def test_unidentified_unused_substitute_is_skipped_and_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """Real 2025/26 row (fixture 19432415): bench, no id, no statistics. Previously refused the fixture."""
+    body = _fixture()
+    before = len(parse_fixture_payload(sportmonks.fixture_payload(body)).players)
+    body["data"]["lineups"].append({
+        "player_id": None, "player_name": "Oliver Evans", "team_id": 76, "position_id": 25,
+        "type_id": sportmonks.BENCH, "details": [],
+    })
+    with caplog.at_level(logging.WARNING, logger="prop_alpha.ingestion.sportmonks"):
+        players = parse_fixture_payload(sportmonks.fixture_payload(body)).players
+    assert len(players) == before
+    assert "without a player_id: Oliver Evans" in caplog.text
+    body["data"]["lineups"][-1]["details"] = [_detail("MINUTES_PLAYED", 12)]
+    with pytest.raises(ValueError, match="without a player_id"):
+        sportmonks.fixture_payload(body)
 
 
 def test_absent_details_are_zero_and_present_ones_map_exactly() -> None:
