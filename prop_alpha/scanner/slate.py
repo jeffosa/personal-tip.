@@ -31,6 +31,7 @@ from prop_alpha.modeling.engine import (
     QuantEngine,
     VoidRule,
 )
+from prop_alpha.modeling.league_level import level_scaled_minutes, season_of
 from prop_alpha.scanner.market_scanner import LiveOddsQuote, ProjectionKey, price_for_ev, stressed_probabilities
 
 SCAN_INTERVAL: Final[timedelta] = timedelta(hours=4)
@@ -149,11 +150,15 @@ def build_projections(
     team_recent_fixtures: Mapping[str, Sequence[int]],
     league_rates: Mapping[tuple[str, str], float],
     engine: QuantEngine,
+    *,
+    season_levels: Mapping[tuple[str, str], Mapping[int, float]] | None = None,
 ) -> tuple[dict[ProjectionKey, FactorProjection], list[str]]:
     """Projections for every regular starter and scan market, plus the reasons players were left out.
 
     `league_rates` maps (position, market) to the league's trailing rate per 90; only history strictly before
-    kickoff is used.
+    kickoff is used. With `season_levels` ((position, market) -> {season -> trailing rate}), each past match's
+    minutes are scaled by its season's rate over today's (modeling.league_level), so league-wide drift between
+    seasons does not carry into the price; a player whose history reaches a season with no rate is left out.
     """
     projections: dict[ProjectionKey, FactorProjection] = {}
     skipped: list[str] = []
@@ -171,12 +176,21 @@ def build_projections(
             if rate is None or not (math.isfinite(rate) and rate > 0.0):
                 skipped.append(f"{player.name}: no league {market} rate for position {player.position}")
                 continue
+            exposure = [a.minutes for a in on_pitch]
+            levels = (season_levels or {}).get((player.position, market))
+            if season_levels is not None:
+                needed = {season_of(a.kickoff_at) for a in on_pitch} | {season_of(fixture.kickoff_at)}
+                if levels is None or not needed <= set(levels):
+                    skipped.append(f"{player.name}: no {market} league level for every season of his history")
+                    continue
+                exposure, rate = level_scaled_minutes(exposure, [a.kickoff_at for a in on_pitch], levels,
+                                                      fixture.kickoff_at)
             projections[(fixture.fixture_id, player.player_id, market)] = engine.factor_count_market(
                 fixture_id=fixture.fixture_id,
                 player_id=player.player_id,
                 market_type=market,
                 counts=[a.count(market) for a in on_pitch],
-                minutes=[a.minutes for a in on_pitch],
+                minutes=exposure,
                 league_rate_per90=rate,
                 referee=NEUTRAL_REFEREE,
                 is_home=player.team_uid == fixture.home_team_uid,

@@ -62,6 +62,8 @@ PURE_MODULES: tuple[str, ...] = (
     "prop_alpha/scanner/slate.py",
     # Bet-recording replies: parse "placed 3 @1.95 5" and resolve it against the replied-to message.
     "prop_alpha/alerts/replies.py",
+    # League level: trailing positional rates and history re-scaled to today's level.
+    "prop_alpha/modeling/league_level.py",
 )
 IO_LIBRARIES = frozenset({
     "psycopg2", "requests", "urllib3", "socket", "http", "sqlite3", "threading", "concurrent", "asyncio", "subprocess",

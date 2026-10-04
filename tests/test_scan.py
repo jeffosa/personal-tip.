@@ -244,6 +244,34 @@ def test_odds_outage_is_reported_in_the_summary_not_fatal(
     assert "Fair-price boards sent (matches with no bookmaker line): 1" in text
 
 
+# ---------------- league level in the scan ----------------
+def test_constant_season_levels_change_no_price_and_a_lower_level_lowers_the_mean() -> None:
+    squad, history, recent = _inputs()
+    engine = QuantEngine(game_state_k=6.0)
+    plain, _ = build_projections(FIXTURE, squad, history, recent, RATES, engine)
+    flat = {key: {2026: rate} for key, rate in RATES.items()}
+    same, skipped = build_projections(FIXTURE, squad, history, recent, RATES, engine, season_levels=flat)
+    assert skipped == [] and set(same) == set(plain)
+    for key in plain:
+        assert same[key].rate_posterior.alpha == pytest.approx(plain[key].rate_posterior.alpha)
+        assert same[key].rate_posterior.beta == pytest.approx(plain[key].rate_posterior.beta)
+    # The history (Aug-Oct 2026) is all this season, so a higher level then than now cannot exist; put last
+    # season's level on it by moving the fixture into next season.
+    later = UpcomingFixture(9002, "League Two", "76", "348", "Walsall", "Port Vale", KICKOFF.replace(year=2027))
+    drop = {key: {2026: rate, 2027: rate * 0.9} for key, rate in RATES.items()}
+    lowered, _ = build_projections(later, squad, history, recent, {k: r * 0.9 for k, r in RATES.items()}, engine,
+                                   season_levels=drop)
+    unscaled, _ = build_projections(later, squad, history, recent, {k: r * 0.9 for k, r in RATES.items()}, engine)
+    assert lowered and all(lowered[k].rate_posterior.mean < unscaled[k].rate_posterior.mean for k in lowered)
+
+
+def test_a_history_season_without_a_level_is_skipped_not_guessed() -> None:
+    squad, history, recent = _inputs()
+    projections, skipped = build_projections(FIXTURE, squad, history, recent, RATES, QuantEngine(game_state_k=6.0),
+                                             season_levels={key: {2025: rate} for key, rate in RATES.items()})
+    assert projections == {} and skipped and all("league level" in reason for reason in skipped)
+
+
 # ---------------- fair-price board ----------------
 def _projections(rates: dict[tuple[str, str], float] = RATES) -> dict[Any, Any]:
     squad, history, recent = _inputs()

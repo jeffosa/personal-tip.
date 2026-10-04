@@ -26,7 +26,7 @@ readonly PIP_VERSION="26.2.1"
 readonly MIN_PYTHON_MAJOR=3
 readonly MIN_PYTHON_MINOR=12
 readonly CI_DATABASE_NAME="prop_alpha_ci"
-readonly EXPECTED_TESTS=445
+readonly EXPECTED_TESTS=459
 
 log() { printf '%s [ci] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { log "FATAL: $*" >&2; exit 1; }

@@ -6,7 +6,7 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Final, Iterable, Sequence
+from typing import Callable, Final, Iterable, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import ArrayLike
@@ -19,6 +19,10 @@ from prop_alpha.modeling.engine import (
     ProjectionError,
     QuantEngine,
 )
+from prop_alpha.modeling.league_level import level_scaled_minutes
+
+# Season start year -> trailing league rate per 90, as known strictly before the given kickoff.
+LevelSource = Callable[[datetime], Mapping[int, float]]
 from prop_alpha.scanner.market_scanner import devig_two_way
 
 
@@ -135,8 +139,13 @@ def walk_forward_over_probability(
     default_start_minutes: float = 85.0,
     default_sub_minutes: float = 20.0,
     failures: list[BacktestFailure] | None = None,
+    level: LevelSource | None = None,
 ) -> list[BacktestPrediction]:
     """P(count > line) for every appearance, using only that player's observations strictly before kickoff.
+
+    With `level`, the league rate is the trailing rate of the target's season as known before its kickoff, and
+    each past match's minutes are scaled by that match's season rate over today's (league_level), so league-wide
+    drift between seasons does not carry into the price; `league_rate_per90` is then unused.
 
     The lineup is fixed at team-sheet time: a starter is priced with p_start = 1, a used substitute with
     p_sub = 1. Unused substitutes (0 minutes, not started) are voided and produce no prediction. Expected
@@ -164,7 +173,7 @@ def walk_forward_over_probability(
             try:
                 p_over = _over_probability(
                     target, prior, line, league_rate_per90, engine, market_type, prior_strength_90s,
-                    default_start_minutes, default_sub_minutes,
+                    default_start_minutes, default_sub_minutes, level,
                 )
             except (ProjectionError, ValueError, FloatingPointError) as exc:
                 if failures is None:
@@ -193,10 +202,16 @@ def _over_probability(
     prior_strength_90s: float,
     default_start_minutes: float,
     default_sub_minutes: float,
+    level: LevelSource | None = None,
 ) -> float:
     # Only time on the pitch informs a per-minute rate: zero-minute rows (including bench bookings,
     # which the engine's exposure validation rejects) are left out of the rate inputs.
     on_pitch = [o for o in prior if o.minutes_played > 0.0]
+    exposure = [o.minutes_played for o in on_pitch]
+    if level is not None:
+        exposure, league_rate_per90 = level_scaled_minutes(
+            exposure, [o.kickoff_at for o in on_pitch], level(target.kickoff_at), target.kickoff_at
+        )
     start_minutes = [o.minutes_played for o in on_pitch if o.started]
     sub_minutes = [o.minutes_played for o in on_pitch if not o.started]
     lineup = LineupExpectation(
@@ -210,7 +225,7 @@ def _over_probability(
         player_id=target.player_id,
         market_type=market_type,
         counts=[o.count for o in on_pitch],
-        minutes=[o.minutes_played for o in on_pitch],
+        minutes=exposure,
         league_rate_per90=league_rate_per90,
         referee=NEUTRAL_REFEREE,
         is_home=True,

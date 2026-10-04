@@ -54,6 +54,7 @@ from prop_alpha.config import DEFAULT_ENV_FILE
 from prop_alpha.ingestion import oddspapi, sportmonks
 from prop_alpha.ingestion.pipeline import QuotaExhaustedError
 from prop_alpha.modeling.engine import FactorProjection, ProjectionError, QuantEngine
+from prop_alpha.modeling.league_level import SEASON_START_MONTH, SeasonTotals, season_of, season_rates
 from prop_alpha.scanner.market_scanner import (
     MODEL_RISK_LOSS_FLOOR,
     AllocationReport,
@@ -96,7 +97,6 @@ DEFAULT_BOOKMAKERS: Final[tuple[str, ...]] = ("bet365", "skybet", "williamhill")
 ODDS_QUOTA_RESERVE: Final[int] = 20
 CATALOGUE_MAX_AGE: Final[timedelta] = timedelta(days=7)
 QuoteSource = Callable[[UpcomingFixture, Mapping[ProjectionKey, FactorProjection]], list[LiveOddsQuote]]
-RATE_LOOKBACK: Final[timedelta] = timedelta(days=365)
 BOARD_STATE_NAME: Final[str] = "fair_boards_sent.json"
 # Rows (player, market) per Telegram message, keeping each board message well under the 4,096-character limit.
 BOARD_ROWS_PER_MESSAGE: Final[int] = 25
@@ -131,25 +131,32 @@ HISTORY_SQL: Final[str] = """
     WHERE s.player_id = ANY(%s) AND f.kickoff_at < %s
     ORDER BY s.player_id, f.kickoff_at DESC
 """
-RATES_SQL: Final[str] = """
-    SELECT p.primary_position,
-           90.0 * sum(s.tackles_attempted) / sum(s.minutes_played),
-           90.0 * sum(s.fouls_committed) / sum(s.minutes_played)
+# Per position and kickoff, for the league level (modeling.league_level): totals from the current season and the
+# LEVEL_SEASONS - 1 before it, strictly before the fixture's kickoff.
+LEVEL_SQL: Final[str] = """
+    SELECT p.primary_position, f.kickoff_at,
+           sum(s.tackles_attempted), sum(s.fouls_committed), sum(s.minutes_played)
     FROM prop_alpha.player_match_stats s
     JOIN prop_alpha.players p USING (player_id)
     JOIN prop_alpha.fixtures f USING (fixture_id)
     JOIN prop_alpha.leagues l USING (league_id)
     WHERE l.name = %s AND f.kickoff_at < %s AND f.kickoff_at >= %s AND s.minutes_played > 0
-    GROUP BY p.primary_position
+    GROUP BY p.primary_position, f.kickoff_at
 """
+LEVEL_SEASONS: Final[int] = 3
 
 
 @dataclass(frozen=True)
 class SlateInputs:
+    """`league_rates`: (position, market) -> today's trailing league rate per 90. `season_levels`: (position,
+    market) -> {season start year -> trailing rate}, used to re-scale each player's history to today's level;
+    empty means no re-scaling."""
+
     squad: tuple[SquadPlayer, ...]
     history_by_player: Mapping[int, tuple[Appearance, ...]]
     team_recent_fixtures: Mapping[str, tuple[int, ...]]
     league_rates: Mapping[tuple[str, str], float]
+    season_levels: Mapping[tuple[str, str], Mapping[int, float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -219,12 +226,22 @@ def load_slate_inputs(cur: Any, fixture: UpcomingFixture) -> SlateInputs:
         if len(rows) < HISTORY_MATCHES + RECENT_TEAM_MATCHES:
             rows.append(Appearance(int(pid), int(fid), str(team), _utc(kicked_off), bool(started), float(minutes),
                                    int(tackles), int(fouls)))
-    cur.execute(RATES_SQL, (fixture.league, kickoff, kickoff - RATE_LOOKBACK))
-    rates: dict[tuple[str, str], float] = {}
-    for position, tackles_rate, fouls_rate in cur.fetchall():
-        rates[(str(position), "tackles")] = float(tackles_rate)
-        rates[(str(position), "fouls")] = float(fouls_rate)
-    return SlateInputs(tuple(squad), {k: tuple(v) for k, v in history.items()}, recent, rates)
+    season_now = season_of(kickoff)
+    cur.execute(LEVEL_SQL, (fixture.league, kickoff,
+                            datetime(season_now - LEVEL_SEASONS + 1, SEASON_START_MONTH, 1, tzinfo=timezone.utc)))
+    totals: dict[tuple[str, str], dict[int, list[float]]] = {}
+    for position, kicked_off, tackles, fouls, minutes in cur.fetchall():
+        season = season_of(_utc(kicked_off))
+        for market, count in (("tackles", tackles), ("fouls", fouls)):
+            running = totals.setdefault((str(position), market), {}).setdefault(season, [0.0, 0.0])
+            running[0] += float(count)
+            running[1] += float(minutes)
+    for by_season in totals.values():
+        by_season.setdefault(season_now, [0.0, 0.0])  # no match yet this season: last season's level
+    levels = {key: season_rates({season: SeasonTotals(c, m) for season, (c, m) in by_season.items()})
+              for key, by_season in totals.items()}
+    rates = {key: by_season[season_now] for key, by_season in levels.items() if season_now in by_season}
+    return SlateInputs(tuple(squad), {k: tuple(v) for k, v in history.items()}, recent, rates, levels)
 
 
 def scan_fixture(
@@ -234,7 +251,8 @@ def scan_fixture(
     """Projections, quotes and the allocation for one fixture; a pricing failure is recorded and skipped."""
     try:
         projections, skipped = build_projections(
-            fixture, inputs.squad, inputs.history_by_player, inputs.team_recent_fixtures, inputs.league_rates, engine
+            fixture, inputs.squad, inputs.history_by_player, inputs.team_recent_fixtures, inputs.league_rates, engine,
+            season_levels=inputs.season_levels or None,
         )
         quotes = quotes_for(fixture, projections)
         report = manager.allocate(projections, quotes, now=now, exposure=exposure)

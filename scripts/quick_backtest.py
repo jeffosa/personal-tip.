@@ -17,10 +17,12 @@ Writes the full results to .prop_alpha_state/quick_backtest_<date>.json.
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
 import sys
+from bisect import bisect_left
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +37,7 @@ from prop_alpha.alerts.status import DEFAULT_DSN, DSN_ENV  # noqa: E402
 from prop_alpha.calibration.fitting import fit_game_state_dispersion  # noqa: E402
 from prop_alpha.evaluation.backtest import (  # noqa: E402
     BacktestFailure,
+    LevelSource,
     PlayerMatchObservation,
     brier_score,
     calibration_table,
@@ -42,6 +45,7 @@ from prop_alpha.evaluation.backtest import (  # noqa: E402
     walk_forward_over_probability,
 )
 from prop_alpha.modeling.engine import QuantEngine  # noqa: E402
+from prop_alpha.modeling.league_level import SeasonTotals, season_of, season_rates  # noqa: E402
 
 SEASON_SPLIT: Final[datetime] = datetime(2026, 7, 1, tzinfo=timezone.utc)
 LINES: Final[dict[str, tuple[float, ...]]] = {"tackles": (0.5, 1.5, 2.5), "fouls": (0.5, 1.5)}
@@ -90,6 +94,37 @@ def positional_rates(rows: Sequence[tuple[Any, ...]], market: str) -> dict[str, 
             counts[row[7]] += int(row[index])
             minutes[row[7]] += float(row[4])
     return {pos: 90.0 * counts[pos] / minutes[pos] for pos in minutes if minutes[pos] > 0.0}
+
+
+def level_source(rows: Sequence[tuple[Any, ...]], market: str, position: str) -> LevelSource:
+    """Season start year -> trailing rate per 90 for `position` (both leagues pooled), from matches strictly
+    before the given kickoff. Cached per kickoff: many players share one."""
+    index = 5 if market == "tackles" else 6
+    by_season: dict[int, list[tuple[datetime, float, int]]] = defaultdict(list)
+    for r in rows:
+        if r[7] == position and float(r[4]) > 0.0:
+            kickoff = r[2].astimezone(timezone.utc)
+            by_season[season_of(kickoff)].append((kickoff, float(r[4]), int(r[index])))
+    cumulative: dict[int, tuple[list[datetime], np.ndarray, np.ndarray]] = {}
+    for season, samples in by_season.items():
+        samples.sort()
+        cumulative[season] = ([s[0] for s in samples], np.cumsum([s[1] for s in samples]),
+                              np.cumsum([s[2] for s in samples]))
+    cache: dict[datetime, dict[int, float]] = {}
+
+    def source(as_of: datetime) -> dict[int, float]:
+        if as_of not in cache:
+            totals = {}
+            for season, (times, minutes, counts) in cumulative.items():
+                i = bisect_left(times, as_of)
+                if i:
+                    totals[season] = SeasonTotals(float(counts[i - 1]), float(minutes[i - 1]))
+            # No match yet this season: last season's level (as the live scan does).
+            totals.setdefault(season_of(as_of), SeasonTotals(0.0, 0.0))
+            cache[as_of] = season_rates(totals)
+        return cache[as_of]
+
+    return source
 
 
 def fit_k(observations: Sequence[PlayerMatchObservation], rate: dict[int, float]) -> float:
@@ -160,11 +195,16 @@ def clustered_interval(
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--level", action="store_true",
+                        help="trailing league level and level-scaled history (modeling.league_level)")
+    args = parser.parse_args()
     rows = load_rows()
     rng = np.random.default_rng(SEED)
     excluded_positions = sorted({r[7] for r in rows if r[7] not in OUTFIELD})
-    results: dict[str, Any] = {"run_at": datetime.now(timezone.utc).isoformat(), "seed": SEED,
+    results: dict[str, Any] = {"run_at": datetime.now(timezone.utc).isoformat(), "seed": SEED, "level": args.level,
                                "excluded_positions": excluded_positions, "markets": {}}
+    print(f"league level: {'trailing, history scaled' if args.level else 'fixed 2025/26 positional rates'}")
     print(f"rows {len(rows)}; positions excluded from scoring: {excluded_positions}")
     for market, lines in LINES.items():
         index = 5 if market == "tackles" else 6
@@ -194,9 +234,11 @@ def main() -> int:
         for label, k in (("fitted" if fitted is not None else "no-overdispersion", fitted or NO_OVERDISPERSION_K),
                          ("scan k=6", SCAN_K)):
             print(f" k = {k:g} ({label})")
+            levels = {pos: level_source(rows, market, pos) for pos in obs_by_position} if args.level else None
             results["markets"][market]["runs"][label] = score_market(
-                market, lines, k, obs_by_position, rates, started_of, all_obs, history_by_player, rng)
-    out = ROOT / ".prop_alpha_state" / f"quick_backtest_{datetime.now(timezone.utc):%Y-%m-%d}.json"
+                market, lines, k, obs_by_position, rates, started_of, all_obs, history_by_player, rng, levels)
+    suffix = "_level" if args.level else ""
+    out = ROOT / ".prop_alpha_state" / f"quick_backtest_{datetime.now(timezone.utc):%Y-%m-%d}{suffix}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(results, indent=1, default=float), encoding="utf-8")
     print(f"\nfull results: {out}")
@@ -207,6 +249,7 @@ def score_market(
     market: str, lines: Sequence[float], k: float, obs_by_position: dict[str, list[PlayerMatchObservation]],
     rates: dict[str, float], started_of: dict[tuple[int, int], bool], all_obs: Sequence[PlayerMatchObservation],
     history_by_player: dict[int, list[PlayerMatchObservation]], rng: np.random.Generator,
+    levels: dict[str, LevelSource] | None = None,
 ) -> dict[str, Any]:
     engine = QuantEngine(game_state_k=k)
     scores: dict[str, Any] = {}
@@ -215,8 +258,9 @@ def score_market(
             failures: list[BacktestFailure] = []
             predictions = []
             for position, group in obs_by_position.items():
-                predictions += walk_forward_over_probability(group, line, rates[position], engine, market,
-                                                             PRIOR_STRENGTH_90S, failures=failures)
+                predictions += walk_forward_over_probability(
+                    group, line, rates[position], engine, market, PRIOR_STRENGTH_90S, failures=failures,
+                    level=None if levels is None else levels[position])
             scored = [pr for pr in predictions if pr.kickoff_at >= SEASON_SPLIT and started_of[(pr.player_id, pr.fixture_id)]
                       and pr.n_history >= MIN_PRIOR_APPEARANCES]
             target_of = {(o.player_id, o.fixture_id): o for o in all_obs}
