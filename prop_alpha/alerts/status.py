@@ -1,7 +1,7 @@
 """Periodic Telegram status report (scheduled every 4 hours). Sends text only; it never places a bet.
 
-Reads the database (one short read-only transaction), the sent-alert state file and the clock, and calls no
-vendor API, so it spends no data quota. A database that cannot be reached is reported in the message
+Reads the database (one short read-only transaction), the sent-alert and placed-bet state files and the clock,
+and calls no vendor API, so it spends no data quota. Open bets older than ledger.STALE_AFTER are flagged. A database that cannot be reached is reported in the message
 (sanctioned handler H8) rather than silencing the report.
 
     python -m prop_alpha.alerts.status            # print the report
@@ -16,15 +16,19 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Final
+from typing import Final, Sequence
 
+from prop_alpha.alerts.fx import MAX_RATE_AGE, ExchangeRate, cached_rate, is_fresh
+from prop_alpha.alerts.ledger import STALE_AFTER, PlacedBetStore, results_summary
 from prop_alpha.alerts.telegram import PAPER_LABEL, SentAlertStore, TelegramNotifier, load_config
+from prop_alpha.config import DEFAULT_DSN, DSN_ENV
 
 logger = logging.getLogger("prop_alpha.status")
 
-DSN_ENV: Final[str] = "PROP_ALPHA_DB_DSN"
-# The working database. prop_alpha_ci is reset by every CI run, so the report never reads it by default.
-DEFAULT_DSN: Final[str] = "postgresql://postgres@localhost:5432/prop_alpha"
+STATUS_NOTE: Final[str] = (
+    "No PRD go-live gate passed. Bets are settled from Sportmonks under assumed market rules; closing-line capture "
+    "and the database bet ledger are not built."
+)
 REPORT_INTERVAL: Final[timedelta] = timedelta(hours=4)
 # Sportmonks plan seen on 2026-10-02: "Starter - Trialing until 2026-10-16".
 SPORTMONKS_TRIAL_ENDS: Final[date] = date(2026, 10, 16)
@@ -88,7 +92,32 @@ def database_section(dsn: str) -> list[str]:
     return lines
 
 
-def format_report(now: datetime, database_lines: list[str], alerts_in_window: int, open_exposure: float) -> str:
+def bet_section(bets: PlacedBetStore, now: datetime) -> list[str]:
+    """Open bets, the stale ones to settle by hand, and the settled results so far."""
+    open_bets = bets.open_bets(now)
+    lines = [f"Open bets: {len(open_bets)} (stake {sum(bet.stake for bet in open_bets):.2f})"]
+    stale = bets.stale_bets(now)
+    if stale:
+        lines.append(f"WARNING: {len(stale)} bet(s) open more than {STALE_AFTER.days} days "
+                     f"({', '.join(f'#{bet.bet_id}' for bet in stale)}): reply settled <bet id> won|lost|void")
+    settled = bets.settled_bets()
+    if settled:
+        lines.append(results_summary(settled))
+    return lines
+
+
+def fx_section(rate: ExchangeRate | None, now: datetime) -> list[str]:
+    """The cached book-currency rate, flagged when the scan would refuse it as too old."""
+    if rate is None:
+        return []
+    if is_fresh(rate, now.date()):
+        return [f"Exchange rate: {rate.describe()}"]
+    return [f"WARNING: exchange rate {rate.describe()} is older than {MAX_RATE_AGE.days} days; scans refuse to run "
+            "until python -m prop_alpha.alerts.fx --refresh succeeds"]
+
+
+def format_report(now: datetime, database_lines: list[str], alerts_in_window: int, open_exposure: float,
+                  bet_lines: Sequence[str] = ()) -> str:
     days_left = (SPORTMONKS_TRIAL_ENDS - now.date()).days
     trial = (
         f"Sportmonks trial: {days_left} days left (ends {SPORTMONKS_TRIAL_ENDS:%d %b})" if days_left > 0
@@ -99,15 +128,18 @@ def format_report(now: datetime, database_lines: list[str], alerts_in_window: in
         *database_lines,
         f"Alerts in the last {int(REPORT_INTERVAL.total_seconds() // 3600)}h: {alerts_in_window}; "
         f"open alerted exposure: {open_exposure:.2f}",
+        *bet_lines,
         trial,
-        "No PRD go-live gate passed. Odds poller, projection refresh and bet ledger not built.",
+        STATUS_NOTE,
         PAPER_LABEL,
     ])
 
 
-def build_report(now: datetime, dsn: str, store: SentAlertStore) -> str:
+def build_report(now: datetime, dsn: str, store: SentAlertStore, bets: PlacedBetStore | None = None,
+                 rate: ExchangeRate | None = None) -> str:
     alerts = [alert for alert in store.load() if alert.sent_at > now - REPORT_INTERVAL]
-    return format_report(now, database_section(dsn), len(alerts), store.exposure(now).total)
+    return format_report(now, database_section(dsn), len(alerts), store.exposure(now).total,
+                         [*(bet_section(bets, now) if bets is not None else ()), *fx_section(rate, now)])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -115,7 +147,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Send the prop_alpha status report to Telegram.")
     parser.add_argument("--send", action="store_true", help="send the report (default: print only)")
     args = parser.parse_args(argv)
-    report = build_report(datetime.now(timezone.utc), os.environ.get(DSN_ENV, DEFAULT_DSN), SentAlertStore())
+    report = build_report(datetime.now(timezone.utc), os.environ.get(DSN_ENV, DEFAULT_DSN), SentAlertStore(),
+                          PlacedBetStore(), cached_rate())
     print(report)
     if args.send:
         message_id = TelegramNotifier(load_config()).send_message(report)

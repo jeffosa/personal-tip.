@@ -51,7 +51,7 @@ SCAN_GAME_STATE_K: Final[float] = 6.0
 SCAN_GAME_STATE_K_BY_MARKET: Final[Mapping[str, float]] = MappingProxyType({"tackles": 6.0, "fouls": 1000.0})
 # Level recalibration of the predictive rate, per market (scripts/recalibrate.py, 2026-10-04): actual over predicted
 # counts for 12,320 starts in the tune window (2026-01-01 to 2026-09-12). Tackles 17,183 / 18,120 = 0.9483: on the
-# untouched test window it moved the mean over-probability to actual (O0.5 69.0% -> 67.4% v 66.7%, O1.5 38.9% ->
+# selection window (2026-09-12 to 2026-10-04; it chose between settings, so it is not a holdout) it moved the mean over-probability to actual (O0.5 69.0% -> 67.4% v 66.7%, O1.5 38.9% ->
 # 36.9% v 36.5%) and raised skill on every line. Fouls' fitted 0.9354 made the test worse (O1.5 29.5% -> 27.1% v
 # 29.4%): the league level already corrects fouls, so fouls stay at 1.
 SCAN_RATE_MULTIPLIER_BY_MARKET: Final[Mapping[str, float]] = MappingProxyType({"tackles": 0.9483, "fouls": 1.0})
@@ -386,7 +386,7 @@ def quotes_from_prices(
     """Pair Over and Under of each bookmaker's player line into LiveOddsQuotes on our fixture and player ids.
 
     The quote's max_stake is the smaller published limit of its sides, or UNKNOWN_LIMIT_STAKE when none is
-    published. captured_at is when the odds were fetched, not when the price last changed.
+    published (limit_published=False, so the alert says it is assumed). captured_at is when the odds were fetched, not when the price last changed.
     """
     _require_utc(captured_at, "captured_at")
     sides: dict[tuple[int, int, str, float, str], dict[str, PropPrice]] = {}
@@ -421,6 +421,7 @@ def quotes_from_prices(
             sportsbook=bookmaker,
             captured_at=captured_at,
             void_rule=VoidRule.VOID_IF_NO_APPEARANCE,
+            limit_published=bool(limits),
         ))
     return OddsCoverage(tuple(quotes), len(prices), matched, tuple(sorted(unmatched_fixtures)),
                         tuple(sorted(unmatched_players)))

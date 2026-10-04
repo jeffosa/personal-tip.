@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Final, Mapping
 
 DEFAULT_ENV_FILE: Final[Path] = Path(__file__).resolve().parents[1] / ".env"
+DSN_ENV: Final[str] = "PROP_ALPHA_DB_DSN"
+# The working database. prop_alpha_ci is reset by every CI run, so the alerts, ledger and status never read it by
+# default.
+DEFAULT_DSN: Final[str] = "postgresql://postgres@localhost:5432/prop_alpha"
 
 
 def parse_env_file(text: str) -> dict[str, str]:

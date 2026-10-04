@@ -23,6 +23,7 @@ from prop_alpha.alerts.telegram import (
     _reference_manager,
     alert_key,
     demo_case,
+    format_digest,
     format_directive,
     load_config,
     parse_env_file,
@@ -272,6 +273,29 @@ def test_alert_text_shows_the_price_floor_and_expiry() -> None:
     assert directive.min_acceptable_odds <= directive.decimal_odds
 
 
+def test_a_stake_capped_by_an_assumed_limit_says_so_in_pounds() -> None:
+    """Audit 2026-10-04: a quote with no published limit is capped at UNKNOWN_LIMIT_STAKE, which the alert must
+    call an assumption, in the bankroll's currency."""
+    projections, report = demo_case(NOW)
+    directive = next(d for d in report.directives if d.line_value == 4.5)
+    assessment = assess_high_value(directive, projections[(1001, 55, "tackles")], DEFAULT_CRITERIA,
+                                   np.random.default_rng(1))
+    assert directive.limit_published
+    assumed = replace(directive, limit_published=False)
+    for published, text in ((directive, format_directive(directive, assessment, "GBP")),
+                            (assumed, format_directive(assumed, assessment, "GBP")),
+                            (directive, format_digest([(directive, assessment, None)], 1, 1, 1, 1, "", "GBP")),
+                            (assumed, format_digest([(assumed, assessment, None)], 1, 1, 1, 1, "", "GBP"))):
+        assert f"GBP {published.stake:.2f}" in text
+        assert ("book limit not published, assumed GBP 50" in text) is (not published.limit_published)
+
+
+def test_quote_limit_flag_must_be_a_bool() -> None:
+    with pytest.raises(ValueError, match="limit_published"):
+        LiveOddsQuote(1, 2, "tackles", 1.5, 2.0, 1.8, 50.0, "bet365", NOW, VoidRule.VOID_IF_NO_APPEARANCE,
+                      limit_published=0)  # type: ignore[arg-type]
+
+
 def test_telegram_rejection_raises_without_the_token() -> None:
     notifier, _ = _notifier(FakeResponse(401, {"ok": False, "error_code": 401, "description": "Unauthorized"}))
     with pytest.raises(TelegramError, match="Unauthorized") as caught:
@@ -344,3 +368,10 @@ def test_digest_rejects_an_empty_page_size(tmp_path: Path) -> None:
     notifier, _, _ = _digest_notifier(1, tmp_path)
     with pytest.raises(ValueError):
         notifier.notify_digest(AllocationReport(), {}, per_message=0)
+
+
+def test_env_template_holds_no_credentials() -> None:
+    """2026-10-04: real keys were found pasted into the tracked .env.example. Credentials belong in .env only."""
+    template = parse_env_file((Path(__file__).resolve().parents[1] / ".env.example").read_text(encoding="utf-8"))
+    secret_names = [key for key in template if key.endswith(("_KEY", "_TOKEN", "_SECRET", "_PASSWORD"))]
+    assert secret_names and {key: template[key] for key in secret_names if template[key]} == {}

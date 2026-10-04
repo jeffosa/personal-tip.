@@ -101,8 +101,10 @@ def test_quotes_pair_sides_and_take_the_smaller_limit() -> None:
     by_player = {(q.player_id, q.market_type): q for q in coverage.quotes}
     tackles = by_player[(1, "tackles")]
     assert (tackles.over_price, tackles.under_price, tackles.max_stake) == (2.4, 1.55, 100.0)
+    assert tackles.limit_published
     fouls = by_player[(3, "fouls")]
     assert (fouls.over_price, fouls.under_price, fouls.max_stake) == (1.9, None, oddspapi.UNKNOWN_LIMIT_STAKE)
+    assert not fouls.limit_published
     assert all(q.sportsbook == "bet365" and q.captured_at == NOW for q in coverage.quotes)
     assert coverage.matched_prices == 3 and len(coverage.unmatched_players) == 1
 
@@ -115,11 +117,11 @@ class FakeOddsClient:
         self.paths: list[str] = []
         self.requests_sent = 0
 
-    def get_json_value(self, path: str, empty_on: frozenset[int] = frozenset()) -> Any:
+    def get_json_value(self, path: str, empty_on: frozenset[int] = frozenset(), empty_marker: str = "") -> Any:
         self.paths.append(path)
         self.requests_sent += 1
         if "bookmaker=skybet" in path:
-            assert 400 in empty_on
+            assert empty_on == oddspapi.NO_FIXTURES_STATUS and empty_marker == oddspapi.NO_FIXTURES_MESSAGE
             return None
         if path == oddspapi.ACCOUNT_PATH:
             return self.account
@@ -165,10 +167,39 @@ def test_vendor_400_can_mean_no_data_and_errors_carry_the_scrubbed_body() -> Non
             return response
 
     client._local.session = BadRequest()
-    assert client.get_json_value("odds", empty_on=frozenset({400})) is None
+    assert client.get_json_value("odds", empty_on=frozenset({400}), empty_marker="no fixtures") is None
     with pytest.raises(requests.HTTPError) as caught:
         client.get_json_value("odds")
     assert "no fixtures" in str(caught.value) and secret not in str(caught.value)
+
+
+def test_only_the_known_no_fixtures_400_counts_as_empty() -> None:
+    client = VendorClient("https://api.oddspapi.io/v4", "k" * 36, TokenBucketRateLimiter(100.0, 10), max_retries=0,
+                          auth_query_param="apiKey")
+    bodies = {
+        "empty": '{"error": {"message": "Invalid bookmaker specified.", "code": "INVALID_PARAMETER", "details": '
+                 '"The bookmaker skybet is not supported or does not have any fixtures available."}}',
+        "malformed": '{"error": {"message": "Invalid tournamentIds.", "code": "INVALID_PARAMETER"}}',
+    }
+
+    class Reply:
+        def __init__(self, body: str) -> None:
+            self.body = body
+
+        def get(self, url: str, timeout: float, params: dict[str, str] | None = None) -> requests.Response:
+            response = requests.Response()
+            response.status_code = 400
+            response._content = self.body.encode()
+            return response
+
+    def fetch(kind: str) -> Any:
+        client._local.session = Reply(bodies[kind])
+        return client.get_json_value("odds", empty_on=oddspapi.NO_FIXTURES_STATUS,
+                                     empty_marker=oddspapi.NO_FIXTURES_MESSAGE)
+
+    assert fetch("empty") is None
+    with pytest.raises(requests.HTTPError, match="Invalid tournamentIds"):
+        fetch("malformed")
 
 
 def test_collect_odds_keeps_the_quota_reserve(tmp_path: Path) -> None:

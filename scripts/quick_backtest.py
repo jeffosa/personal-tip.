@@ -33,7 +33,7 @@ from scipy.stats import poisson
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from prop_alpha.alerts.status import DEFAULT_DSN, DSN_ENV  # noqa: E402
+from prop_alpha.config import DEFAULT_DSN, DSN_ENV  # noqa: E402
 from prop_alpha.calibration.fitting import fit_game_state_dispersion  # noqa: E402
 from prop_alpha.evaluation.backtest import (  # noqa: E402
     BacktestFailure,

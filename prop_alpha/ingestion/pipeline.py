@@ -287,9 +287,11 @@ class VendorClient:
         """A response body for an error message: at most 300 characters, never the key."""
         return text[:300].replace(self.api_key, "<key>") if self.api_key else text[:300]
 
-    def get_json_value(self, path: str, empty_on: frozenset[int] = frozenset()) -> Any:
+    def get_json_value(self, path: str, empty_on: frozenset[int] = frozenset(), empty_marker: str = "") -> Any:
         """Any JSON value (object or list) from `path`; retries, quota and error rules as get_json. A status in
-        `empty_on` returns None: for OddsPapi, HTTP 400 and 404 are also how "this bookmaker has no fixtures here" is reported."""
+        `empty_on` whose body contains `empty_marker` returns None: OddsPapi reports "this bookmaker has no fixtures
+        here" as HTTP 400 with a fixed message. Any other body with that status raises, so a malformed query or a
+        changed API is not mistaken for "no fixtures"."""
         url = f"{self.base_url}/{path.lstrip('/')}"
         failure = "no attempt made"
         for attempt in range(self.max_retries + 1):
@@ -298,7 +300,7 @@ class VendorClient:
             resp = self._get(url)
             self._record_remaining_quota(resp.headers)
             if resp.status_code not in RETRYABLE_HTTP_STATUS:
-                if resp.status_code in empty_on:
+                if resp.status_code in empty_on and empty_marker in resp.text:
                     logger.info("%s: HTTP %d treated as no data: %s", path, resp.status_code, self._scrub(resp.text))
                     return None
                 if resp.status_code >= 400:

@@ -24,7 +24,7 @@ from typing import Any, Final
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from prop_alpha.alerts.status import DEFAULT_DSN, DSN_ENV  # noqa: E402
+from prop_alpha.config import DEFAULT_DSN, DSN_ENV  # noqa: E402
 from prop_alpha.ingestion import sportmonks  # noqa: E402
 from prop_alpha.ingestion.pipeline import build_vendor_client  # noqa: E402
 from prop_alpha.ingestion.transform import parse_fixture_payload  # noqa: E402

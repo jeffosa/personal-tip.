@@ -47,8 +47,10 @@ from typing import Any, Callable, Final, Mapping, Sequence
 import numpy as np
 import requests
 
+from prop_alpha.alerts.fx import BOOK_CURRENCY, ExchangeRate
 from prop_alpha.alerts.replies import USAGE, AlertItem
 from prop_alpha.config import DEFAULT_ENV_FILE, parse_env_file
+from prop_alpha.ingestion.oddspapi import UNKNOWN_LIMIT_STAKE
 from prop_alpha.modeling.engine import FactorProjection, LineupExpectation, QuantEngine, RefereeProfile, VoidRule
 from prop_alpha.scanner.market_scanner import (
     MODEL_RISK_LOSS_FLOOR,
@@ -284,6 +286,24 @@ class AlertContext:
     player: str
 
 
+def limit_note(book_rate: ExchangeRate | None = None) -> str:
+    """Said on a stake whose quote had no published limit: the cap is an assumption, not the book's. The assumed
+    limit is in the books' currency; with a conversion, its bankroll-currency value is added."""
+    note = f"book limit not published, assumed {BOOK_CURRENCY} {UNKNOWN_LIMIT_STAKE:g}"
+    if book_rate is not None and not book_rate.identity:
+        note += f" = {book_rate.quote} {book_rate.convert(UNKNOWN_LIMIT_STAKE):.2f}"
+    return note
+
+
+def stake_text(stake: float, currency: str, book_rate: ExchangeRate | None = None) -> str:
+    """The stake in the bankroll currency and, when the books use another, in theirs at the rate used."""
+    text = f"{currency}{stake:.2f}"
+    if book_rate is not None and not book_rate.identity:
+        text += (f" (= {book_rate.base} {stake / book_rate.rate:.2f} at {book_rate.rate:.4f}, "
+                 f"{book_rate.source} {book_rate.as_of:%d %b})")
+    return text
+
+
 def format_digest(
     entries: Sequence[tuple[StakingDirective, HighValueAssessment, AlertContext | None]],
     first_number: int,
@@ -292,6 +312,7 @@ def format_digest(
     parts: int,
     label: str = "",
     bankroll_currency: str = "",
+    book_rate: ExchangeRate | None = None,
 ) -> str:
     """One plain-text message listing several high-value bets, numbered from `first_number` of `total`."""
     currency = f"{bankroll_currency} " if bankroll_currency else ""
@@ -312,7 +333,8 @@ def format_digest(
             f"   Edge: {assessment.ev_per_unit:+.1%} expected profit | model {assessment.model_win_probability:.0%} "
             f"v book {assessment.book_win_probability:.0%} | held in {assessment.survival_rate:.0%} of "
             f"{assessment.n_simulations:,} simulations",
-            f"   Stake: {currency}{directive.stake:.2f} ({directive.fraction:.1%} of bankroll)",
+            f"   Stake: {stake_text(directive.stake, currency, book_rate)} ({directive.fraction:.1%} of bankroll)"
+            + ("" if directive.limit_published else f" | {limit_note(book_rate)}"),
         ]
     lines += ["", USAGE]
     return "\n".join(lines)
@@ -324,6 +346,7 @@ def format_directive(
     bankroll_currency: str = "",
     label: str = "",
     context: AlertContext | None = None,
+    book_rate: ExchangeRate | None = None,
 ) -> str:
     """Plain-text alert (no parse_mode, so nothing needs escaping). `label` (e.g. MOCK ODDS) heads the message;
     `context` (match and player names) replaces the bare ids."""
@@ -342,7 +365,8 @@ def format_directive(
         f"Expected profit {assessment.ev_per_unit:+.2%} per 1 staked",
         f"Edge held in {assessment.surviving_simulations} of {assessment.n_simulations} simulated match "
         f"conditions ({assessment.survival_rate:.1%})",
-        f"Suggested stake {currency}{directive.stake:.2f} ({directive.fraction:.3%} of bankroll)",
+        f"Suggested stake {stake_text(directive.stake, currency, book_rate)} ({directive.fraction:.3%} of bankroll)",
+        *(() if directive.limit_published else (limit_note(book_rate),)),
     ))
 
 
@@ -446,6 +470,7 @@ class TelegramNotifier:
         label: str = "",
         descriptions: Mapping[ProjectionKey, AlertContext] | None = None,
         max_alerts: int | None = None,
+        book_rate: ExchangeRate | None = None,
     ) -> list[int]:
         """Send each directive in report.directives whose market/line/side/book has not been alerted yet
         and that passes the high-value screen.
@@ -461,7 +486,7 @@ class TelegramNotifier:
         message_ids: list[int] = []
         for directive, assessment in self._high_value(report, projections, criteria, max_alerts):
             context = (descriptions or {}).get((directive.fixture_id, directive.player_id, directive.market_type))
-            text = format_directive(directive, assessment, bankroll_currency, label, context)
+            text = format_directive(directive, assessment, bankroll_currency, label, context, book_rate)
             self._record(directive)
             message_ids.append(self.send_message(text))
             logger.info("alert sent for %s", alert_key(directive))
@@ -477,6 +502,7 @@ class TelegramNotifier:
         descriptions: Mapping[ProjectionKey, AlertContext] | None = None,
         max_alerts: int | None = None,
         per_message: int = DIGEST_SIZE,
+        book_rate: ExchangeRate | None = None,
     ) -> tuple[int, list[int]]:
         """As notify, but the high-value bets go out as numbered lists of at most `per_message` per message
         (10 bets: two messages of 5), in report order. Returns (bets alerted, message ids). Every bet of a
@@ -491,7 +517,8 @@ class TelegramNotifier:
             entries = [
                 (d, a, (descriptions or {}).get((d.fixture_id, d.player_id, d.market_type))) for d, a in chunk
             ]
-            text = format_digest(entries, part * per_message + 1, len(passing), part + 1, parts, label, bankroll_currency)
+            text = format_digest(entries, part * per_message + 1, len(passing), part + 1, parts, label, bankroll_currency,
+                                 book_rate)
             for directive, _ in chunk:
                 self._record(directive)
             message_id = self.send_message(text)

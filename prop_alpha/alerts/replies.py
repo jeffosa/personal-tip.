@@ -5,10 +5,16 @@ The maintainer places every bet by hand, then replies to the alert or fair-price
     placed 3 @1.95 5                  bet 3 of that message at decimal odds 1.95, stake 5
     placed 2 under @2.10 10 skybet    board rows list both sides, so the side is required there; the book is optional
     undo 12                           cancel recorded bet 12
+    settled 12 lost                   record bet 12's result (won, lost or void); overrides an automatic result
 
 `resolve_bet` checks the reply against the numbered items of the message it answers and returns a PlacedBet, or a
 ReplyError whose message is sent back to the chat. Odds below the item's minimum are recorded (the bet happened)
 and flagged in the confirmation.
+
+`grade` settles a bet from the stored match statistics (automatic settlement, run by `ledger --settle`). The
+statistic and void rule are the assumed market contract of ingestion/oddspapi.py (tackles = TACKLES, fouls =
+FOULS, void if the player does not play), not yet checked against a bookmaker's settlement: every automatic
+result says so, and a `settled` reply overrides it.
 """
 
 from __future__ import annotations
@@ -21,14 +27,22 @@ from typing import Final, Mapping
 
 PLACED_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^\s*placed\s+#?(?P<number>\d{1,3})\s*(?P<side>over|under|o|u)?\s*@\s*(?P<odds>\d{1,4}(?:\.\d{1,3})?)\s+"
-    r"[£$€]?\s*(?P<stake>\d{1,7}(?:\.\d{1,2})?)\s*(?P<book>[A-Za-z0-9][A-Za-z0-9 ._-]{0,39})?\s*$",
+    r"(?P<symbol>[£$€])?\s*(?P<stake>\d{1,7}(?:\.\d{1,2})?)\s*(?P<book>[A-Za-z0-9][A-Za-z0-9 ._-]{0,39})?\s*$",
     re.IGNORECASE,
 )
 UNDO_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\s*undo\s+#?(?P<bet_id>\d{1,7})\s*$", re.IGNORECASE)
+SETTLE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^\s*settled?\s+#?(?P<bet_id>\d{1,7})\s+(?P<result>won|win|lost|lose|void)\s*$", re.IGNORECASE
+)
 USAGE: Final[str] = (
     "To record a bet, reply to the alert or board message with: placed <number> [over|under] @<odds> <stake> [book]"
-    " - e.g. placed 3 @1.95 5. To cancel one: undo <bet id>."
+    " - e.g. placed 3 @1.95 5. To cancel one: undo <bet id>. To record a result: settled <bet id> won|lost|void."
 )
+RESULTS: Final[tuple[str, ...]] = ("won", "lost", "void")
+SETTLEMENT_SOURCES: Final[frozenset[str]] = frozenset({"auto", "manual"})
+# The stored count each market settles on (ingestion/oddspapi.py market contract, assumed until checked).
+SETTLEMENT_COLUMNS: Final[Mapping[str, str]] = {"tackles": "tackles_attempted", "fouls": "fouls_committed"}
+AUTO_BASIS: Final[str] = "Sportmonks stats, assumed market rules (not yet checked against the bookmaker)"
 UNKNOWN_BOOK: Final[str] = "unknown"
 ITEM_KINDS: Final[frozenset[str]] = frozenset({"alert", "board"})
 SIDES: Final[tuple[str, ...]] = ("over", "under")
@@ -80,11 +94,15 @@ class AlertItem:
 
 @dataclass(frozen=True)
 class PlaceCommand:
+    """`stake_symbol` is the currency sign typed before the stake (£, $ or €), or None: then the stake is in the
+    bankroll currency. The ledger converts a book-currency stake (£ with a USD bankroll) at the cached rate."""
+
     number: int
     side: str | None
     odds: float
     stake: float
     book: str | None
+    stake_symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -93,12 +111,18 @@ class UndoCommand:
 
 
 @dataclass(frozen=True)
+class SettleCommand:
+    bet_id: int
+    result: str
+
+
+@dataclass(frozen=True)
 class ReplyError:
     message: str
 
 
-def parse_reply(text: str) -> PlaceCommand | UndoCommand | ReplyError:
-    """A `placed` or `undo` command, or a ReplyError explaining the expected form."""
+def parse_reply(text: str) -> PlaceCommand | UndoCommand | SettleCommand | ReplyError:
+    """A `placed`, `undo` or `settled` command, or a ReplyError explaining the expected form."""
     placed = PLACED_PATTERN.match(text)
     if placed is not None:
         side = placed.group("side")
@@ -111,11 +135,15 @@ def parse_reply(text: str) -> PlaceCommand | UndoCommand | ReplyError:
         return PlaceCommand(
             int(placed.group("number")),
             None if side is None else ("over" if side.lower().startswith("o") else "under"),
-            odds, stake, book,
+            odds, stake, book, placed.group("symbol"),
         )
     undo = UNDO_PATTERN.match(text)
     if undo is not None:
         return UndoCommand(int(undo.group("bet_id")))
+    settle = SETTLE_PATTERN.match(text)
+    if settle is not None:
+        word = settle.group("result").lower()
+        return SettleCommand(int(settle.group("bet_id")), {"win": "won", "lose": "lost"}.get(word, word))
     return ReplyError(f"Not understood. {USAGE}")
 
 
@@ -141,9 +169,14 @@ class PlacedBet:
     match: str
     player: str
     placed_at: datetime
+    # The stake as typed, when it was in the books' currency and `stake` is its bankroll-currency conversion.
+    entered_stake: float | None = None
+    entered_currency: str | None = None
 
     def __post_init__(self) -> None:
         _require_utc(self.placed_at, "placed_at")
+        if (self.entered_stake is None) != (self.entered_currency is None):
+            raise ValueError("entered_stake and entered_currency go together")
         if self.bet_id < 1 or self.kind not in ITEM_KINDS or self.side not in SIDES:
             raise ValueError("bet needs a positive id, a known kind and a side")
         if not self.market or not self.book or not _valid_line(self.line):
@@ -167,8 +200,11 @@ def resolve_bet(
     update_id: int,
     message_id: int,
     placed_at: datetime,
+    stake: float | None = None,
+    entered: tuple[float, str] | None = None,
 ) -> PlacedBet | ReplyError:
-    """The bet `command` describes on the message whose numbered items are `items`, or why it cannot be recorded."""
+    """The bet `command` describes on the message whose numbered items are `items`, or why it cannot be recorded.
+    `stake` replaces command.stake when the ledger converted it from `entered` (amount, currency)."""
     item = items.get(command.number)
     if item is None:
         listed = ", ".join(str(n) for n in sorted(items)) or "none"
@@ -187,15 +223,18 @@ def resolve_bet(
     return PlacedBet(
         bet_id=bet_id, update_id=update_id, message_id=message_id, number=item.number, kind=item.kind,
         fixture_id=item.fixture_id, player_id=item.player_id, market=item.market, line=item.line, side=side,
-        odds=command.odds, stake=command.stake, book=command.book or item.book or UNKNOWN_BOOK,
-        min_odds=sides[side], match=item.match, player=item.player, placed_at=placed_at,
+        odds=command.odds, stake=command.stake if stake is None else stake,
+        book=command.book or item.book or UNKNOWN_BOOK, min_odds=sides[side], match=item.match, player=item.player,
+        placed_at=placed_at, entered_stake=None if entered is None else entered[0],
+        entered_currency=None if entered is None else entered[1],
     )
 
 
 def confirmation(bet: PlacedBet) -> str:
     lines = [
         f"Recorded bet #{bet.bet_id}: {bet.player}, {bet.side.upper()} {bet.line:g} {bet.market} "
-        f"@ {bet.odds:.2f}, stake {bet.stake:g} ({bet.book})",
+        f"@ {bet.odds:.2f}, stake {bet.stake:g} ({bet.book})"
+        + ("" if bet.entered_stake is None else f" = {bet.entered_currency} {bet.entered_stake:g} as entered"),
         bet.match,
     ]
     if bet.below_minimum:
@@ -203,3 +242,67 @@ def confirmation(bet: PlacedBet) -> str:
                      "expects no edge.")
     lines.append(f"To cancel: undo {bet.bet_id}")
     return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class Settlement:
+    """The result of one recorded bet. `source` "auto" comes from the stored statistics (`grade`); "manual" from a
+    `settled` reply, which overrides any automatic result. `count` and `minutes` are the statistics an automatic
+    result used (None for a manual one); `update_id` is the Telegram update of a manual one."""
+
+    bet_id: int
+    result: str
+    source: str
+    detail: str
+    settled_at: datetime
+    count: int | None = None
+    minutes: int | None = None
+    update_id: int | None = None
+
+    def __post_init__(self) -> None:
+        _require_utc(self.settled_at, "settled_at")
+        if self.bet_id < 1 or self.result not in RESULTS or self.source not in SETTLEMENT_SOURCES:
+            raise ValueError("settlement needs a positive bet id, a known result and a known source")
+        if self.source == "manual" and self.update_id is None:
+            raise ValueError("a manual settlement carries the Telegram update that recorded it")
+        for name, value in (("count", self.count), ("minutes", self.minutes)):
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must not be negative")
+
+
+def profit(bet: PlacedBet, settlement: Settlement) -> float:
+    """Profit in stake units: won = stake x (odds - 1), lost = -stake, void (a push or no appearance) = 0."""
+    if settlement.bet_id != bet.bet_id:
+        raise ValueError("settlement is for another bet")
+    if settlement.result == "won":
+        return bet.stake * (bet.odds - 1.0)
+    return -bet.stake if settlement.result == "lost" else 0.0
+
+
+def grade(bet: PlacedBet, fixture_status: str, minutes: int | None, count: int | None,
+          settled_at: datetime) -> Settlement | None:
+    """The automatic result of `bet`, or None while it cannot be graded safely: the match is not final, or the
+    player has no stored row (Sportmonks may have listed him without an identity; settle it by hand). A player
+    with a row and 0 minutes did not play: void. A count equal to a whole line is a push: void."""
+    if bet.market not in SETTLEMENT_COLUMNS:
+        raise ValueError(f"no settlement statistic for market {bet.market!r}")
+    if fixture_status != "final" or minutes is None:
+        return None
+    if minutes == 0:
+        return Settlement(bet.bet_id, "void", "auto", f"did not play; {AUTO_BASIS}", settled_at, count, minutes)
+    if count is None:
+        raise ValueError(f"bet {bet.bet_id}: player played {minutes} minutes but has no {bet.market} count")
+    if count == bet.line:
+        result = "void"
+    else:
+        result = "won" if (count > bet.line) == (bet.side == "over") else "lost"
+    detail = f"{count} {bet.market} in {minutes} min v {bet.side} {bet.line:g}; {AUTO_BASIS}"
+    return Settlement(bet.bet_id, result, "auto", detail, settled_at, count, minutes)
+
+
+def settlement_text(bet: PlacedBet, settlement: Settlement) -> str:
+    """One line for the chat or the ledger listing."""
+    # Automatic results rest on assumed market rules until a bookmaker's settlement confirms them (audit 2026-10-04).
+    outcome = settlement.result.upper() + (" (provisional)" if settlement.source == "auto" else "")
+    return (f"#{bet.bet_id} {outcome} {profit(bet, settlement):+.2f}: {bet.player}, {bet.side.upper()} {bet.line:g} "
+            f"{bet.market} @ {bet.odds:.2f}, stake {bet.stake:g} ({bet.match}) - {settlement.detail}")

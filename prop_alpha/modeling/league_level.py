@@ -23,7 +23,7 @@ from typing import Final, Mapping, Sequence
 # Seasons start on 1 July (English and Italian leagues kick off in August).
 SEASON_START_MONTH: Final[int] = 7
 # Tuned on 2026-10-04 (scripts/tune_backtest.py): 30,000 beat 90,000 on the tune window (mean log loss 0.56152 v
-# 0.56158) and cut the worst calibration bin on 4 of 5 lines in the untouched test window (2026-09-12 on). With one
+# 0.56158) and cut the worst calibration bin on 4 of 5 lines in the selection window (2026-09-12 to 2026-10-04; used to choose, so not a holdout). With one
 # position in one league playing about 350,000 minutes a season, the current season carries half the weight after
 # under a tenth of its matches.
 SEASON_PRIOR_MINUTES: Final[float] = 30_000.0

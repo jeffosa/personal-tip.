@@ -10,6 +10,8 @@ import pytest
 psycopg2 = pytest.importorskip("psycopg2")
 
 from prop_alpha.alerts import status  # noqa: E402
+from prop_alpha.alerts.ledger import PlacedBetStore, process_updates  # noqa: E402
+from prop_alpha.alerts.replies import AlertItem, Settlement  # noqa: E402
 from prop_alpha.alerts.telegram import PAPER_LABEL, SentAlert, SentAlertStore  # noqa: E402
 
 NOW = datetime(2026, 10, 3, 8, 0, tzinfo=timezone.utc)
@@ -56,3 +58,34 @@ def test_trial_expiry_turns_into_a_warning() -> None:
 
 def test_default_database_is_never_the_ci_database() -> None:
     assert status.DEFAULT_DSN.endswith("/prop_alpha") and "_ci" not in status.DEFAULT_DSN
+
+
+def test_report_lists_open_and_stale_bets_and_settled_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(status, "read_snapshot", lambda dsn: SNAPSHOT)
+    item = AlertItem(1, "alert", 9001, 7, "tackles", 1.5, (("over", 1.9),), "Walsall v Port Vale", "A", "skybet")
+    bets = PlacedBetStore(tmp_path / "bets.jsonl")
+
+    def update(update_id: int, text: str) -> dict[str, object]:
+        return {"update_id": update_id, "message": {
+            "message_id": 900 + update_id, "chat": {"id": 4242}, "text": text,
+            "date": int((NOW - timedelta(days=9)).timestamp()), "reply_to_message": {"message_id": 500}}}
+
+    process_updates([update(1, "placed 1 @2.0 5"), update(2, "placed 1 @2.0 3")], "4242", {500: {1: item}}, bets, NOW)
+    bets.record_settlement(Settlement(2, "won", "auto", "test", NOW))
+    report = status.build_report(NOW, "postgresql://unused", SentAlertStore(tmp_path / "sent.jsonl"), bets)
+    assert "Open bets: 1 (stake 5.00)" in report
+    assert "WARNING: 1 bet(s) open more than 7 days (#1): reply settled <bet id> won|lost|void" in report
+    assert "1 settled bet(s) (1 won, 0 lost, 0 void): staked 3.00, profit +3.00" in report
+    assert status.STATUS_NOTE in report and "bet ledger not built" not in report.replace("database bet ledger", "")
+
+
+def test_report_shows_the_exchange_rate_and_flags_a_stale_one() -> None:
+    from datetime import date
+
+    from prop_alpha.alerts.fx import ExchangeRate
+
+    rate = ExchangeRate("GBP", "USD", 1.3201, date(2026, 10, 2))
+    assert status.fx_section(None, NOW) == []
+    assert status.fx_section(rate, NOW) == ["Exchange rate: GBP->USD 1.3201 (ECB 02 Oct)"]
+    [warning] = status.fx_section(rate, NOW + timedelta(days=6))
+    assert warning.startswith("WARNING: exchange rate") and "scans refuse to run" in warning

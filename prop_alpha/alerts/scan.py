@@ -30,7 +30,7 @@ import json
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Final, Mapping, Sequence
@@ -38,9 +38,10 @@ from typing import Any, Callable, Final, Mapping, Sequence
 import numpy as np
 import requests
 
+from prop_alpha.alerts.fx import BOOK_CURRENCY, SUPPORTED_CURRENCIES, ExchangeRate, bankroll_currency, book_to_bankroll
+from prop_alpha.alerts.fx import identity as fx_identity
 from prop_alpha.alerts.ledger import PlacedBetStore, combined_exposure
 from prop_alpha.alerts.replies import USAGE, AlertItem
-from prop_alpha.alerts.status import DEFAULT_DSN, DSN_ENV
 from prop_alpha.alerts.telegram import (
     DEFAULT_CRITERIA,
     PAPER_LABEL,
@@ -50,7 +51,7 @@ from prop_alpha.alerts.telegram import (
     TelegramNotifier,
     load_config,
 )
-from prop_alpha.config import DEFAULT_ENV_FILE
+from prop_alpha.config import DEFAULT_DSN, DEFAULT_ENV_FILE, DSN_ENV
 from prop_alpha.ingestion import oddspapi, sportmonks
 from prop_alpha.ingestion.pipeline import QuotaExhaustedError
 from prop_alpha.modeling.engine import FactorProjection, ProjectionError, QuantEngine
@@ -172,6 +173,7 @@ class ScanSummary:
     alerts_sent: int = 0
     boards_sent: int = 0
     alert_cap: int | None = None
+    bankroll: str = ""
     failures: list[str] = field(default_factory=list)
     odds_notes: list[str] = field(default_factory=list)
 
@@ -186,6 +188,7 @@ class ScanSummary:
             lines += [
                 f"Players priced: {self.players_priced}; quotes checked: {self.quotes}; "
                 f"stakes suggested: {self.directives}; high-value alerts sent: {self.alerts_sent}",
+                *((f"Bankroll: {self.bankroll}",) if self.bankroll else ()),
             ]
             if self.alert_cap is not None and self.alerts_sent >= self.alert_cap:
                 lines.append(f"Alert cap of {self.alert_cap} per run reached: the best by expected profit were sent")
@@ -197,19 +200,29 @@ class ScanSummary:
         return "\n".join(lines)
 
 
+def in_bankroll_currency(quotes: Sequence[LiveOddsQuote], book_rate: ExchangeRate) -> list[LiveOddsQuote]:
+    """Quotes with max_stake converted from the books' currency into the bankroll's, so the allocator clips a
+    bankroll-currency stake to a limit in the same currency."""
+    if book_rate.identity:
+        return list(quotes)
+    return [replace(quote, max_stake=book_rate.convert(quote.max_stake)) for quote in quotes]
+
+
 def _utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
 def fetch_upcoming(client: Any, start: datetime, end: datetime) -> list[UpcomingFixture]:
-    """Not-started SCAN_LEAGUES fixtures with kickoff in [start, end)."""
+    """Not-started SCAN_LEAGUES fixtures with kickoff in [start, end). Raises if the listing is longer than
+    MAX_LISTING_PAGES pages: a scan of part of the window would report normally while missing fixtures."""
     fixtures: list[UpcomingFixture] = []
     for page in range(1, MAX_LISTING_PAGES + 1):
         rows, has_more = sportmonks.upcoming_fixtures(client.get_json(sportmonks.upcoming_path(start, end, page)))
         fixtures += [UpcomingFixture(**row) for row in rows if start <= row["kickoff_at"] < end]
         if not has_more:
-            break
-    return sorted(fixtures, key=lambda f: (f.kickoff_at, f.fixture_id))
+            return sorted(fixtures, key=lambda f: (f.kickoff_at, f.fixture_id))
+    raise ValueError(f"fixture listing for {start:%Y-%m-%d %H:%M}-{end:%H:%M} UTC has more than {MAX_LISTING_PAGES} "
+                     "pages; scan refused rather than run on part of the window")
 
 
 def load_slate_inputs(cur: Any, fixture: UpcomingFixture) -> SlateInputs:
@@ -246,6 +259,25 @@ def load_slate_inputs(cur: Any, fixture: UpcomingFixture) -> SlateInputs:
     return SlateInputs(tuple(squad), {k: tuple(v) for k, v in history.items()}, recent, rates, levels)
 
 
+def scan_engines() -> tuple[QuantEngine, dict[str, QuantEngine]]:
+    """The scan's engines: the default and one per market (SCAN_GAME_STATE_K_BY_MARKET)."""
+    return (QuantEngine(game_state_k=SCAN_GAME_STATE_K),
+            {market: QuantEngine(game_state_k=k) for market, k in SCAN_GAME_STATE_K_BY_MARKET.items()})
+
+
+def price_fixture(
+    fixture: UpcomingFixture, inputs: SlateInputs, engine: QuantEngine,
+    market_engines: Mapping[str, QuantEngine] | None = None,
+) -> tuple[dict[ProjectionKey, FactorProjection], list[str]]:
+    """The model's projections for one fixture, exactly as the scan prices it. The Gate 2 lockbox
+    (scripts/gate2_lockbox.py) scores this function, and modeling/model_freeze.py fingerprints it."""
+    return build_projections(
+        fixture, inputs.squad, inputs.history_by_player, inputs.team_recent_fixtures, inputs.league_rates, engine,
+        season_levels=inputs.season_levels or None, market_engines=market_engines,
+        rate_multipliers=SCAN_RATE_MULTIPLIER_BY_MARKET,
+    )
+
+
 def scan_fixture(
     fixture: UpcomingFixture, inputs: SlateInputs, now: datetime, quotes_for: QuoteSource,
     manager: InstitutionalAssetManager, engine: QuantEngine, summary: ScanSummary, exposure: Any,
@@ -253,11 +285,7 @@ def scan_fixture(
 ) -> tuple[dict[ProjectionKey, FactorProjection], AllocationReport | None, list[LiveOddsQuote]]:
     """Projections, quotes and the allocation for one fixture; a pricing failure is recorded and skipped."""
     try:
-        projections, skipped = build_projections(
-            fixture, inputs.squad, inputs.history_by_player, inputs.team_recent_fixtures, inputs.league_rates, engine,
-            season_levels=inputs.season_levels or None, market_engines=market_engines,
-            rate_multipliers=SCAN_RATE_MULTIPLIER_BY_MARKET,
-        )
+        projections, skipped = price_fixture(fixture, inputs, engine, market_engines)
         quotes = quotes_for(fixture, projections)
         report = manager.allocate(projections, quotes, now=now, exposure=exposure)
     except (ProjectionError, ValueError, FloatingPointError) as exc:
@@ -404,7 +432,8 @@ def collect_odds(
     prices: list[oddspapi.PropPrice] = []
     no_odds: list[str] = []
     for book in books:
-        body = client.get_json_value(oddspapi.odds_path(book, tournaments), empty_on=frozenset({400, 404}))
+        body = client.get_json_value(oddspapi.odds_path(book, tournaments), empty_on=oddspapi.NO_FIXTURES_STATUS,
+                                     empty_marker=oddspapi.NO_FIXTURES_MESSAGE)
         if body is None:
             no_odds.append(book)
             continue
@@ -441,13 +470,26 @@ def run_scan(
     now: datetime, client: Any, dsn: str, notifier: TelegramNotifier | None, store: SentAlertStore,
     bankroll: float, label: str, max_alerts: int = DEFAULT_MAX_ALERTS, *,
     odds: str = "mock", odds_client: Any | None = None, books: Sequence[str] = DEFAULT_BOOKMAKERS,
-    state_dir: Path = STATE_DIR, bets: PlacedBetStore | None = None,
+    state_dir: Path = STATE_DIR, bets: PlacedBetStore | None = None, currency: str,
+    book_rate: ExchangeRate | None = None,
 ) -> ScanSummary:
-    """With `bets`, exposure per market is the larger of the stakes alerted and the stakes recorded as placed."""
+    """With `bets`, exposure per market is the larger of the stakes alerted and the stakes recorded as placed.
+    `currency` (fx.bankroll_currency()) is the bankroll's; when it is not BOOK_CURRENCY, `book_rate`
+    (fx.book_to_bankroll()) converts every book limit into it, and every stake is shown in both."""
     import psycopg2
 
+    if currency not in SUPPORTED_CURRENCIES:
+        raise ValueError(f"currency {currency!r} is not supported")
+    if book_rate is None:
+        if currency != BOOK_CURRENCY:
+            raise ValueError(f"a {currency} bankroll needs a {BOOK_CURRENCY}->{currency} rate")
+        book_rate = fx_identity(currency)
+    if book_rate.quote != currency or book_rate.base not in (BOOK_CURRENCY, currency):
+        raise ValueError(f"rate {book_rate.describe()} does not convert {BOOK_CURRENCY} into {currency}")
+    rate = book_rate
     start, end = scan_window(now)
-    summary = ScanSummary(start, end, alert_cap=max_alerts)
+    conversion = "" if rate.identity else f"; book limits converted at {rate.describe()}"
+    summary = ScanSummary(start, end, alert_cap=max_alerts, bankroll=f"{currency} {bankroll:,.2f}{conversion}")
     fixtures = fetch_upcoming(client, start, end)
     summary.fixtures = [f"{f.name} {f.kickoff_at:%H:%M}" for f in fixtures]
     if not fixtures:
@@ -474,18 +516,17 @@ def run_scan(
         real_quotes = coverage.quotes
 
         def quotes_for(fixture: UpcomingFixture, projections: Mapping[ProjectionKey, FactorProjection]) -> list[LiveOddsQuote]:
-            return [quote for quote in real_quotes if quote.fixture_id == fixture.fixture_id]
+            return in_bankroll_currency([quote for quote in real_quotes if quote.fixture_id == fixture.fixture_id], rate)
     elif odds == "mock":
         seed = int.from_bytes(hashlib.sha256(start.isoformat().encode("utf-8")).digest()[:8], "big")
         rng = np.random.default_rng(seed)
 
         def quotes_for(fixture: UpcomingFixture, projections: Mapping[ProjectionKey, FactorProjection]) -> list[LiveOddsQuote]:
-            return mock_quotes(projections, now, rng)
+            return in_bankroll_currency(mock_quotes(projections, now, rng), rate)
     else:
         raise ValueError(f"unknown odds source {odds!r}")
     manager = InstitutionalAssetManager(bankroll, model_risk_loss_floor=MODEL_RISK_LOSS_FLOOR)
-    engine = QuantEngine(game_state_k=SCAN_GAME_STATE_K)
-    market_engines = {market: QuantEngine(game_state_k=k) for market, k in SCAN_GAME_STATE_K_BY_MARKET.items()}
+    engine, market_engines = scan_engines()
     combined = AllocationReport()
     all_projections: dict[ProjectionKey, FactorProjection] = {}
     all_descriptions: dict[ProjectionKey, AlertContext] = {}
@@ -507,7 +548,8 @@ def run_scan(
     combined.directives.sort(key=lambda d: (-d.ev_per_unit, d.fixture_id, d.player_id, d.market_type, d.line_value))
     if notifier is not None:
         summary.alerts_sent, _ = notifier.notify_digest(
-            combined, all_projections, label=label, descriptions=all_descriptions, max_alerts=max_alerts
+            combined, all_projections, bankroll_currency=currency, label=label, descriptions=all_descriptions,
+            max_alerts=max_alerts, book_rate=rate,
         )
         # No bookmaker line to compare against: give the manual bettor the model's prices instead.
         summary.boards_sent = send_boards(notifier, unquoted, state_dir / BOARD_STATE_NAME)
@@ -525,6 +567,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--at", type=datetime.fromisoformat, default=None, help="simulated UTC run time (testing)")
     args = parser.parse_args(argv)
     now = _utc(args.at) if args.at is not None else datetime.now(timezone.utc)
+    currency = bankroll_currency()
+    book_rate = book_to_bankroll(currency, now.date())
     from prop_alpha.ingestion.pipeline import build_odds_client, build_vendor_client
 
     environ = {**os.environ, "DATA_VENDOR_MAX_REQUESTS": os.environ.get("DATA_VENDOR_MAX_REQUESTS", "10"),
@@ -543,7 +587,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                            float(os.environ.get(BANKROLL_ENV, DEFAULT_BANKROLL)), label,
                            int(os.environ.get(MAX_ALERTS_ENV, DEFAULT_MAX_ALERTS)),
                            odds=args.odds, odds_client=odds_client, books=books,
-                           bets=PlacedBetStore() if real else None)
+                           bets=PlacedBetStore() if real else None, currency=currency, book_rate=book_rate)
     finally:
         client.close()
         if odds_client is not None:

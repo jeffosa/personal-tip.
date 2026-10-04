@@ -28,7 +28,13 @@ MARKET_TYPES: Final[Mapping[str, str]] = {"playertotals-tackles": "tackles", "pl
 # Lower-league prop limits are £50-£500 (PRD Gate 4); a quote without a published limit is assumed to take 50.
 UNKNOWN_LIMIT_STAKE: Final[float] = 50.0
 
-MARKETS_PATH: Final[str] = f"markets?sportId={SOCCER_SPORT_ID}"
+# The only reply counted as "no fixtures": HTTP 400 INVALID_PARAMETER whose details end with this (seen for skybet
+# on 2026-10-04: "The bookmaker 'skybet' is not supported or does not have any fixtures available."). Any other 400
+# or 404 is an error. The message does not separate a misspelt bookmaker from one with no fixtures.
+NO_FIXTURES_STATUS: Final[frozenset[int]] = frozenset({400})
+NO_FIXTURES_MESSAGE: Final[str] = "does not have any fixtures available"
+
+MARKETS_PATH: Final[str] =f"markets?sportId={SOCCER_SPORT_ID}"
 PARTICIPANTS_PATH: Final[str] = f"participants?sportId={SOCCER_SPORT_ID}"
 ACCOUNT_PATH: Final[str] = "account"
 
@@ -38,6 +44,10 @@ _COMMON_TEAM_WORDS: Final[frozenset[str]] = frozenset({
 
 
 def odds_path(bookmaker: str, tournament_ids: Sequence[int]) -> str:
+    """One bookmaker per call, as the singular `bookmaker` parameter. The v4 docs name it `bookmakers` (up to 3), but
+    the live API (checked 2026-10-04) answers three with HTTP 400 "Please provide exactly one bookmaker using the
+    'bookmaker' query parameter"; singular and plural both work for one book, and the singular returned bet365's
+    24 League One/Two fixtures."""
     return (f"odds-by-tournaments?bookmaker={bookmaker}&tournamentIds={','.join(str(t) for t in sorted(tournament_ids))}"
             "&oddsFormat=decimal")
 

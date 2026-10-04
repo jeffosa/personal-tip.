@@ -1,22 +1,27 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from prop_alpha.alerts import ledger
+from prop_alpha.alerts.fx import ExchangeRate
 from prop_alpha.alerts.ledger import PlacedBetStore, combined_exposure, poll, process_updates
 from prop_alpha.alerts.replies import (
     AlertItem,
     PlaceCommand,
     PlacedBet,
     ReplyError,
+    SettleCommand,
+    Settlement,
     UndoCommand,
     confirmation,
+    grade,
     parse_reply,
+    profit,
     resolve_bet,
 )
 from prop_alpha.alerts.telegram import (
@@ -41,10 +46,13 @@ MESSAGES = {500: {1: ALERT, 2: BOARD}}
 # ---------------- parsing ----------------
 @pytest.mark.parametrize(("text", "expected"), [
     ("placed 3 @1.95 5", PlaceCommand(3, None, 1.95, 5.0, None)),
-    ("Placed 2 under @ 2.10 £10 Sky Bet", PlaceCommand(2, "under", 2.10, 10.0, "Sky Bet")),
+    ("Placed 2 under @ 2.10 £10 Sky Bet", PlaceCommand(2, "under", 2.10, 10.0, "Sky Bet", "£")),
     ("placed #1 o @1.9 5.50", PlaceCommand(1, "over", 1.9, 5.5, None)),
     ("undo 12", UndoCommand(12)),
     ("UNDO #3", UndoCommand(3)),
+    ("settled 12 lost", SettleCommand(12, "lost")),
+    ("Settle #4 WIN", SettleCommand(4, "won")),
+    ("settled 5 void", SettleCommand(5, "void")),
 ])
 def test_replies_parse(text: str, expected: object) -> None:
     assert parse_reply(text) == expected
@@ -141,7 +149,11 @@ def test_exposure_takes_the_larger_of_alerted_and_placed_per_market(tmp_path: Pa
                     store, NOW)
     book = combined_exposure(alerts, store, NOW).by_market
     assert book == {(9001, 7, "tackles"): 20.0, (9001, 8, "fouls"): 4.0}  # board bet counted; alert not doubled
-    assert combined_exposure(alerts, store, NOW + timedelta(days=5)).by_market == {}  # outside the open window
+    # Audit 2026-10-04: the alert leaves after OPEN_POSITION_WINDOW, the placed bets stay until settled.
+    later = NOW + timedelta(days=5)
+    assert combined_exposure(alerts, store, later).by_market == {(9001, 7, "tackles"): 5.0, (9001, 8, "fouls"): 4.0}
+    store.record_settlement(Settlement(1, "lost", "auto", "test", later))
+    assert combined_exposure(alerts, store, later).by_market == {(9001, 8, "fouls"): 4.0}
 
 
 def test_corrupt_state_files_raise(tmp_path: Path) -> None:
@@ -215,3 +227,143 @@ def test_empty_report_indexes_nothing(tmp_path: Path) -> None:
     fake = _FakeTelegram([], index=index)
     assert fake.notify_digest(AllocationReport(), {}) == (0, [])
     assert index.load() == {}
+
+
+# ---------------- settlement (audit 2026-10-04) ----------------
+def _bet(side: str = "over", line: float = 1.5, market: str = "tackles", stake: float = 10.0,
+         odds: float = 2.0) -> PlacedBet:
+    return PlacedBet(bet_id=1, update_id=10, message_id=500, number=1, kind="alert", fixture_id=9001, player_id=7,
+                     market=market, line=line, side=side, odds=odds, stake=stake, book="skybet", min_odds=1.9,
+                     match="Walsall v Port Vale", player="A (Walsall)", placed_at=NOW)
+
+
+@pytest.mark.parametrize(("side", "line", "status", "minutes", "count", "expected"), [
+    ("over", 1.5, "final", 90, 2, "won"),
+    ("over", 1.5, "final", 90, 1, "lost"),
+    ("under", 1.5, "final", 90, 1, "won"),
+    ("under", 1.5, "final", 75, 3, "lost"),
+    ("over", 2.0, "final", 90, 2, "void"),     # whole line, count on it: push
+    ("under", 0.5, "final", 0, 0, "void"),     # in the squad, did not play
+    ("over", 1.5, "final", None, None, None),  # no stored row: left for settling by hand
+    ("over", 1.5, "live", 60, 4, None),        # not final yet
+    ("over", 1.5, "postponed", None, None, None),
+])
+def test_grade_settles_on_the_stored_count(side: str, line: float, status: str, minutes: int | None,
+                                           count: int | None, expected: str | None) -> None:
+    settlement = grade(_bet(side, line), status, minutes, count, NOW)
+    assert (settlement.result if settlement else None) == expected
+    if settlement is not None:
+        assert settlement.source == "auto" and "assumed market rules" in settlement.detail
+
+
+def test_grade_refuses_an_unknown_market_or_a_missing_count() -> None:
+    with pytest.raises(ValueError, match="no settlement statistic"):
+        grade(_bet(market="yellow_card"), "final", 90, 1, NOW)
+    with pytest.raises(ValueError, match="no tackles count"):
+        grade(_bet(), "final", 90, None, NOW)
+
+
+def test_profit_by_result() -> None:
+    bet = _bet(stake=10.0, odds=2.5)
+    results = [profit(bet, Settlement(1, result, "auto", "", NOW)) for result in ("won", "lost", "void")]
+    assert results == [15.0, -10.0, 0.0]
+    with pytest.raises(ValueError, match="another bet"):
+        profit(bet, Settlement(2, "won", "auto", "", NOW))
+
+
+def test_settlement_records_are_validated() -> None:
+    with pytest.raises(ValueError):
+        Settlement(1, "half-won", "auto", "", NOW)
+    with pytest.raises(ValueError, match="Telegram update"):
+        Settlement(1, "won", "manual", "", NOW)
+    with pytest.raises(ValueError, match="UTC"):
+        Settlement(1, "won", "auto", "", NOW.replace(tzinfo=None))
+
+
+def test_settle_open_bets_grades_only_final_matches_with_a_player_row(tmp_path: Path) -> None:
+    store = PlacedBetStore(tmp_path / "bets.jsonl")
+    process_updates([_update(1, "placed 1 @2.05 5"), _update(2, "placed 2 under @2.90 4")], CHAT, MESSAGES,
+                    store, NOW)
+    # bet 1: tackles over 1.5 for player 7 (3 tackles); bet 2: fouls under 0.5 for player 8, not ingested yet.
+    rows: dict[tuple[int, int], tuple[str, int | None, int | None, int | None] | None] = {
+        (9001, 7): ("final", 90, 3, 1), (9001, 8): None,
+    }
+    settled = ledger.settle_open_bets(store.open_bets(NOW), rows, NOW)
+    assert [(bet.bet_id, s.result, s.count) for bet, s in settled] == [(1, "won", 3)]
+    for _, settlement in settled:
+        store.record_settlement(settlement)
+    assert [bet.bet_id for bet in store.open_bets(NOW)] == [2]
+    assert "1 settled bet(s) (1 won, 0 lost, 0 void): staked 5.00, profit +5.25" in ledger.results_summary(
+        store.settled_bets())
+
+
+def test_a_settled_reply_overrides_the_automatic_result_and_is_recorded_once(tmp_path: Path) -> None:
+    store = PlacedBetStore(tmp_path / "bets.jsonl")
+    process_updates([_update(1, "placed 1 @2.05 5")], CHAT, MESSAGES, store, NOW)
+    store.record_settlement(Settlement(1, "won", "auto", "auto", NOW))
+    replies, _ = process_updates([_update(2, "settled 1 lost"), _update(3, "settled 9 won")], CHAT, MESSAGES,
+                                 store, NOW)
+    assert replies[0][1].startswith("Recorded #1 LOST -5.00") and replies[1][1] == "No recorded bet #9 to settle."
+    store.record_settlement(Settlement(1, "won", "auto", "a later automatic run", NOW))  # never beats a manual one
+    [(_, settlement)] = store.settled_bets()
+    assert settlement.source == "manual" and settlement.result == "lost"
+    again, _ = process_updates([_update(2, "settled 1 lost")], CHAT, MESSAGES, store, NOW)
+    assert again == []  # the same Telegram update is not recorded twice
+
+
+def test_old_open_bets_stay_open_and_are_flagged_stale(tmp_path: Path) -> None:
+    store = PlacedBetStore(tmp_path / "bets.jsonl")
+    process_updates([_update(1, "placed 1 @2.05 5")], CHAT, MESSAGES, store, NOW)
+    later = NOW + ledger.STALE_AFTER + timedelta(hours=1)
+    assert [b.bet_id for b in store.open_bets(later)] == [1]
+    assert store.stale_bets(NOW) == [] and [b.bet_id for b in store.stale_bets(later)] == [1]
+    assert store.exposure(later).by_market == {(9001, 7, "tackles"): 5.0}
+
+
+def test_corrupt_settled_record_raises(tmp_path: Path) -> None:
+    path = tmp_path / "bets.jsonl"
+    record = {"event": "settled", "bet_id": 1, "result": "maybe", "source": "auto", "at": "x"}
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="bets.jsonl line 1"):
+        PlacedBetStore(path).load()
+
+
+# ---------------- stake currency (USD bankroll, GBP books; 2026-10-04) ----------------
+def test_a_pound_stake_is_converted_to_the_bankroll_currency_and_kept_as_entered(tmp_path: Path) -> None:
+    rate = ExchangeRate("GBP", "USD", 1.32, date(2026, 10, 9))
+    store = PlacedBetStore(tmp_path / "bets.jsonl")
+    replies, _ = process_updates([_update(1, "placed 1 @2.05 £10"), _update(2, "placed 2 under @2.90 $4"),
+                                  _update(3, "placed 2 over @1.80 €5")], CHAT, MESSAGES, store, NOW, "USD", rate)
+    assert "stake 13.2 (skybet) = GBP 10 as entered" in replies[0][1]
+    assert "€" not in replies[2][1] and "no current EUR rate" in replies[2][1]
+    bets = store.open_bets(NOW)
+    assert [(b.stake, b.entered_stake, b.entered_currency) for b in bets] == [(13.2, 10.0, "GBP"), (4.0, None, None)]
+    assert store.exposure(NOW).by_market == {(9001, 7, "tackles"): 13.2, (9001, 8, "fouls"): 4.0}
+
+
+def test_a_pound_stake_without_a_rate_is_refused_not_guessed(tmp_path: Path) -> None:
+    store = PlacedBetStore(tmp_path / "bets.jsonl")
+    replies, _ = process_updates([_update(1, "placed 1 @2.05 £10")], CHAT, MESSAGES, store, NOW, "USD", None)
+    assert "no current GBP rate" in replies[0][1] and store.open_bets(NOW) == []
+
+
+def test_bets_recorded_before_the_currency_fields_still_load(tmp_path: Path) -> None:
+    path = tmp_path / "bets.jsonl"
+    store = PlacedBetStore(path)
+    process_updates([_update(1, "placed 1 @2.05 5")], CHAT, MESSAGES, store, NOW)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    del record["entered_stake"], record["entered_currency"]
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    [bet] = PlacedBetStore(path).open_bets(NOW)
+    assert bet.stake == 5.0 and bet.entered_stake is None
+
+
+def test_automatic_results_are_labelled_provisional_and_manual_ones_are_not(tmp_path: Path) -> None:
+    store = PlacedBetStore(tmp_path / "bets.jsonl")
+    process_updates([_update(1, "placed 1 @2.05 5"), _update(2, "placed 2 under @2.90 4")], CHAT, MESSAGES,
+                    store, NOW)
+    store.record_settlement(Settlement(1, "won", "auto", "auto", NOW))
+    process_updates([_update(3, "settled 2 lost")], CHAT, MESSAGES, store, NOW)
+    texts = [ledger.settlement_text(bet, s) for bet, s in store.settled_bets()]
+    assert "WON (provisional)" in texts[0] and "LOST" in texts[1] and "provisional" not in texts[1]
+    assert "1 provisional (automatic, assumed market rules" in ledger.results_summary(store.settled_bets())

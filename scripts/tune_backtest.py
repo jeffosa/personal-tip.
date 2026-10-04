@@ -3,7 +3,8 @@
 Windows (kickoff, UTC):
     tune  2026-01-01 .. 2026-09-12   2025/26 second half (prior strength) and the first weeks of 2026/27 (the
                                      season blend only matters across a season boundary, and 2024/25 is not loaded)
-    test  2026-09-12 ..              untouched until a setting is chosen
+    test  2026-09-12 ..              selection window: its results chose settings on 2026-10-04, so it is no
+                                     longer a holdout (Gate 2 scores the frozen model on the lockbox, model_freeze.py)
 The setting with the lowest mean log loss over both markets' lines in the tune window is chosen; the test window
 then compares it with the current setting (prior strength 6, 90,000 pseudo-minutes).
 

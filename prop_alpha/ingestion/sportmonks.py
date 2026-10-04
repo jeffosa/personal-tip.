@@ -318,3 +318,19 @@ def upcoming_fixtures(body: Mapping[str, Any]) -> tuple[list[dict[str, Any]], bo
         })
     pagination = body.get("pagination")
     return fixtures, bool(isinstance(pagination, Mapping) and pagination.get("has_more"))
+
+
+def finished_fixtures(body: Mapping[str, Any]) -> tuple[list[tuple[str, datetime]], bool]:
+    """(finished SCAN_LEAGUES fixtures as (fixture id, kickoff), whether another page follows) from one page of
+    the upcoming_path listing: the results job ingests these."""
+    data = body.get("data")
+    if not isinstance(data, list):
+        raise ValueError("Sportmonks listing has no 'data' list")
+    finished: list[tuple[str, datetime]] = []
+    for fixture in data:
+        state = fixture.get("state")
+        if (fixture.get("league_id") in SCAN_LEAGUES and isinstance(state, Mapping)
+                and state.get("developer_name") in FINAL_STATES):
+            finished.append((str(int(fixture["id"])), datetime.fromisoformat(_kickoff(fixture))))
+    pagination = body.get("pagination")
+    return finished, bool(isinstance(pagination, Mapping) and pagination.get("has_more"))

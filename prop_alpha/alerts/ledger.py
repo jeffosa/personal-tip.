@@ -2,16 +2,22 @@
 messages. It never places a bet.
 
     python -m prop_alpha.alerts.ledger --poll    # read new replies, record bets, answer each in the chat
-    python -m prop_alpha.alerts.ledger --list    # print the open (unsettled) recorded bets
+    python -m prop_alpha.alerts.ledger --list    # print the open (unsettled) bets and the settled results
+    python -m prop_alpha.alerts.ledger --settle [--send]   # settle open bets whose match is final in the database
 
 Replies are parsed by prop_alpha.alerts.replies (pure). Only messages from the configured TELEGRAM_CHAT_ID are
 read; anyone else who messages the bot is ignored. A `placed` reply must answer the alert or board message it
 refers to, which MessageIndex maps to that message's numbered bets.
 
-I/O: Telegram (getUpdates, sendMessage) and three gitignored files under .prop_alpha_state/: placed_bets.jsonl
-(append-only placed/undo events), alert_messages.jsonl (written by the senders) and telegram_offset.json (the
-next update to read). Each recorded event carries its Telegram update id, so an update delivered twice is
-recorded once.
+I/O: Telegram (getUpdates, sendMessage), one short read-only database transaction for --settle, and three
+gitignored files under .prop_alpha_state/: placed_bets.jsonl (append-only placed, undo and settled events),
+alert_messages.jsonl (written by the senders) and telegram_offset.json (the next update to read). Each recorded
+reply carries its Telegram update id, so an update delivered twice is recorded once.
+
+A placed bet counts as open exposure until it is settled or undone, however old it is (audit 2026-10-04: expiring
+it after OPEN_POSITION_WINDOW under-counted a postponed or unsettled bet). Automatic settlement (`grade`) reads the
+match from the database, which scripts/telegram_status.cmd refreshes first (prop_alpha.ingestion.results); a bet
+still open STALE_AFTER after it was placed is flagged by --list and the status report for settling by hand.
 """
 
 from __future__ import annotations
@@ -27,24 +33,33 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
 
+from prop_alpha.alerts.fx import BOOK_CURRENCY, CURRENCY_SYMBOLS, ExchangeRate, bankroll_currency, cached_rate, is_fresh
 from prop_alpha.alerts.replies import (
+    RESULTS,
+    SETTLEMENT_COLUMNS,
+    SETTLEMENT_SOURCES,
     AlertItem,
     PlaceCommand,
     PlacedBet,
     ReplyError,
+    SettleCommand,
+    Settlement,
     UndoCommand,
     confirmation,
+    grade,
     parse_reply,
+    profit,
     resolve_bet,
+    settlement_text,
 )
 from prop_alpha.alerts.telegram import (
     DEFAULT_INDEX_FILE,
-    OPEN_POSITION_WINDOW,
     MessageIndex,
     SentAlertStore,
     TelegramNotifier,
     load_config,
 )
+from prop_alpha.config import DEFAULT_DSN, DSN_ENV
 from prop_alpha.scanner.market_scanner import ExposureBook, ProjectionKey
 
 logger = logging.getLogger("prop_alpha.ledger")
@@ -52,15 +67,64 @@ logger = logging.getLogger("prop_alpha.ledger")
 STATE_DIR: Final[Path] = DEFAULT_INDEX_FILE.parent
 DEFAULT_BETS_FILE: Final[Path] = STATE_DIR / "placed_bets.jsonl"
 DEFAULT_OFFSET_FILE: Final[Path] = STATE_DIR / "telegram_offset.json"
-COMMAND_WORDS: Final[tuple[str, ...]] = ("placed", "undo")
+COMMAND_WORDS: Final[tuple[str, ...]] = ("placed", "undo", "settle")
+# A bet still open this long after it was placed is flagged for settling by hand (postponed, abandoned, or a
+# player row missing from the stored match).
+STALE_AFTER: Final[timedelta] = timedelta(days=7)
+# Fixture status and the bet player's minutes and counts; no fixture row means the match was never ingested.
+SETTLEMENT_SQL: Final[str] = """
+    SELECT f.status, s.minutes_played, s.tackles_attempted, s.fouls_committed
+    FROM prop_alpha.fixtures f
+    LEFT JOIN prop_alpha.player_match_stats s ON s.fixture_id = f.fixture_id AND s.player_id = %s
+    WHERE f.vendor_fixture_uid = %s
+"""
 NOT_A_REPLY: Final[str] = (
     "Reply to the alert or board message itself (long-press or swipe it, then Reply), so I know which bet you mean."
 )
 
 
+OPTIONAL_BET_FIELDS: Final[frozenset[str]] = frozenset({"entered_stake", "entered_currency"})
+
+
 def _bet_from_record(raw: Mapping[str, Any]) -> PlacedBet:
-    fields = {key: raw[key] for key in PlacedBet.__dataclass_fields__ if key != "placed_at"}
+    """Records written before a field existed lack it; only OPTIONAL_BET_FIELDS may be missing."""
+    fields = {key: raw[key] for key in PlacedBet.__dataclass_fields__
+              if key != "placed_at" and (key not in OPTIONAL_BET_FIELDS or key in raw)}
     return PlacedBet(**fields, placed_at=datetime.fromisoformat(str(raw["placed_at"])))
+
+
+def stake_in_bankroll(command: PlaceCommand, currency: str,
+                      book_rate: ExchangeRate | None) -> tuple[float, tuple[float, str] | None] | ReplyError:
+    """(stake in the bankroll currency, (amount, currency) as entered when converted), or why not: a stake with no
+    sign, or the bankroll's own sign, is in the bankroll currency; the books' sign is converted at `book_rate`."""
+    entered = None if command.stake_symbol is None else CURRENCY_SYMBOLS[command.stake_symbol]
+    if entered is None or entered == currency:
+        return command.stake, None
+    if book_rate is not None and not book_rate.identity and (book_rate.base, book_rate.quote) == (entered, currency):
+        return round(book_rate.convert(command.stake), 2), (command.stake, entered)
+    return ReplyError(f"Stakes are recorded in {currency or 'the bankroll currency'}, and no current {entered} rate "
+                      f"is available: give the stake without a currency sign, e.g. placed {command.number} "
+                      f"@{command.odds:g} {command.stake:g}")
+
+
+def _optional_int(value: Any, where: str) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{where}: settled record has a non-integer count, minutes or update_id")
+    return value
+
+
+def _settlement_from_record(raw: Mapping[str, Any], where: str) -> Settlement:
+    if (not isinstance(raw.get("bet_id"), int) or raw.get("result") not in RESULTS
+            or raw.get("source") not in SETTLEMENT_SOURCES or not isinstance(raw.get("at"), str)):
+        raise ValueError(f"{where}: settled record needs bet_id, result, source and at")
+    return Settlement(
+        bet_id=int(raw["bet_id"]), result=str(raw["result"]), source=str(raw["source"]),
+        detail=str(raw.get("detail", "")), settled_at=datetime.fromisoformat(str(raw["at"])),
+        count=_optional_int(raw.get("count"), where), minutes=_optional_int(raw.get("minutes"), where),
+        update_id=_optional_int(raw.get("update_id"), where),
+    )
 
 
 class PlacedBetStore:
@@ -79,11 +143,18 @@ class PlacedBetStore:
 
     def load(self) -> tuple[dict[int, PlacedBet], set[int], set[int]]:
         """(bets by id, cancelled bet ids, Telegram update ids already recorded)."""
+        bets, cancelled, seen, _ = self.load_all()
+        return bets, cancelled, seen
+
+    def load_all(self) -> tuple[dict[int, PlacedBet], set[int], set[int], dict[int, Settlement]]:
+        """As load, plus the settlement of each settled bet: a manual result overrides an automatic one whatever
+        their order in the file, and a later manual result overrides an earlier one."""
         bets: dict[int, PlacedBet] = {}
         cancelled: set[int] = set()
         seen: set[int] = set()
+        settlements: dict[int, Settlement] = {}
         if not self.path.is_file():
-            return bets, cancelled, seen
+            return bets, cancelled, seen, settlements
         for number, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), start=1):
             if not line.strip():
                 continue
@@ -96,9 +167,16 @@ class PlacedBetStore:
             elif event == "undo" and isinstance(record.get("bet_id"), int) and isinstance(record.get("update_id"), int):
                 cancelled.add(int(record["bet_id"]))
                 seen.add(int(record["update_id"]))
+            elif event == "settled":
+                settlement = _settlement_from_record(record, f"{self.path.name} line {number}")
+                if settlement.update_id is not None:
+                    seen.add(settlement.update_id)
+                earlier = settlements.get(settlement.bet_id)
+                if earlier is None or settlement.source == "manual" or earlier.source == "auto":
+                    settlements[settlement.bet_id] = settlement
             else:
-                raise ValueError(f"{self.path.name} line {number} is not a placed or undo record")
-        return bets, cancelled, seen
+                raise ValueError(f"{self.path.name} line {number} is not a placed, undo or settled record")
+        return bets, cancelled, seen, settlements
 
     def record_bet(self, bet: PlacedBet) -> None:
         self._append({"event": "placed", **asdict(bet), "placed_at": bet.placed_at.isoformat()})
@@ -106,22 +184,42 @@ class PlacedBetStore:
     def record_undo(self, bet_id: int, update_id: int, at: datetime) -> None:
         self._append({"event": "undo", "bet_id": bet_id, "update_id": update_id, "at": at.isoformat()})
 
-    def open_bets(self, now: datetime, window: timedelta = OPEN_POSITION_WINDOW) -> list[PlacedBet]:
-        """Bets placed within `window` before `now` and not undone (settlement is not recorded yet)."""
-        bets, cancelled, _ = self.load()
-        return sorted((b for b in bets.values() if b.bet_id not in cancelled and b.placed_at > now - window),
+    def record_settlement(self, settlement: Settlement) -> None:
+        self._append({
+            "event": "settled", "bet_id": settlement.bet_id, "result": settlement.result,
+            "source": settlement.source, "detail": settlement.detail, "at": settlement.settled_at.isoformat(),
+            "count": settlement.count, "minutes": settlement.minutes, "update_id": settlement.update_id,
+        })
+
+    def open_bets(self, now: datetime) -> list[PlacedBet]:
+        """Bets neither undone nor settled, however old. `now` is checked to be UTC (stale_bets ages from it)."""
+        if now.tzinfo is None or now.utcoffset() != timedelta(0):
+            raise ValueError("now must be a timezone-aware UTC datetime")
+        bets, cancelled, _, settlements = self.load_all()
+        return sorted((b for b in bets.values() if b.bet_id not in cancelled and b.bet_id not in settlements),
                       key=lambda b: b.bet_id)
 
-    def exposure(self, now: datetime, window: timedelta = OPEN_POSITION_WINDOW) -> ExposureBook:
+    def stale_bets(self, now: datetime, after: timedelta = STALE_AFTER) -> list[PlacedBet]:
+        """Open bets placed more than `after` before `now`: settle them by hand."""
+        return [bet for bet in self.open_bets(now) if bet.placed_at < now - after]
+
+    def settled_bets(self) -> list[tuple[PlacedBet, Settlement]]:
+        """Every settled bet that was not undone, with its effective settlement, by bet id."""
+        bets, cancelled, _, settlements = self.load_all()
+        return [(bets[bet_id], settlements[bet_id]) for bet_id in sorted(settlements)
+                if bet_id in bets and bet_id not in cancelled]
+
+    def exposure(self, now: datetime) -> ExposureBook:
         totals: dict[ProjectionKey, float] = defaultdict(float)
-        for bet in self.open_bets(now, window):
+        for bet in self.open_bets(now):
             totals[(bet.fixture_id, bet.player_id, bet.market)] += bet.stake
         return ExposureBook(dict(totals))
 
 
 def combined_exposure(alerts: SentAlertStore, bets: PlacedBetStore, now: datetime) -> ExposureBook:
-    """Per market, the larger of the stakes alerted and the stakes placed: a placed bet that followed an alert
-    is not counted twice, and a bet taken from a board (no alerted stake) is still counted."""
+    """Per market, the larger of the stakes alerted (within OPEN_POSITION_WINDOW) and the stakes placed and not yet
+    settled: a placed bet that followed an alert is not counted twice, and a bet taken from a board (no alerted
+    stake) is still counted."""
     alerted, placed = alerts.exposure(now).by_market, bets.exposure(now).by_market
     return ExposureBook({key: max(alerted.get(key, 0.0), placed.get(key, 0.0)) for key in {*alerted, *placed}})
 
@@ -137,9 +235,12 @@ def process_updates(
     messages: Mapping[int, Mapping[int, AlertItem]],
     store: PlacedBetStore,
     now: datetime,
+    currency: str = "",
+    book_rate: ExchangeRate | None = None,
 ) -> tuple[list[tuple[int, str]], int | None]:
     """Record the bets in `updates` and return (replies to send as (message id to answer, text), next offset).
-    Messages from other chats, non-text messages and chat that is not a command are skipped."""
+    Messages from other chats, non-text messages and chat that is not a command are skipped. Stakes are recorded
+    in `currency` (the bankroll's); one typed with the books' sign is converted at `book_rate`."""
     replies: list[tuple[int, str]] = []
     next_offset: int | None = None
     bets, cancelled, seen = store.load()
@@ -172,8 +273,17 @@ def process_updates(
                 store.record_undo(command.bet_id, update_id, _message_time(message, now))
                 cancelled.add(command.bet_id)
                 replies.append((own_id, f"Cancelled bet #{command.bet_id}."))
+        elif isinstance(command, SettleCommand):
+            if command.bet_id not in bets or command.bet_id in cancelled:
+                replies.append((own_id, f"No recorded bet #{command.bet_id} to settle."))
+            else:
+                settlement = Settlement(command.bet_id, command.result, "manual", "settled by hand",
+                                        _message_time(message, now), update_id=update_id)
+                store.record_settlement(settlement)
+                replies.append((own_id, "Recorded " + settlement_text(bets[command.bet_id], settlement)))
         else:
-            answer, recorded = _record_place(command, message, messages, store, update_id, next_id, now)
+            answer, recorded = _record_place(command, message, messages, store, update_id, next_id, now, currency,
+                                             book_rate)
             replies.append((own_id, answer))
             next_id += 1 if recorded else 0
         seen.add(update_id)
@@ -182,7 +292,8 @@ def process_updates(
 
 def _record_place(
     command: PlaceCommand, message: Mapping[str, Any], messages: Mapping[int, Mapping[int, AlertItem]],
-    store: PlacedBetStore, update_id: int, bet_id: int, now: datetime,
+    store: PlacedBetStore, update_id: int, bet_id: int, now: datetime, currency: str = "",
+    book_rate: ExchangeRate | None = None,
 ) -> tuple[str, bool]:
     """(answer for the chat, whether a bet was recorded)."""
     replied: Any = message.get("reply_to_message")
@@ -192,8 +303,11 @@ def _record_place(
     items = messages.get(replied_id)
     if items is None:
         return "That message is not an alert or board I sent, so no bet was recorded. " + NOT_A_REPLY, False
+    stake = stake_in_bankroll(command, currency, book_rate)
+    if isinstance(stake, ReplyError):
+        return stake.message, False
     result = resolve_bet(command, items, bet_id=bet_id, update_id=update_id, message_id=replied_id,
-                         placed_at=_message_time(message, now))
+                         placed_at=_message_time(message, now), stake=stake[0], entered=stake[1])
     if isinstance(result, ReplyError):
         return result.message, False
     store.record_bet(result)
@@ -204,6 +318,7 @@ def _record_place(
 
 def poll(
     notifier: TelegramNotifier, index: MessageIndex, store: PlacedBetStore, offset_file: Path, now: datetime,
+    currency: str = "", book_rate: ExchangeRate | None = None,
 ) -> int:
     """Read new replies, record bets, answer each in the chat. Returns the number of replies sent."""
     if notifier.chat_id is None:
@@ -214,7 +329,8 @@ def poll(
         if not (isinstance(raw, dict) and isinstance(raw.get("offset"), int)):
             raise ValueError(f"{offset_file.name} is not an offset record")
         offset = int(raw["offset"])
-    replies, next_offset = process_updates(notifier.get_updates(offset), notifier.chat_id, index.load(), store, now)
+    replies, next_offset = process_updates(notifier.get_updates(offset), notifier.chat_id, index.load(), store, now,
+                                           currency, book_rate)
     if next_offset is not None:
         # Saved before answering: the bets are already recorded, and a failed answer must not re-read them.
         offset_file.parent.mkdir(parents=True, exist_ok=True)
@@ -224,24 +340,111 @@ def poll(
     return len(replies)
 
 
+def settle_open_bets(
+    open_bets: Sequence[PlacedBet],
+    rows: Mapping[tuple[int, int], tuple[str, int | None, int | None, int | None] | None],
+    now: datetime,
+) -> list[tuple[PlacedBet, Settlement]]:
+    """Pure: grade each open bet from its database row, keyed by (fixture id, player id) and holding (fixture
+    status, minutes, tackles, fouls), or None when the match was never ingested. Ungradable bets stay open."""
+    settled: list[tuple[PlacedBet, Settlement]] = []
+    columns = tuple(SETTLEMENT_COLUMNS)
+    for bet in open_bets:
+        row = rows.get((bet.fixture_id, bet.player_id))
+        if row is None:
+            continue
+        status, minutes, *counts = row
+        count = counts[columns.index(bet.market)] if bet.market in columns else None
+        settlement = grade(bet, status, minutes, count, now)
+        if settlement is not None:
+            settled.append((bet, settlement))
+    return settled
+
+
+def read_settlement_rows(
+    dsn: str, bets: Sequence[PlacedBet],
+) -> dict[tuple[int, int], tuple[str, int | None, int | None, int | None] | None]:
+    """One read-only transaction: each bet's fixture status and its player's stored minutes and counts."""
+    import psycopg2
+
+    rows: dict[tuple[int, int], tuple[str, int | None, int | None, int | None] | None] = {}
+    if not bets:
+        return rows
+    conn = psycopg2.connect(dsn, options="-c statement_timeout=10000 -c default_transaction_read_only=on",
+                            connect_timeout=10)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                for bet in bets:
+                    cur.execute(SETTLEMENT_SQL, (bet.player_id, str(bet.fixture_id)))
+                    found = cur.fetchone()
+                    rows[(bet.fixture_id, bet.player_id)] = None if found is None else (
+                        str(found[0]), *(None if value is None else int(value) for value in found[1:])
+                    )
+    finally:
+        conn.close()
+    return rows
+
+
+def settle(store: PlacedBetStore, dsn: str, now: datetime) -> list[tuple[PlacedBet, Settlement]]:
+    """Record an automatic result for every open bet whose match is final in the database."""
+    open_bets = store.open_bets(now)
+    settled = settle_open_bets(open_bets, read_settlement_rows(dsn, open_bets), now)
+    for _, settlement in settled:
+        store.record_settlement(settlement)
+    return settled
+
+
+def results_summary(settled: Sequence[tuple[PlacedBet, Settlement]]) -> str:
+    """Count, stakes, profit and return on stake of the settled bets."""
+    staked = sum(bet.stake for bet, _ in settled)
+    total = sum(profit(bet, settlement) for bet, settlement in settled)
+    by_result = {result: sum(1 for _, s in settled if s.result == result) for result in RESULTS}
+    roi = f", return on stake {total / staked:+.1%}" if staked > 0 else ""
+    provisional = sum(1 for _, s in settled if s.source == "auto")
+    caveat = (f"; {provisional} provisional (automatic, assumed market rules; not validated results)"
+              if provisional else "")
+    return (f"{len(settled)} settled bet(s) ({by_result['won']} won, {by_result['lost']} lost, {by_result['void']} "
+            f"void): staked {staked:.2f}, profit {total:+.2f}{roi}{caveat}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Record manually placed bets from Telegram replies.")
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--poll", action="store_true", help="read new replies, record bets, answer in the chat")
-    action.add_argument("--list", action="store_true", help="print the open recorded bets")
+    action.add_argument("--list", action="store_true", help="print the open bets and the settled results")
+    action.add_argument("--settle", action="store_true", help="settle open bets whose match is final")
+    parser.add_argument("--send", action="store_true", help="with --settle: send the new results to Telegram")
     args = parser.parse_args(argv)
     now = datetime.now(timezone.utc)
     store = PlacedBetStore()
     if args.list:
         open_bets = store.open_bets(now)
+        stale = {bet.bet_id for bet in store.stale_bets(now)}
         for bet in open_bets:
-            flag = "  BELOW MINIMUM" if bet.below_minimum else ""
+            flag = ("  BELOW MINIMUM" if bet.below_minimum else "") + ("  STALE: settle by hand" if bet.bet_id in stale else "")
             print(f"#{bet.bet_id} {bet.placed_at:%d %b %H:%M} {bet.match} | {bet.player} | {bet.side.upper()} "
                   f"{bet.line:g} {bet.market} @ {bet.odds:.2f} stake {bet.stake:g} ({bet.book}){flag}")
         print(f"{len(open_bets)} open bet(s), total stake {sum(b.stake for b in open_bets):g}")
+        settled = store.settled_bets()
+        for bet, settlement in settled:
+            print(settlement_text(bet, settlement))
+        print(results_summary(settled))
         return 0
-    sent = poll(TelegramNotifier(load_config()), MessageIndex(), store, DEFAULT_OFFSET_FILE, now)
+    if args.settle:
+        settled = settle(store, os.environ.get(DSN_ENV, DEFAULT_DSN), now)
+        lines = [settlement_text(bet, settlement) for bet, settlement in settled]
+        print("\n".join(lines) if lines else "no open bet has a final match in the database")
+        if args.send and lines:
+            TelegramNotifier(load_config()).send_message("\n".join(
+                ["BETS SETTLED (reply settled <bet id> won|lost|void to correct one)", *lines,
+                 results_summary(store.settled_bets())]))
+        return 0
+    currency = bankroll_currency()
+    rate = None if currency == BOOK_CURRENCY else cached_rate()
+    fresh = rate if rate is not None and is_fresh(rate, now.date()) else None
+    sent = poll(TelegramNotifier(load_config()), MessageIndex(), store, DEFAULT_OFFSET_FILE, now, currency, fresh)
     print(f"answered {sent} message(s)")
     return 0
 

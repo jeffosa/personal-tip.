@@ -26,7 +26,7 @@ readonly PIP_VERSION="26.2.1"
 readonly MIN_PYTHON_MAJOR=3
 readonly MIN_PYTHON_MINOR=12
 readonly CI_DATABASE_NAME="prop_alpha_ci"
-readonly EXPECTED_TESTS=468
+readonly EXPECTED_TESTS=540
 
 log() { printf '%s [ci] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { log "FATAL: $*" >&2; exit 1; }
@@ -57,7 +57,7 @@ log "interpreter: $("${PYTHON_BIN}" -V 2>&1)"
 
 for required in \
   requirements.txt schema.sql migrations/003_integrity_constraints.sql migrations/004_merge_hardening.sql \
-  migrations/005_player_current_team.sql prop_alpha/__init__.py tests/test_merge_postgres.sql \
+  migrations/005_player_current_team.sql migrations/006_player_attributes_by_kickoff.sql prop_alpha/__init__.py tests/test_merge_postgres.sql \
   tests/test_core.py tests/test_integrity.py tests/test_pipeline_concurrency.py tests/test_typing_contract.py; do
   [[ -f "${required}" ]] || die "repository is missing ${required}"
 done

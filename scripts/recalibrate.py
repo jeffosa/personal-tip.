@@ -8,7 +8,8 @@ counts) over the tune window, per market. Every price derived from it moves cons
 
 Windows and settings as scripts/tune_backtest.py (prior strength 6, season blend SEASON_PRIOR_MINUTES, k 6 for
 tackles and 1000 for fouls). The test window (2026-09-12 on) is scored once, with and without the multiplier,
-against the PRD Gate 2 criteria. Read-only on the working database. Run from the repository root:
+against the PRD Gate 2 criteria. Its result decided which multipliers to keep, so it is a selection window, not a
+holdout: Gate 2 evidence comes only from the lockbox in prop_alpha/modeling/model_freeze.py. Read-only on the working database. Run from the repository root:
     .venv\\Scripts\\python.exe -u scripts\\recalibrate.py
 Writes .prop_alpha_state/recalibration_<date>.json, which holds the fitted multipliers.
 """

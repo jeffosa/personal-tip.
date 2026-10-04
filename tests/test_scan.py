@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +10,8 @@ import pytest
 import requests
 
 from prop_alpha.alerts import scan
+from prop_alpha.alerts.fx import ExchangeRate
+from prop_alpha.alerts.fx import identity as fx_identity
 from prop_alpha.alerts.telegram import SentAlertStore, TelegramConfig, TelegramNotifier
 from prop_alpha.ingestion import sportmonks
 from prop_alpha.modeling.engine import QuantEngine
@@ -18,6 +20,7 @@ from prop_alpha.scanner.market_scanner import (
     AllocationReport,
     ExposureBook,
     InstitutionalAssetManager,
+    LiveOddsQuote,
 )
 from prop_alpha.alerts.telegram import DEFAULT_CRITERIA, PAPER_LABEL
 from prop_alpha.modeling.engine import VoidRule
@@ -116,6 +119,41 @@ def test_upcoming_listing_keeps_scan_leagues_and_not_started_fixtures() -> None:
     assert "fixtureLeagues:12,14" in sportmonks.upcoming_path(KICKOFF, KICKOFF, 1)
 
 
+def test_a_usd_bankroll_needs_a_rate_and_converts_book_limits(tmp_path: Path) -> None:
+    rate = ExchangeRate("GBP", "USD", 1.3201, date(2026, 10, 2))
+    store = SentAlertStore(tmp_path / "s.jsonl")
+    for currency, book_rate, message in (("EUR", None, "not supported"), ("USD", None, "needs a GBP->USD rate"),
+                                         ("GBP", rate, "does not convert")):
+        with pytest.raises(ValueError, match=message):
+            scan.run_scan(KICKOFF, _StubSportmonks(), "postgresql://unused", None, store, 1000.0, "",
+                          currency=currency, book_rate=book_rate)
+    quote = LiveOddsQuote(9001, 1, "tackles", 1.5, 2.0, 1.8, 50.0, "bet365", KICKOFF, "void_if_no_appearance")
+    [converted] = scan.in_bankroll_currency([quote], rate)
+    assert converted.max_stake == pytest.approx(66.005) and converted.over_price == 2.0
+    assert scan.in_bankroll_currency([quote], fx_identity("GBP")) == [quote]
+
+
+def test_a_fixture_listing_longer_than_the_page_limit_refuses_the_scan() -> None:
+    row = {"id": 1, "league_id": 14, "state": {"developer_name": "NS"}, "starting_at_timestamp": int(KICKOFF.timestamp()),
+           "participants": [{"id": 76, "name": "Walsall", "meta": {"location": "home"}},
+                            {"id": 348, "name": "Port Vale", "meta": {"location": "away"}}]}
+
+    class Listing:
+        def __init__(self, pages: int) -> None:
+            self.pages, self.calls = pages, 0
+
+        def get_json(self, path: str) -> dict[str, Any]:
+            self.calls += 1
+            return {"data": [dict(row, id=self.calls)], "pagination": {"has_more": self.calls < self.pages}}
+
+    start, end = KICKOFF - timedelta(hours=1), KICKOFF + timedelta(hours=1)
+    assert len(scan.fetch_upcoming(Listing(scan.MAX_LISTING_PAGES), start, end)) == scan.MAX_LISTING_PAGES
+    truncated = Listing(scan.MAX_LISTING_PAGES + 1)
+    with pytest.raises(ValueError, match="more than"):
+        scan.fetch_upcoming(truncated, start, end)
+    assert truncated.calls == scan.MAX_LISTING_PAGES
+
+
 def _mock_source(now: datetime, seed: int) -> scan.QuoteSource:
     rng = np.random.default_rng(seed)
     return lambda fixture, projections: mock_quotes(projections, now, rng)
@@ -196,7 +234,7 @@ class _StubSportmonks:
 class _FailingOdds:
     requests_sent = 0
 
-    def get_json_value(self, path: str, empty_on: frozenset[int] = frozenset()) -> Any:
+    def get_json_value(self, path: str, empty_on: frozenset[int] = frozenset(), empty_marker: str = "") -> Any:
         raise requests.HTTPError(f"{path}: HTTP 403: Forbidden")
 
 
@@ -234,11 +272,12 @@ def test_odds_outage_is_reported_in_the_summary_not_fatal(
     notifier = _RecordingNotifier(store)
     with caplog.at_level(logging.ERROR, logger="prop_alpha.scan"):
         summary = scan.run_scan(KICKOFF - timedelta(hours=2), _StubSportmonks(), "postgresql://unused", notifier,
-                                store, 1000.0, "", odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path)
+                                store, 1000.0, "", currency="GBP", odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path)
     assert summary.fixtures == ["Walsall v Port Vale 14:00"]
     assert summary.quotes == 0 and summary.alerts_sent == 0
     assert summary.boards_sent == 1 and notifier.texts and all(t.startswith(PAPER_LABEL) for t in notifier.texts)
     text = summary.text("")
+    assert "Bankroll: GBP 1,000.00" in text
     assert "Odds unavailable this run, nothing priced: HTTPError" in text and "HTTP 403" in text
     assert "Matches kicking off in this window: 1" in text
     assert "Fair-price boards sent (matches with no bookmaker line): 1" in text
@@ -364,7 +403,7 @@ def test_board_is_sent_once_per_match_and_never_for_mock_or_quoted_runs(
     store = SentAlertStore(tmp_path / "sent.jsonl")
     first, again = _RecordingNotifier(store), _RecordingNotifier(store)
     now = KICKOFF - timedelta(hours=2)
-    summary = scan.run_scan(now, _StubSportmonks(), "postgresql://unused", first, store, 1000.0, "",
+    summary = scan.run_scan(now, _StubSportmonks(), "postgresql://unused", first, store, 1000.0, "", currency="GBP",
                             odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path)
     assert summary.boards_sent == 1
     board_text = "\n".join(first.texts)
@@ -372,12 +411,12 @@ def test_board_is_sent_once_per_match_and_never_for_mock_or_quoted_runs(
     assert "Walsall v Port Vale, Sat 10 Oct 14:00 UTC" in board_text
     assert "Regular Starter (Walsall)" in board_text and ">= " in board_text
     assert "Rarely Plays" not in board_text  # not a regular starter, so never priced
-    retry = scan.run_scan(now, _StubSportmonks(), "postgresql://unused", again, store, 1000.0, "",
+    retry = scan.run_scan(now, _StubSportmonks(), "postgresql://unused", again, store, 1000.0, "", currency="GBP",
                           odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path)
     assert retry.boards_sent == 0 and not [t for t in again.texts if scan.BOARD_HEADER in t]
     mock_store = SentAlertStore(tmp_path / "mock.jsonl")
     mocked = scan.run_scan(now, _StubSportmonks(), "postgresql://unused", _RecordingNotifier(mock_store), mock_store,
-                           1000.0, scan.MOCK_LABEL, odds="mock", state_dir=tmp_path / "mock_state")
+                           1000.0, scan.MOCK_LABEL, currency="GBP", odds="mock", state_dir=tmp_path / "mock_state")
     assert mocked.boards_sent == 0
 
 

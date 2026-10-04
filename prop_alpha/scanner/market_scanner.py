@@ -45,8 +45,12 @@ class LiveOddsQuote:
     sportsbook: str
     captured_at: datetime
     void_rule: VoidRule | str
+    # False when the book published no stake limit and max_stake is an assumption (oddspapi.UNKNOWN_LIMIT_STAKE).
+    limit_published: bool = True
 
     def __post_init__(self) -> None:
+        if not isinstance(self.limit_published, bool):
+            raise ValueError("limit_published must be a bool")
         if not isinstance(self.captured_at, datetime) or self.captured_at.tzinfo is None:
             raise ValueError("captured_at must be a timezone-aware UTC datetime")
         if self.captured_at.utcoffset() != timedelta(0):
@@ -87,6 +91,8 @@ class StakingDirective:
     stake: float
     min_acceptable_odds: float
     expires_at: datetime
+    # Copied from the quote: False means the stake was clipped to an assumed limit, not one the book published.
+    limit_published: bool = True
 
 
 @dataclass(frozen=True)
@@ -670,6 +676,7 @@ class InstitutionalAssetManager:
             stake=math.floor(raw_stake * 100.0 + 1e-9) / 100.0,
             min_acceptable_odds=math.ceil(floor_price * 1000.0 - 1e-9) / 1000.0,
             expires_at=candidate.quote.captured_at + self.max_quote_age,
+            limit_published=candidate.quote.limit_published,
         )
 
     def _candidates(
