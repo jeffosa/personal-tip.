@@ -276,6 +276,22 @@ def test_each_market_is_priced_with_its_own_game_state_k() -> None:
     assert {p.game_state_k for (_, _, m), p in projections.items() if m == "fouls"} == {1000.0}
 
 
+def test_rate_multiplier_moves_the_mean_and_keeps_the_shape() -> None:
+    squad, history, recent = _inputs()
+    engine = QuantEngine(game_state_k=6.0)
+    plain, _ = build_projections(FIXTURE, squad, history, recent, RATES, engine)
+    scaled, _ = build_projections(FIXTURE, squad, history, recent, RATES, engine,
+                                  rate_multipliers={"tackles": 0.9483, "fouls": 1.0})
+    for key, projection in plain.items():
+        factor = 0.9483 if key[2] == "tackles" else 1.0
+        assert scaled[key].rate_posterior.mean == pytest.approx(projection.rate_posterior.mean * factor)
+        assert scaled[key].rate_posterior.alpha == projection.rate_posterior.alpha
+    tackles = [k for k in plain if k[2] == "tackles"][0]
+    assert scaled[tackles].side_probabilities(1.5, "over").p_win < plain[tackles].side_probabilities(1.5, "over").p_win
+    with pytest.raises(ValueError):
+        build_projections(FIXTURE, squad, history, recent, RATES, engine, rate_multipliers={"tackles": 0.0})
+
+
 def test_a_history_season_without_a_level_is_skipped_not_guessed() -> None:
     squad, history, recent = _inputs()
     projections, skipped = build_projections(FIXTURE, squad, history, recent, RATES, QuantEngine(game_state_k=6.0),

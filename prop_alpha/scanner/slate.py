@@ -16,7 +16,7 @@ about whether real bookmakers misprice anything. Every mock quote carries MOCK_S
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Final, Mapping, Sequence
@@ -28,6 +28,7 @@ from prop_alpha.modeling.engine import (
     MAX_MATCH_MINUTES,
     NEUTRAL_REFEREE,
     FactorProjection,
+    GammaPosterior,
     LineupExpectation,
     QuantEngine,
     VoidRule,
@@ -48,6 +49,12 @@ SCAN_GAME_STATE_K: Final[float] = 6.0
 # game-state overdispersion (fit_game_state_dispersion refused, 1/k <= 0), and k = 1000 calibrated better than 6
 # (worst bin 0.041 v 0.064 at over 0.5), so fouls are priced without it.
 SCAN_GAME_STATE_K_BY_MARKET: Final[Mapping[str, float]] = MappingProxyType({"tackles": 6.0, "fouls": 1000.0})
+# Level recalibration of the predictive rate, per market (scripts/recalibrate.py, 2026-10-04): actual over predicted
+# counts for 12,320 starts in the tune window (2026-01-01 to 2026-09-12). Tackles 17,183 / 18,120 = 0.9483: on the
+# untouched test window it moved the mean over-probability to actual (O0.5 69.0% -> 67.4% v 66.7%, O1.5 38.9% ->
+# 36.9% v 36.5%) and raised skill on every line. Fouls' fitted 0.9354 made the test worse (O1.5 29.5% -> 27.1% v
+# 29.4%): the league level already corrects fouls, so fouls stay at 1.
+SCAN_RATE_MULTIPLIER_BY_MARKET: Final[Mapping[str, float]] = MappingProxyType({"tackles": 0.9483, "fouls": 1.0})
 
 MOCK_SPORTSBOOK: Final[str] = "MOCK"
 MOCK_LINES: Final[tuple[float, ...]] = (0.5, 1.5, 2.5, 3.5)
@@ -158,6 +165,7 @@ def build_projections(
     *,
     season_levels: Mapping[tuple[str, str], Mapping[int, float]] | None = None,
     market_engines: Mapping[str, QuantEngine] | None = None,
+    rate_multipliers: Mapping[str, float] | None = None,
 ) -> tuple[dict[ProjectionKey, FactorProjection], list[str]]:
     """Projections for every regular starter and scan market, plus the reasons players were left out.
 
@@ -165,8 +173,13 @@ def build_projections(
     kickoff is used. With `season_levels` ((position, market) -> {season -> trailing rate}), each past match's
     minutes are scaled by its season's rate over today's (modeling.league_level), so league-wide drift between
     seasons does not carry into the price; a player whose history reaches a season with no rate is left out.
-    `market_engines` overrides `engine` per market (each market's game-state k).
+    `market_engines` overrides `engine` per market (each market's game-state k). `rate_multipliers` scales each
+    market's predictive rate (level recalibration): the posterior mean moves by the factor, its shape is kept, so
+    every line and side moves consistently.
     """
+    for market, factor in (rate_multipliers or {}).items():
+        if not (math.isfinite(factor) and factor > 0.0):
+            raise ValueError(f"rate multiplier for {market} must be finite and positive")
     projections: dict[ProjectionKey, FactorProjection] = {}
     skipped: list[str] = []
     for player in sorted(squad, key=lambda p: p.player_id):
@@ -193,7 +206,7 @@ def build_projections(
                 exposure, rate = level_scaled_minutes(exposure, [a.kickoff_at for a in on_pitch], levels,
                                                       fixture.kickoff_at)
             market_engine = (market_engines or {}).get(market, engine)
-            projections[(fixture.fixture_id, player.player_id, market)] = market_engine.factor_count_market(
+            projection = market_engine.factor_count_market(
                 fixture_id=fixture.fixture_id,
                 player_id=player.player_id,
                 market_type=market,
@@ -204,6 +217,11 @@ def build_projections(
                 is_home=player.team_uid == fixture.home_team_uid,
                 lineup=lineup,
             )
+            factor = (rate_multipliers or {}).get(market, 1.0)
+            if factor != 1.0:
+                posterior = projection.rate_posterior
+                projection = replace(projection, rate_posterior=GammaPosterior(posterior.alpha, posterior.beta / factor))
+            projections[(fixture.fixture_id, player.player_id, market)] = projection
     return projections, skipped
 
 

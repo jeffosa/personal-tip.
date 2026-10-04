@@ -68,6 +68,7 @@ from prop_alpha.scanner.slate import (
     RECENT_TEAM_MATCHES,
     SCAN_GAME_STATE_K,
     SCAN_GAME_STATE_K_BY_MARKET,
+    SCAN_RATE_MULTIPLIER_BY_MARKET,
     Appearance,
     FairPrice,
     OddsCoverage,
@@ -255,6 +256,7 @@ def scan_fixture(
         projections, skipped = build_projections(
             fixture, inputs.squad, inputs.history_by_player, inputs.team_recent_fixtures, inputs.league_rates, engine,
             season_levels=inputs.season_levels or None, market_engines=market_engines,
+            rate_multipliers=SCAN_RATE_MULTIPLIER_BY_MARKET,
         )
         quotes = quotes_for(fixture, projections)
         report = manager.allocate(projections, quotes, now=now, exposure=exposure)
