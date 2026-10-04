@@ -33,11 +33,13 @@ from pathlib import Path
 from typing import Any, Callable, Final, Mapping, Sequence
 
 import numpy as np
+import requests
 
 from prop_alpha.alerts.status import DEFAULT_DSN, DSN_ENV
 from prop_alpha.alerts.telegram import PAPER_LABEL, AlertContext, SentAlertStore, TelegramNotifier, load_config
 from prop_alpha.config import DEFAULT_ENV_FILE
 from prop_alpha.ingestion import oddspapi, sportmonks
+from prop_alpha.ingestion.pipeline import QuotaExhaustedError
 from prop_alpha.modeling.engine import FactorProjection, ProjectionError, QuantEngine
 from prop_alpha.scanner.market_scanner import (
     MODEL_RISK_LOSS_FLOOR,
@@ -345,7 +347,13 @@ def run_scan(
         if odds_client is None:
             raise ValueError("--odds oddspapi needs an OddsPapi client")
         squads = {fixture.fixture_id: inputs.squad for fixture, inputs in slate}
-        coverage, summary.odds_notes = collect_odds(odds_client, fixtures, squads, now, end, books, state_dir)
+        try:
+            coverage, summary.odds_notes = collect_odds(odds_client, fixtures, squads, now, end, books, state_dir)
+        except (requests.RequestException, QuotaExhaustedError, ValueError) as exc:
+            # An odds outage must show up in the chat, not silence the run: the summary still goes out.
+            summary.odds_notes = [f"Odds unavailable this run, nothing priced: {type(exc).__name__}: {exc}"]
+            logger.error("scan: odds unavailable: %s: %s", type(exc).__name__, exc)
+            coverage = OddsCoverage((), 0, 0, (), ())
         real_quotes = coverage.quotes
 
         def quotes_for(fixture: UpcomingFixture, projections: Mapping[ProjectionKey, FactorProjection]) -> list[LiveOddsQuote]:

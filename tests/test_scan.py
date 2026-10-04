@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+import requests
 
 from prop_alpha.alerts import scan
 from prop_alpha.alerts.telegram import SentAlertStore, TelegramConfig, TelegramNotifier
@@ -174,3 +175,56 @@ def test_notify_max_alerts_must_be_non_negative(tmp_path: Path) -> None:
     notifier = _RecordingNotifier(SentAlertStore(tmp_path / "s.jsonl"))
     with pytest.raises(ValueError):
         notifier.notify(AllocationReport(), {}, max_alerts=-1)
+
+
+class _StubSportmonks:
+    def get_json(self, path: str) -> dict[str, Any]:
+        row = {"id": 9001, "league_id": 14, "state": {"developer_name": "NS"},
+               "starting_at_timestamp": int(KICKOFF.timestamp()),
+               "participants": [{"id": 76, "name": "Walsall", "meta": {"location": "home"}},
+                                {"id": 348, "name": "Port Vale", "meta": {"location": "away"}}]}
+        return {"data": [row], "pagination": {"has_more": False}}
+
+
+class _FailingOdds:
+    requests_sent = 0
+
+    def get_json_value(self, path: str, empty_on: frozenset[int] = frozenset()) -> Any:
+        raise requests.HTTPError(f"{path}: HTTP 403: Forbidden")
+
+
+def test_odds_outage_is_reported_in_the_summary_not_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Audit rerun 2026-10-03: an OddsPapi 403 used to end the run before any summary was sent."""
+    squad, history, recent = _inputs()
+    inputs = scan.SlateInputs(tuple(squad), {k: tuple(v) for k, v in history.items()},
+                              {k: tuple(v) for k, v in recent.items()}, RATES)
+
+    class _Conn:
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def cursor(self) -> Any:
+            return self
+
+        def close(self) -> None:
+            return None
+
+    import psycopg2
+
+    monkeypatch.setattr(psycopg2, "connect", lambda *args, **kwargs: _Conn())
+    monkeypatch.setattr(scan, "load_slate_inputs", lambda cur, fixture: inputs)
+    store = SentAlertStore(tmp_path / "sent.jsonl")
+    notifier = _RecordingNotifier(store)
+    with caplog.at_level(logging.ERROR, logger="prop_alpha.scan"):
+        summary = scan.run_scan(KICKOFF - timedelta(hours=2), _StubSportmonks(), "postgresql://unused", notifier,
+                                store, 1000.0, "", odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path)
+    assert summary.fixtures == ["Walsall v Port Vale 14:00"]
+    assert summary.quotes == 0 and summary.alerts_sent == 0 and notifier.texts == []
+    text = summary.text("")
+    assert "Odds unavailable this run, nothing priced: HTTPError" in text and "HTTP 403" in text
+    assert "Matches kicking off in this window: 1" in text

@@ -42,6 +42,9 @@ SANCTIONED_HANDLERS: frozenset[tuple[str, str, str]] = frozenset({
     # H10, added on 2026-10-03 with the odds collector: OddsPapi takes its key as a query parameter, and
     # requests quotes the URL in its messages, so transport errors are re-raised without it (as H6).
     ("prop_alpha/ingestion/pipeline.py", "VendorClient._get", "requests.RequestException"),
+    # H11, added on 2026-10-03 after the audit rerun: an OddsPapi failure (403, outage, quota) becomes a line
+    # in the scan summary instead of ending the run silently.
+    ("prop_alpha/alerts/scan.py", "run_scan", "(requests.RequestException, QuotaExhaustedError, ValueError)"),
 })
 
 PURE_MODULES: tuple[str, ...] = (
