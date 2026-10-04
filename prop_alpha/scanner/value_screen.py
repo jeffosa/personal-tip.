@@ -45,6 +45,8 @@ from prop_alpha.scanner.market_scanner import StakingDirective, stressed_probabi
 class HighValueCriteria:
     loss_floor: float
     min_ev_per_unit: float = 0.04
+    # Maintainer decision (2026-10-04): stays at 60%. Measured on the reference case, 70% roughly halves the
+    # bets that pass and 80% passes almost none below a 10% edge; revisit only with backtest evidence.
     min_survival_rate: float = 0.60
     n_simulations: int = 1000
 
