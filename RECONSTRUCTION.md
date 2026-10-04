@@ -753,7 +753,7 @@ password is in `%APPDATA%\postgresql\pgpass.conf`, outside the repository. CI us
 
 | Gate | Status |
 |---|---|
-| 1 | Environment met (PRD: "PostgreSQL 15+"; 18.6 qualifies). Criterion 1: fresh install met (`merge_staging_player_feed(integer)` resolves; `idx_odds_fixture_captured` present, `idx_odds_captured_brin` absent); the v2 → 002 upgrade cannot be run, because no v2 schema exists (M-1). Criteria 2–7 (1,000-fixture backfill, zero rejects, reconciliation, idempotency, concurrency soak, lineups) need vendor access and are not started. |
-| 2 | Blocked by Gate 1's backfill; fitting runs and the market-benchmark dataset not started. The backtest's neutral referee cannot evaluate referee-sensitive markets. |
+| 1 | Environment met (PRD: "PostgreSQL 15+"; 18.6 qualifies). Criterion 1: fresh install met (`merge_staging_player_feed(integer)` resolves; `idx_odds_fixture_captured` present, `idx_odds_captured_brin` absent); the v2 → 002 upgrade cannot be run, because no v2 schema exists (M-1). Criterion 2: 1,243 League One/Two fixtures backfilled and merged from Sportmonks on 2026-10-03 with 0 merge rejects; whether the run used `--workers 8`, as the criterion specifies, is not recorded. Criterion 3: not yet assessed, because 63 fixtures were refused by the converter before staging and are not root-caused. Criteria 4–7 (reconciliation, idempotency, concurrency soak, lineups) not run. |
+| 2 | Data for a walk-forward now exists (2025/26 complete, 2026/27 to date); fitting runs, the clustered bootstrap and the market-benchmark dataset not started. The backtest's neutral referee cannot evaluate referee-sensitive markets. |
 | 3 | Projection refresh, bet-ledger writer and closing-line capture are **[N]**. |
 | 4 | Execution component, restriction telemetry and the bench estimator are **[N]**. |
