@@ -31,7 +31,7 @@ from prop_alpha.modeling.engine import (
     QuantEngine,
     VoidRule,
 )
-from prop_alpha.scanner.market_scanner import LiveOddsQuote, ProjectionKey
+from prop_alpha.scanner.market_scanner import LiveOddsQuote, ProjectionKey, price_for_ev, stressed_probabilities
 
 SCAN_INTERVAL: Final[timedelta] = timedelta(hours=4)
 # Market -> the Appearance field it counts. Card markets need referee propensities and are not scanned yet.
@@ -215,6 +215,80 @@ def mock_quotes(
                 void_rule=VoidRule.VOID_IF_NO_APPEARANCE,
             ))
     return quotes
+
+
+# ---------------- fair-price board: no bookmaker line to compare against ----------------
+FAIR_LINES: Final[tuple[float, ...]] = (0.5, 1.5, 2.5, 3.5)
+# A side is listed only when its minimum odds lie in this range. Shorter prices are the near-certain trap (a small
+# win for a large stake, where model error costs most); longer ones are long shots with the least evidence.
+# A display filter for manual betting, not a risk parameter of the allocator.
+FAIR_MIN_ODDS_RANGE: Final[tuple[float, float]] = (1.40, 3.50)
+
+
+@dataclass(frozen=True)
+class FairPrice:
+    """One side of one line for a manual bettor: the model's chance given the bet settles, the no-margin price,
+    and the lowest price worth taking (after the model-risk loss floor, at the minimum expected profit)."""
+
+    fixture_id: int
+    player_id: int
+    market: str
+    line: float
+    side: str
+    model_probability: float
+    fair_odds: float
+    min_odds: float
+
+    def __post_init__(self) -> None:
+        if self.side not in ("over", "under"):
+            raise ValueError("side must be 'over' or 'under'")
+        if not (math.isfinite(self.model_probability) and 0.0 < self.model_probability < 1.0):
+            raise ValueError("model_probability must lie strictly inside (0, 1)")
+        if not (math.isfinite(self.fair_odds) and math.isfinite(self.min_odds) and 1.0 < self.fair_odds <= self.min_odds):
+            raise ValueError("odds must be finite with 1 < fair_odds <= min_odds")
+
+
+def fair_price_board(
+    projections: Mapping[ProjectionKey, FactorProjection], loss_floor: float, min_ev: float
+) -> list[FairPrice]:
+    """For each projection, the FAIR_LINES line whose over-probability is closest to even (most likely the book's
+    main line), with each side's fair and minimum odds. Prices assume the bet is void if the player does not play.
+
+    `min_odds` is the price at which expected profit per unit staked equals `min_ev` once `loss_floor` has moved
+    win probability to loss (as the high-value screen requires), rounded up to 0.01. Sides whose minimum odds fall
+    outside FAIR_MIN_ODDS_RANGE are left out.
+    """
+    if not (math.isfinite(loss_floor) and 0.0 <= loss_floor < 1.0):
+        raise ValueError("loss_floor must lie in [0, 1)")
+    if not (math.isfinite(min_ev) and min_ev > 0.0):
+        raise ValueError("min_ev must be finite and positive")
+    low, high = FAIR_MIN_ODDS_RANGE
+    board: list[FairPrice] = []
+    for key in sorted(projections):
+        projection = projections[key]
+        best: tuple[float, float] | None = None
+        for line in FAIR_LINES:
+            over = projection.side_probabilities(line, "over", VoidRule.VOID_IF_NO_APPEARANCE)
+            settled = over.p_win + over.p_lose
+            if settled > 0.0:
+                gap = abs(over.p_win / settled - 0.5)
+                if best is None or gap < best[0]:
+                    best = (gap, line)
+        if best is None:
+            continue
+        line = best[1]
+        for side in ("over", "under"):
+            probabilities = projection.side_probabilities(line, side, VoidRule.VOID_IF_NO_APPEARANCE)
+            settled = probabilities.p_win + probabilities.p_lose
+            stressed = stressed_probabilities(probabilities, loss_floor)
+            if settled <= 0.0 or stressed.p_win <= 0.0:
+                continue
+            min_odds = math.ceil(price_for_ev(stressed, min_ev) * 100.0 - 1e-9) / 100.0
+            p_win = probabilities.p_win / settled
+            if not (0.0 < p_win < 1.0 and low <= min_odds <= high):
+                continue
+            board.append(FairPrice(key[0], key[1], key[2], line, side, p_win, 1.0 / p_win, min_odds))
+    return board
 
 
 # ---------------- real odds (OddsPapi) -> LiveOddsQuote ----------------

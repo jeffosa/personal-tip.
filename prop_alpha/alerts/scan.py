@@ -13,6 +13,9 @@ transaction, the alert state files, the OddsPapi cache and odds archive under .p
 in ODDS_BOOKMAKERS, plus the market catalogue (weekly) and team names (when an unknown team appears). The free
 plan has 250 requests, so the run first reads the unmetered account endpoint and skips odds when fetching would
 leave fewer than ODDS_QUOTA_RESERVE. Every raw odds response is archived for closing-line analysis.
+In an `--odds oddspapi` run, a match where no bookmaker quote matched any player gets a fair-price board instead
+(`send_boards`): each priced player's fair and minimum odds on the line closest to even, for manual comparison with
+any bookmaker. Each match is boarded once (`fair_boards_sent.json` in the state directory).
 `--odds mock` prices from the model plus noise: its alerts are labelled MOCK on every message and recorded in
 their own state file, so they never count toward real exposure. One fixture that cannot be priced is recorded in the summary and skipped (sanctioned
 handler H9); the rest of the slate is still scanned.
@@ -36,7 +39,14 @@ import numpy as np
 import requests
 
 from prop_alpha.alerts.status import DEFAULT_DSN, DSN_ENV
-from prop_alpha.alerts.telegram import PAPER_LABEL, AlertContext, SentAlertStore, TelegramNotifier, load_config
+from prop_alpha.alerts.telegram import (
+    DEFAULT_CRITERIA,
+    PAPER_LABEL,
+    AlertContext,
+    SentAlertStore,
+    TelegramNotifier,
+    load_config,
+)
 from prop_alpha.config import DEFAULT_ENV_FILE
 from prop_alpha.ingestion import oddspapi, sportmonks
 from prop_alpha.ingestion.pipeline import QuotaExhaustedError
@@ -54,10 +64,12 @@ from prop_alpha.scanner.slate import (
     RECENT_TEAM_MATCHES,
     SCAN_GAME_STATE_K,
     Appearance,
+    FairPrice,
     OddsCoverage,
     SquadPlayer,
     UpcomingFixture,
     build_projections,
+    fair_price_board,
     mock_quotes,
     quotes_from_prices,
     scan_window,
@@ -81,6 +93,15 @@ ODDS_QUOTA_RESERVE: Final[int] = 20
 CATALOGUE_MAX_AGE: Final[timedelta] = timedelta(days=7)
 QuoteSource = Callable[[UpcomingFixture, Mapping[ProjectionKey, FactorProjection]], list[LiveOddsQuote]]
 RATE_LOOKBACK: Final[timedelta] = timedelta(days=365)
+BOARD_STATE_NAME: Final[str] = "fair_boards_sent.json"
+# Rows (player, market) per Telegram message, keeping each board message well under the 4,096-character limit.
+BOARD_ROWS_PER_MESSAGE: Final[int] = 25
+BOARD_HEADER: Final[str] = (
+    "FAIR-PRICE BOARD - no bookmaker line found for this match. Check any bookmaker yourself and bet a side "
+    "only at or above its price. Valid until kickoff. Prices assume the bet is void if the player does not "
+    "play: skip a book whose rule differs. Lineups are estimated, not confirmed. Token stakes only until the "
+    "model is validated."
+)
 
 TEAM_RECENT_SQL: Final[str] = """
     SELECT f.fixture_id
@@ -136,6 +157,7 @@ class ScanSummary:
     quotes: int = 0
     directives: int = 0
     alerts_sent: int = 0
+    boards_sent: int = 0
     alert_cap: int | None = None
     failures: list[str] = field(default_factory=list)
     odds_notes: list[str] = field(default_factory=list)
@@ -154,6 +176,8 @@ class ScanSummary:
             ]
             if self.alert_cap is not None and self.alerts_sent >= self.alert_cap:
                 lines.append(f"Alert cap of {self.alert_cap} per run reached: the best by expected profit were sent")
+            if self.boards_sent:
+                lines.append(f"Fair-price boards sent (matches with no bookmaker line): {self.boards_sent}")
         lines += self.odds_notes
         lines += [f"Could not price {failure}" for failure in self.failures]
         lines.append(PAPER_LABEL)
@@ -231,6 +255,60 @@ def descriptions(
         )
         for key in projections
     }
+
+
+def format_board(fixture: UpcomingFixture, inputs: SlateInputs, entries: Sequence[FairPrice]) -> list[str]:
+    """Board messages for one fixture: one row per player and market with each listed side's minimum odds, home
+    side first; split every BOARD_ROWS_PER_MESSAGE rows."""
+    players = {p.player_id: p for p in inputs.squad}
+    team_names = {fixture.home_team_uid: fixture.home_name, fixture.away_team_uid: fixture.away_name}
+    rows: dict[tuple[int, str, float], dict[str, FairPrice]] = {}
+    for entry in entries:
+        rows.setdefault((entry.player_id, entry.market, entry.line), {})[entry.side] = entry
+
+    def order(key: tuple[int, str, float]) -> tuple[bool, str, str]:
+        player = players[key[0]]
+        return player.team_uid != fixture.home_team_uid, player.name, key[1]
+
+    lines: list[str] = []
+    for key in sorted(rows, key=order):
+        player, sides = players[key[0]], rows[key]
+        over, under = sides.get("over"), sides.get("under")
+        p_over = over.model_probability if over is not None else 1.0 - sides["under"].model_probability
+        prices = " | ".join(f"{side.title()} >= {entry.min_odds:.2f}"
+                            for side, entry in (("over", over), ("under", under)) if entry is not None)
+        lines.append(f"{player.name} ({team_names[player.team_uid]}) {key[1]} {key[2]:g}: {prices} "
+                     f"(model: over {p_over:.0%})")
+    title = f"{fixture.name}, {fixture.kickoff_at:%a %d %b %H:%M} UTC"
+    chunks = [lines[i:i + BOARD_ROWS_PER_MESSAGE] for i in range(0, len(lines), BOARD_ROWS_PER_MESSAGE)]
+    return [
+        "\n".join([PAPER_LABEL, *((BOARD_HEADER,) if i == 0 else ()), title + (" (continued)" if i else ""), *chunk])
+        for i, chunk in enumerate(chunks)
+    ]
+
+
+def send_boards(
+    notifier: TelegramNotifier,
+    candidates: Sequence[tuple[UpcomingFixture, SlateInputs, Mapping[ProjectionKey, FactorProjection]]],
+    state_file: Path,
+) -> int:
+    """Send a fair-price board for each candidate fixture not boarded before (state_file keeps the fixture ids, so
+    a retried run does not repeat a board). Returns the number of fixtures boarded."""
+    sent: set[int] = set(json.loads(state_file.read_text(encoding="utf-8"))) if state_file.is_file() else set()
+    boarded = 0
+    for fixture, inputs, projections in candidates:
+        if fixture.fixture_id in sent:
+            continue
+        entries = fair_price_board(projections, DEFAULT_CRITERIA.loss_floor, DEFAULT_CRITERIA.min_ev_per_unit)
+        if not entries:
+            continue
+        for text in format_board(fixture, inputs, entries):
+            notifier.send_message(text)
+        sent.add(fixture.fixture_id)
+        boarded += 1
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps(sorted(sent)), encoding="utf-8")
+    return boarded
 
 
 def _load_catalogue(path: Path) -> dict[int, oddspapi.LineMarket]:
@@ -372,10 +450,13 @@ def run_scan(
     all_projections: dict[ProjectionKey, FactorProjection] = {}
     all_descriptions: dict[ProjectionKey, AlertContext] = {}
     exposure = store.exposure(now)
+    unquoted: list[tuple[UpcomingFixture, SlateInputs, Mapping[ProjectionKey, FactorProjection]]] = []
     for fixture, inputs in slate:
         projections, report, quotes = scan_fixture(fixture, inputs, now, quotes_for, manager, engine, summary, exposure)
         if report is None:
             continue
+        if odds == "oddspapi" and not quotes and projections:
+            unquoted.append((fixture, inputs, projections))
         summary.players_priced += len({key[1] for key in projections})
         summary.quotes += len(quotes)
         summary.directives += len(report.directives)
@@ -387,6 +468,8 @@ def run_scan(
         summary.alerts_sent, _ = notifier.notify_digest(
             combined, all_projections, label=label, descriptions=all_descriptions, max_alerts=max_alerts
         )
+        # No bookmaker line to compare against: give the manual bettor the model's prices instead.
+        summary.boards_sent = send_boards(notifier, unquoted, state_dir / BOARD_STATE_NAME)
     return summary
 
 

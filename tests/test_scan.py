@@ -19,13 +19,20 @@ from prop_alpha.scanner.market_scanner import (
     ExposureBook,
     InstitutionalAssetManager,
 )
+from prop_alpha.alerts.telegram import DEFAULT_CRITERIA, PAPER_LABEL
+from prop_alpha.modeling.engine import VoidRule
+from prop_alpha.scanner.market_scanner import expected_value, stressed_probabilities
 from prop_alpha.scanner.slate import (
+    FAIR_LINES,
+    FAIR_MIN_ODDS_RANGE,
     MOCK_SPORTSBOOK,
     SCAN_GAME_STATE_K,
     Appearance,
+    FairPrice,
     SquadPlayer,
     UpcomingFixture,
     build_projections,
+    fair_price_board,
     lineup_estimate,
     mock_quotes,
     scan_window,
@@ -193,10 +200,7 @@ class _FailingOdds:
         raise requests.HTTPError(f"{path}: HTTP 403: Forbidden")
 
 
-def test_odds_outage_is_reported_in_the_summary_not_fatal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Audit rerun 2026-10-03: an OddsPapi 403 used to end the run before any summary was sent."""
+def _patch_database(monkeypatch: pytest.MonkeyPatch) -> None:
     squad, history, recent = _inputs()
     inputs = scan.SlateInputs(tuple(squad), {k: tuple(v) for k, v in history.items()},
                               {k: tuple(v) for k, v in recent.items()}, RATES)
@@ -218,13 +222,115 @@ def test_odds_outage_is_reported_in_the_summary_not_fatal(
 
     monkeypatch.setattr(psycopg2, "connect", lambda *args, **kwargs: _Conn())
     monkeypatch.setattr(scan, "load_slate_inputs", lambda cur, fixture: inputs)
+
+
+def test_odds_outage_is_reported_in_the_summary_not_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Audit rerun 2026-10-03: an OddsPapi 403 used to end the run before any summary was sent. With no odds,
+    the match gets a fair-price board instead of high-value alerts."""
+    _patch_database(monkeypatch)
     store = SentAlertStore(tmp_path / "sent.jsonl")
     notifier = _RecordingNotifier(store)
     with caplog.at_level(logging.ERROR, logger="prop_alpha.scan"):
         summary = scan.run_scan(KICKOFF - timedelta(hours=2), _StubSportmonks(), "postgresql://unused", notifier,
                                 store, 1000.0, "", odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path)
     assert summary.fixtures == ["Walsall v Port Vale 14:00"]
-    assert summary.quotes == 0 and summary.alerts_sent == 0 and notifier.texts == []
+    assert summary.quotes == 0 and summary.alerts_sent == 0
+    assert summary.boards_sent == 1 and notifier.texts and all(t.startswith(PAPER_LABEL) for t in notifier.texts)
     text = summary.text("")
     assert "Odds unavailable this run, nothing priced: HTTPError" in text and "HTTP 403" in text
     assert "Matches kicking off in this window: 1" in text
+    assert "Fair-price boards sent (matches with no bookmaker line): 1" in text
+
+
+# ---------------- fair-price board ----------------
+def _projections(rates: dict[tuple[str, str], float] = RATES) -> dict[Any, Any]:
+    squad, history, recent = _inputs()
+    projections, _ = build_projections(FIXTURE, squad, history, recent, rates, QuantEngine(game_state_k=6.0))
+    return projections
+
+
+def test_board_minimum_odds_give_the_screens_profit_after_the_loss_floor() -> None:
+    floor, min_ev = DEFAULT_CRITERIA.loss_floor, DEFAULT_CRITERIA.min_ev_per_unit
+    projections = _projections()
+    board = fair_price_board(projections, floor, min_ev)
+    assert board
+    low, high = FAIR_MIN_ODDS_RANGE
+    for entry in board:
+        assert low <= entry.min_odds <= high and entry.fair_odds < entry.min_odds
+        stressed = stressed_probabilities(
+            projections[(entry.fixture_id, entry.player_id, entry.market)].side_probabilities(
+                entry.line, entry.side, VoidRule.VOID_IF_NO_APPEARANCE), floor)
+        assert expected_value(stressed, entry.min_odds) >= min_ev - 1e-9
+        assert expected_value(stressed, entry.min_odds - 0.01) < min_ev  # rounded up by less than one tick
+
+
+def test_board_lists_the_line_closest_to_even_for_each_player_and_market() -> None:
+    projections = _projections()
+    for entry in fair_price_board(projections, DEFAULT_CRITERIA.loss_floor, DEFAULT_CRITERIA.min_ev_per_unit):
+        projection = projections[(entry.fixture_id, entry.player_id, entry.market)]
+
+        def gap(line: float) -> float:
+            over = projection.side_probabilities(line, "over", VoidRule.VOID_IF_NO_APPEARANCE)
+            return abs(over.p_win / (over.p_win + over.p_lose) - 0.5)
+
+        assert gap(entry.line) == min(gap(line) for line in FAIR_LINES)
+
+
+def test_board_leaves_out_near_certain_and_long_shot_sides() -> None:
+    """A player who almost never fouls: the Under is near-certain (minimum odds about 1.05) and the Over a long
+    shot, so neither side is listed, though the model priced both."""
+    squad, history, recent = _inputs()
+    history[1] = [Appearance(1, a.fixture_id, "76", a.kickoff_at, a.started, a.minutes, a.tackles, 0)
+                  for a in history[1]]
+    projections, _ = build_projections(FIXTURE, squad, history, recent, {**RATES, ("MID", "fouls"): 0.05},
+                                       QuantEngine(game_state_k=6.0))
+    assert (9001, 1, "fouls") in projections
+    board = fair_price_board(projections, DEFAULT_CRITERIA.loss_floor, DEFAULT_CRITERIA.min_ev_per_unit)
+    assert not [e for e in board if (e.player_id, e.market) == (1, "fouls")]
+
+
+def test_board_inputs_and_entries_are_validated() -> None:
+    with pytest.raises(ValueError):
+        fair_price_board({}, 1.0, 0.04)
+    with pytest.raises(ValueError):
+        fair_price_board({}, 0.03, 0.0)
+    with pytest.raises(ValueError):
+        FairPrice(1, 1, "fouls", 1.5, "both", 0.5, 2.0, 2.1)
+    with pytest.raises(ValueError):
+        FairPrice(1, 1, "fouls", 1.5, "over", 0.5, 2.0, 1.9)
+
+
+def test_board_is_sent_once_per_match_and_never_for_mock_or_quoted_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_database(monkeypatch)
+    store = SentAlertStore(tmp_path / "sent.jsonl")
+    first, again = _RecordingNotifier(store), _RecordingNotifier(store)
+    now = KICKOFF - timedelta(hours=2)
+    summary = scan.run_scan(now, _StubSportmonks(), "postgresql://unused", first, store, 1000.0, "",
+                            odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path)
+    assert summary.boards_sent == 1
+    board_text = "\n".join(first.texts)
+    assert first.texts[0].startswith(PAPER_LABEL) and scan.BOARD_HEADER in first.texts[0]
+    assert "Walsall v Port Vale, Sat 10 Oct 14:00 UTC" in board_text
+    assert "Regular Starter (Walsall)" in board_text and ">= " in board_text
+    assert "Rarely Plays" not in board_text  # not a regular starter, so never priced
+    retry = scan.run_scan(now, _StubSportmonks(), "postgresql://unused", again, store, 1000.0, "",
+                          odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path)
+    assert retry.boards_sent == 0 and not [t for t in again.texts if scan.BOARD_HEADER in t]
+    mock_store = SentAlertStore(tmp_path / "mock.jsonl")
+    mocked = scan.run_scan(now, _StubSportmonks(), "postgresql://unused", _RecordingNotifier(mock_store), mock_store,
+                           1000.0, scan.MOCK_LABEL, odds="mock", state_dir=tmp_path / "mock_state")
+    assert mocked.boards_sent == 0
+
+
+def test_board_messages_split_and_keep_the_paper_label() -> None:
+    squad = tuple(SquadPlayer(i, f"Player {i:02d}", "MID", "76") for i in range(1, 40))
+    inputs = scan.SlateInputs(squad, {}, {}, RATES)
+    entries = [FairPrice(9001, i, "fouls", 1.5, "over", 0.5, 2.0, 2.12) for i in range(1, 40)]
+    texts = scan.format_board(FIXTURE, inputs, entries)
+    assert len(texts) == 2 and all(t.startswith(PAPER_LABEL) and len(t) < 4096 for t in texts)
+    assert scan.BOARD_HEADER in texts[0] and scan.BOARD_HEADER not in texts[1] and "(continued)" in texts[1]
+    assert "Player 01 (Walsall) fouls 1.5: Over >= 2.12 (model: over 50%)" in texts[0]
