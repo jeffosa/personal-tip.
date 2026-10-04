@@ -26,7 +26,7 @@ readonly PIP_VERSION="26.2.1"
 readonly MIN_PYTHON_MAJOR=3
 readonly MIN_PYTHON_MINOR=12
 readonly CI_DATABASE_NAME="prop_alpha_ci"
-readonly EXPECTED_TESTS=461
+readonly EXPECTED_TESTS=468
 
 log() { printf '%s [ci] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { log "FATAL: $*" >&2; exit 1; }
@@ -135,8 +135,9 @@ if [[ -n "${PROP_ALPHA_CI_DATABASE_URL:-}" ]]; then
   psql_ci -c 'SELECT * FROM prop_alpha.merge_staging_player_feed()'
   # Behaviour on real rows (transfer, backfill, reject); the script rolls itself back.
   psql_ci -At -f tests/test_merge_postgres.sql >/dev/null
-  # 005 on the current schema must be a no-op (idempotency).
+  # 005 and 006 on the current schema must be no-ops (idempotency).
   psql_ci -f migrations/005_player_current_team.sql
+  psql_ci -f migrations/006_player_attributes_by_kickoff.sql
   psql_ci -c 'SELECT * FROM prop_alpha.merge_staging_player_feed()'
   # Upgrade path: 003 reinstalls the v3.2 zero-argument body (an overload of the v3.3 function); 004 must
   # drop it, so the zero-argument call in pipeline.MERGE_SQL resolves to the batched function again. 005
@@ -144,6 +145,7 @@ if [[ -n "${PROP_ALPHA_CI_DATABASE_URL:-}" ]]; then
   psql_ci -f migrations/003_integrity_constraints.sql
   psql_ci -f migrations/004_merge_hardening.sql
   psql_ci -f migrations/005_player_current_team.sql
+  psql_ci -f migrations/006_player_attributes_by_kickoff.sql
   psql_ci -c 'SELECT * FROM prop_alpha.merge_staging_player_feed()'
   psql_ci -c 'SELECT * FROM prop_alpha.merge_staging_player_feed(1)'
   psql_ci -At -f tests/test_merge_postgres.sql >/dev/null

@@ -15,7 +15,7 @@ $$;
 
 CREATE FUNCTION pg_temp.stage(
     p_batch uuid, p_fixture text, p_home text, p_away text, p_kickoff timestamptz,
-    p_player text, p_team text, p_tackles_won integer DEFAULT 1
+    p_player text, p_team text, p_tackles_won integer DEFAULT 1, p_position text DEFAULT 'DM'
 ) RETURNS void LANGUAGE sql AS $$
     INSERT INTO prop_alpha.staging_player_feed (
         batch_id, vendor_fixture_uid, home_team_uid, away_team_uid, kickoff_at, fixture_status,
@@ -24,7 +24,7 @@ CREATE FUNCTION pg_temp.stage(
         tackles_attempted, tackles_won, fouls_committed, fouls_drawn, yellow_cards, red_cards
     ) VALUES (
         p_batch, p_fixture, p_home, p_away, p_kickoff, 'final',
-        p_player, 'Player ' || p_player, 'DM', p_team, p_team = p_home, TRUE,
+        p_player, 'Player ' || p_player, p_position, p_team, p_team = p_home, TRUE,
         0, 90, 90,
         2, p_tackles_won, 1, 1, 0, 0
     );
@@ -73,5 +73,25 @@ SELECT pg_temp.expect(
     'all three appearances are kept'
 );
 SELECT pg_temp.expect(NOT EXISTS (SELECT 1 FROM prop_alpha.staging_player_feed), 'staging is drained');
+
+-- 4. Name and position follow the latest match by kickoff (migration 006), not the last row staged.
+CREATE FUNCTION pg_temp.position_of(p_player text) RETURNS text LANGUAGE sql AS $$
+    SELECT primary_position FROM prop_alpha.players WHERE vendor_player_uid = p_player;
+$$;
+SELECT pg_temp.stage('00000000-0000-0000-0000-000000000004', 'f3', 'tB', 'tC', '2026-10-01T15:00Z', 'p1', 'tB', 1, 'AM');
+SELECT pg_temp.expect(player_rows_merged = 1, 'new-position merge counts') FROM prop_alpha.merge_staging_player_feed();
+SELECT pg_temp.expect(pg_temp.position_of('p1') = 'AM', 'a newer match sets the position');
+SELECT pg_temp.stage('00000000-0000-0000-0000-000000000005', 'f00', 'tA', 'tC', '2026-06-01T15:00Z', 'p1', 'tA', 1, 'GK');
+SELECT pg_temp.expect(player_rows_merged = 1, 'old-match merge counts') FROM prop_alpha.merge_staging_player_feed();
+SELECT pg_temp.expect(pg_temp.position_of('p1') = 'AM', 'a backfilled older match does not change the position');
+-- Re-ingesting two matches in one batch, the older staged last: the newer match still wins.
+SELECT pg_temp.stage('00000000-0000-0000-0000-000000000006', 'f3', 'tB', 'tC', '2026-10-01T15:00Z', 'p1', 'tB', 1, 'AM');
+SELECT pg_temp.stage('00000000-0000-0000-0000-000000000006', 'f2', 'tB', 'tC', '2026-09-01T15:00Z', 'p1', 'tB', 1, 'DM');
+SELECT pg_temp.expect(player_rows_merged = 2, 're-ingest merge counts') FROM prop_alpha.merge_staging_player_feed();
+SELECT pg_temp.expect(pg_temp.position_of('p1') = 'AM', 'staging order does not decide the position');
+SELECT pg_temp.expect(
+    (SELECT attributes_as_of FROM prop_alpha.players WHERE vendor_player_uid = 'p1') = '2026-10-01T15:00Z',
+    'attributes_as_of is the kickoff of the match that set them'
+);
 
 ROLLBACK;

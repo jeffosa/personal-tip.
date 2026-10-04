@@ -269,7 +269,9 @@ MIGRATION_002 = (ROOT / "migrations" / "002_staging_and_indexes.sql").read_text(
 MIGRATION_003 = (ROOT / "migrations" / "003_integrity_constraints.sql").read_text(encoding="utf-8")
 MIGRATION_004 = (ROOT / "migrations" / "004_merge_hardening.sql").read_text(encoding="utf-8")
 MIGRATION_005 = (ROOT / "migrations" / "005_player_current_team.sql").read_text(encoding="utf-8")
-MERGE_SOURCES = {"schema.sql": SCHEMA, "003": MIGRATION_003, "004": MIGRATION_004, "005": MIGRATION_005}
+MIGRATION_006 = (ROOT / "migrations" / "006_player_attributes_by_kickoff.sql").read_text(encoding="utf-8")
+MERGE_SOURCES = {"schema.sql": SCHEMA, "003": MIGRATION_003, "004": MIGRATION_004, "005": MIGRATION_005,
+                 "006": MIGRATION_006}
 CORE_CONSTRAINTS = (
     "chk_possession_bounds", "chk_minute_logic", "chk_tackles_won_le_attempted", "chk_duels_won_le_total",
 )
@@ -329,7 +331,7 @@ def _merge_stats_insert_columns(function: str) -> list[str]:
     return [column.strip() for column in match.group(1).replace("\n", " ").split(",")]
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "003", "004", "005"])
+@pytest.mark.parametrize("source", ["schema.sql", "003", "004", "005", "006"])
 def test_merge_rejects_every_row_a_core_constraint_would_refuse(source: str) -> None:
     block = _player_reject_block(_merge_function(MERGE_SOURCES[source]))
     for constraint, fragments in REJECT_PREDICATES.items():
@@ -339,7 +341,7 @@ def test_merge_rejects_every_row_a_core_constraint_would_refuse(source: str) -> 
         assert f"CONSTRAINT {constraint}" in SCHEMA
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "004", "005"])
+@pytest.mark.parametrize("source", ["schema.sql", "004", "005", "006"])
 def test_merge_rejects_null_market_metrics(source: str) -> None:
     block = _player_reject_block(_merge_function(MERGE_SOURCES[source]))
     for fragment in NULL_METRIC_PREDICATES:
@@ -348,7 +350,8 @@ def test_merge_rejects_null_market_metrics(source: str) -> None:
 
 
 def test_merge_function_identical_in_schema_and_latest_migration() -> None:
-    assert _merge_function(SCHEMA) == _merge_function(MIGRATION_005)
+    assert _merge_function(SCHEMA) == _merge_function(MIGRATION_006)
+    assert _merge_function(MIGRATION_005) != _merge_function(MIGRATION_006)
     assert _merge_function(MIGRATION_004) != _merge_function(MIGRATION_005)
     assert _merge_function(MIGRATION_003) != _merge_function(MIGRATION_004)
 
@@ -360,7 +363,7 @@ CURRENT_TEAM_FROM_LATEST_KICKOFF = (
 )
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "005"])
+@pytest.mark.parametrize("source", ["schema.sql", "005", "006"])
 def test_merge_moves_player_to_team_of_latest_fixture(source: str) -> None:
     function = _merge_function(MERGE_SOURCES[source])
     for fragment in CURRENT_TEAM_FROM_LATEST_KICKOFF:
@@ -426,9 +429,12 @@ def test_referee_job_shares_merge_advisory_lock_key() -> None:
     for sql in (SCHEMA, MIGRATION_003, MIGRATION_004, MIGRATION_005):
         keys = re.findall(r"pg_advisory_xact_lock\(hashtext\('([^']+)'\)\)", sql)
         assert keys == [referee_job.MERGE_LOCK_KEY]
+    # 006 also takes the lock for its one-time players repair.
+    keys = re.findall(r"pg_advisory_xact_lock\(hashtext\('([^']+)'\)\)", MIGRATION_006)
+    assert keys == [referee_job.MERGE_LOCK_KEY] * 2
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "003", "004", "005"])
+@pytest.mark.parametrize("source", ["schema.sql", "003", "004", "005", "006"])
 def test_merge_drains_by_single_delete_returning_after_taking_the_lock(source: str) -> None:
     function = _merge_function(MERGE_SOURCES[source])
     body = _strip_comments(function[function.index("\nBEGIN\n"):])
@@ -465,7 +471,7 @@ def test_merge_drains_by_single_delete_returning_after_taking_the_lock(source: s
 
 
 def test_no_truncate_in_any_sql() -> None:
-    for sql in (SCHEMA, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005):
+    for sql in (SCHEMA, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006):
         assert "TRUNCATE" not in _strip_comments(sql).upper()
 
 
@@ -473,7 +479,8 @@ def test_merge_upserts_order_by_conflict_key_and_keep_latest_row() -> None:
     function = _merge_function(SCHEMA)
     assert "ORDER BY c.referee_uid, c.staged_at DESC" in function
     assert "ORDER BY cf.vendor_fixture_uid, cf.staged_at DESC" in function
-    assert "ORDER BY c.vendor_player_uid, c.staged_at DESC" in function
+    # Players: latest match by kickoff wins (migration 006), the staged order only breaks exact ties.
+    assert "ORDER BY c.vendor_player_uid, c.kickoff_at DESC, c.vendor_fixture_uid DESC, c.staged_at DESC" in function
     assert "ORDER BY cf.vendor_fixture_uid, cf.vendor_player_uid, cf.staged_at DESC" in function
     assert "ORDER BY f.fixture_id, p.player_id\n    ON CONFLICT (fixture_id, player_id)" in function
 
@@ -519,3 +526,40 @@ def test_application_sql_references_existing_columns() -> None:
     stats = set(_table_columns(SCHEMA, "player_match_stats"))
     assert {"fouls_committed", "yellow_cards", "red_cards", "is_home"} <= stats
     assert {"status", "referee_id", "league_id", "kickoff_at"} <= set(_table_columns(SCHEMA, "fixtures"))
+
+
+PLAYER_ATTRIBUTES_FROM_LATEST_KICKOFF = (
+    "c.player_name, c.player_position, t.team_id, c.vendor_player_uid, c.kickoff_at",
+    "ORDER BY c.vendor_player_uid, c.kickoff_at DESC, c.vendor_fixture_uid DESC, c.staged_at DESC",
+    "attributes_as_of = EXCLUDED.attributes_as_of,",
+    "WHERE pl.attributes_as_of IS NULL OR EXCLUDED.attributes_as_of >= pl.attributes_as_of;",
+)
+
+
+@pytest.mark.parametrize("source", ["schema.sql", "006"])
+def test_player_attributes_follow_the_latest_match_not_the_last_row_staged(source: str) -> None:
+    """Gate 1 idempotency (2026-10-04): name and position followed the last row staged, so re-ingesting an old
+    match rewrote them and concurrent workers made the winner arbitrary."""
+    function = _merge_function(MERGE_SOURCES[source])
+    for fragment in PLAYER_ATTRIBUTES_FROM_LATEST_KICKOFF:
+        assert fragment in function, f"missing player-attribute fragment {fragment!r}"
+    assert "ORDER BY c.vendor_player_uid, c.staged_at DESC" not in function
+    assert "attributes_as_of  TIMESTAMPTZ" in SCHEMA
+
+
+def test_migration_006_adds_the_column_replaces_the_merge_and_repairs_in_one_transaction() -> None:
+    body = _strip_comments(MIGRATION_006)
+    statements = [line.strip() for line in body.splitlines() if line.strip()]
+    assert statements[:4] == [
+        "SET lock_timeout = '5s';", "BEGIN;",
+        "ALTER TABLE prop_alpha.players ADD COLUMN IF NOT EXISTS attributes_as_of TIMESTAMPTZ;",
+        "DROP FUNCTION IF EXISTS prop_alpha.merge_staging_player_feed();",
+    ]
+    assert statements[-2:] == ["COMMIT;", "RESET lock_timeout;"]
+    repair = body[body.index("$$;"):]
+    assert repair.index("pg_advisory_xact_lock") < repair.index("UPDATE prop_alpha.players AS pl")
+    assert "jsonb_to_recordset(r.payload->'players')" in repair
+    assert "ORDER BY e.uid, f.kickoff_at DESC, f.vendor_fixture_uid DESC" in repair
+    assert "IS DISTINCT FROM (latest.name, latest.position, latest.kickoff_at)" in repair
+    for statement in ("TRUNCATE", "VACUUM FULL", "CLUSTER", "ALTER COLUMN", "SET DEFAULT"):
+        assert statement not in body

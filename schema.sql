@@ -1,7 +1,7 @@
 -- prop_alpha schema v3.3 (reconstructed): fresh install for PostgreSQL 15+.
 -- Status: installs cleanly on PostgreSQL 18.6 (ci/bootstrap.sh stage 6, 2026-10-02); the merge has only
 -- run on empty staging and on the fixtures in tests/test_merge_postgres.sql. Not run on PostgreSQL 15.
--- A fresh database gets this file only; it already embodies migrations 002 to 005.
+-- A fresh database gets this file only; it already embodies migrations 002 to 006.
 -- Never apply migrations/002_staging_and_indexes.sql to a database built from this file: it would
 -- reinstall the v3.0 merge function and drop the minute-logic reject predicates.
 -- Run with: psql -v ON_ERROR_STOP=1 -f schema.sql
@@ -33,7 +33,9 @@ CREATE TABLE players (
     primary_position  VARCHAR(16)  NOT NULL,
     current_team_id   INTEGER      REFERENCES teams(team_id),
     vendor_player_uid VARCHAR(64)  NOT NULL UNIQUE,
-    updated_at        TIMESTAMPTZ  NOT NULL DEFAULT now()
+    updated_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    -- Kickoff of the match that set full_name and primary_position (migration 006).
+    attributes_as_of  TIMESTAMPTZ
 );
 
 -- Coefficients are written only by calibration.referee_job.run_referee_job, under the merge's
@@ -261,7 +263,7 @@ CREATE TABLE bets (
 );
 
 -- ============================================================
--- merge_staging_player_feed(): identical to migrations/005_player_current_team.sql (AGENT M4, Z5).
+-- merge_staging_player_feed(): identical to migrations/006_player_attributes_by_kickoff.sql (AGENT M4, Z5).
 -- Call: SELECT * FROM prop_alpha.merge_staging_player_feed();  -- claims at most 200 batches per call
 -- ============================================================
 CREATE OR REPLACE FUNCTION prop_alpha.merge_staging_player_feed(p_max_batches integer DEFAULT 200)
@@ -377,17 +379,23 @@ BEGIN
         ingested_at          = now();
     GET DIAGNOSTICS v_fixtures = ROW_COUNT;
 
-    INSERT INTO prop_alpha.players AS pl (full_name, primary_position, current_team_id, vendor_player_uid)
+    -- Name and position come from the player's latest match by kickoff, never from the last row staged: a
+    -- backfilled older match must not overwrite them, and with concurrent workers "last staged" is arbitrary.
+    -- attributes_as_of is the kickoff of the match that set them; an older match leaves them alone.
+    INSERT INTO prop_alpha.players AS pl
+        (full_name, primary_position, current_team_id, vendor_player_uid, attributes_as_of)
     SELECT DISTINCT ON (c.vendor_player_uid)
-           c.player_name, c.player_position, t.team_id, c.vendor_player_uid
+           c.player_name, c.player_position, t.team_id, c.vendor_player_uid, c.kickoff_at
     FROM claimed_feed c
     JOIN prop_alpha.teams t ON t.vendor_team_uid = c.team_uid
     WHERE c.vendor_player_uid IS NOT NULL
-    ORDER BY c.vendor_player_uid, c.staged_at DESC
+    ORDER BY c.vendor_player_uid, c.kickoff_at DESC, c.vendor_fixture_uid DESC, c.staged_at DESC
     ON CONFLICT (vendor_player_uid) DO UPDATE SET
         full_name        = EXCLUDED.full_name,
         primary_position = EXCLUDED.primary_position,
-        updated_at       = now();
+        attributes_as_of = EXCLUDED.attributes_as_of,
+        updated_at       = now()
+    WHERE pl.attributes_as_of IS NULL OR EXCLUDED.attributes_as_of >= pl.attributes_as_of;
 
     INSERT INTO prop_alpha.player_match_stats AS s (
         fixture_id, player_id, team_id, is_home, started, minute_on, minute_off, minutes_played,
