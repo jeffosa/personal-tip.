@@ -109,16 +109,19 @@ def test_tackles_won_above_tackles_is_capped_logged_and_kept_raw(caplog: pytest.
     assert raw["TACKLES_WON"] == 2
 
 
-def test_unidentified_player_who_played_fails_the_fixture() -> None:
+def test_unidentified_starter_is_skipped_and_logged(caplog: pytest.LogCaptureFixture) -> None:
     body = _fixture()
+    before = len(parse_fixture_payload(sportmonks.fixture_payload(body)).players)
     starter = next(row for row in body["data"]["lineups"] if row["type_id"] == sportmonks.STARTING_XI)
     starter["player_id"] = None
-    with pytest.raises(ValueError, match="without a player_id"):
-        sportmonks.fixture_payload(body)
+    with caplog.at_level(logging.WARNING, logger="prop_alpha.ingestion.sportmonks"):
+        players = parse_fixture_payload(sportmonks.fixture_payload(body)).players
+    assert len(players) == before - 1
+    assert "(starter," in caplog.text
 
 
-def test_unidentified_unused_substitute_is_skipped_and_logged(caplog: pytest.LogCaptureFixture) -> None:
-    """Real 2025/26 row (fixture 19432415): bench, no id, no statistics. Previously refused the fixture."""
+def test_unidentified_substitute_is_skipped_and_logged_with_minutes(caplog: pytest.LogCaptureFixture) -> None:
+    """Real 2025/26 rows (fixtures 19432415, 19432307): bench, no id; some played. Previously refused the fixture."""
     body = _fixture()
     before = len(parse_fixture_payload(sportmonks.fixture_payload(body)).players)
     body["data"]["lineups"].append({
@@ -128,10 +131,14 @@ def test_unidentified_unused_substitute_is_skipped_and_logged(caplog: pytest.Log
     with caplog.at_level(logging.WARNING, logger="prop_alpha.ingestion.sportmonks"):
         players = parse_fixture_payload(sportmonks.fixture_payload(body)).players
     assert len(players) == before
-    assert "without a player_id: Oliver Evans" in caplog.text
+    assert "without a player_id: Oliver Evans (sub, 0 min)" in caplog.text
     body["data"]["lineups"][-1]["details"] = [_detail("MINUTES_PLAYED", 12)]
-    with pytest.raises(ValueError, match="without a player_id"):
-        sportmonks.fixture_payload(body)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="prop_alpha.ingestion.sportmonks"):
+        payload = sportmonks.fixture_payload(body)
+    assert len(parse_fixture_payload(payload).players) == before
+    assert "Oliver Evans (sub, 12 min)" in caplog.text
+    assert any(r.get("player_name") == "Oliver Evans" for r in payload["vendor_response"]["lineups"])
 
 
 def test_absent_details_are_zero_and_present_ones_map_exactly() -> None:

@@ -186,19 +186,19 @@ def fixture_payload(body: Mapping[str, Any]) -> dict[str, Any]:
     players: list[dict[str, Any]] = []
     seen_details: set[str] = set()
     capped: list[str] = []
-    unidentified_bench: list[str] = []
+    unidentified: list[str] = []
     for row in lineups:
         kind = row.get("type_id")
         if kind not in (STARTING_XI, BENCH):
             raise ValueError(f"fixture {fixture.get('id')}: unknown lineup type_id {kind!r}")
         details = _details(row)
         if row.get("player_id") is None:
-            # Seen on ~9% of 2025/26 League One fixtures: an unregistered squad player on the bench. An unused
-            # substitute has no statistics, so nothing is lost by leaving them out; anyone who played is.
-            if kind == BENCH and details.get("MINUTES_PLAYED", 0) == 0:
-                unidentified_bench.append(str(row.get("player_name") or "unnamed"))
-                continue
-            raise ValueError(f"fixture {fixture.get('id')}: lineup row without a player_id (unidentified player)")
+            # Seen on ~9% of 2025/26 League One fixtures: a named player, usually a substitute, with no identity.
+            # The row cannot be keyed, so it is left out of the stored players (the raw row stays in
+            # vendor_response) and logged with its role and minutes. Maintainer decision 2026-10-04: load the match.
+            role = "starter" if kind == STARTING_XI else "sub"
+            unidentified.append(f"{row.get('player_name') or 'unnamed'} ({role}, {details.get('MINUTES_PLAYED', 0)} min)")
+            continue
         uid = str(row["player_id"])
         seen_details.update(details)
         started = kind == STARTING_XI
@@ -229,9 +229,9 @@ def fixture_payload(body: Mapping[str, Any]) -> dict[str, Any]:
                 player["minute_off"] = max(minute_off, minute_on) if minute_off is not None else minute_on + minutes
         players.append(player)
 
-    if unidentified_bench:
-        logger.warning("fixture %s: skipped unused substitutes without a player_id: %s", fixture.get("id"),
-                       ", ".join(unidentified_bench))
+    if unidentified:
+        logger.warning("fixture %s: skipped players without a player_id: %s", fixture.get("id"),
+                       ", ".join(unidentified))
     if capped:
         logger.warning("fixture %s: TACKLES_WON capped at TACKLES for %s", fixture.get("id"), ", ".join(capped))
     if status == "final":
