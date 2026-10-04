@@ -550,9 +550,18 @@ class QuantEngine:
 
     @staticmethod
     def gamma_poisson_update(
-        prior: GammaPosterior, counts: Sequence[int], minutes: Sequence[float]
+        prior: GammaPosterior, counts: Sequence[int], minutes: Sequence[float],
+        exposure_scale: Sequence[float] | None = None,
     ) -> GammaPosterior:
+        """Conjugate update: alpha + sum(counts), beta + sum(minutes x scale) / 90. `exposure_scale` weights each
+        match's minutes (the league level of its season over today's, modeling.league_level.level_ratios); the
+        minutes themselves are validated as played, so a weight above 1 never fails the MAX_MATCH_MINUTES check."""
         np_minutes, np_counts = validate_exposure_vector(minutes, counts, allow_empty=True)
+        if exposure_scale is not None:
+            scale = np.asarray(exposure_scale, dtype=np.float64)
+            if scale.shape != np_minutes.shape or not np.isfinite(scale).all() or (scale <= 0.0).any():
+                raise ValueError("exposure_scale needs one finite, positive weight per match")
+            np_minutes = np_minutes * scale
         return GammaPosterior(
             alpha=prior.alpha + float(np_counts.sum()),
             beta=prior.beta + float(np_minutes.sum()) / 90.0,
@@ -635,9 +644,10 @@ class QuantEngine:
         referee: RefereeProfile,
         is_home: bool,
         prior_strength_90s: float,
+        exposure_scale: Sequence[float] | None = None,
     ) -> tuple[GammaPosterior, float]:
         posterior = self.gamma_poisson_update(
-            self.positional_prior(league_rate_per90, prior_strength_90s), counts, minutes
+            self.positional_prior(league_rate_per90, prior_strength_90s), counts, minutes, exposure_scale
         )
         multiplier = (
             self.referee_multiplier(referee, is_home)
@@ -683,9 +693,10 @@ class QuantEngine:
         is_home: bool,
         lineup: LineupExpectation,
         prior_strength_90s: float = 6.0,
+        exposure_scale: Sequence[float] | None = None,
     ) -> PropProjection:
         posterior, multiplier = self._count_inputs(
-            market_type, counts, minutes, league_rate_per90, referee, is_home, prior_strength_90s
+            market_type, counts, minutes, league_rate_per90, referee, is_home, prior_strength_90s, exposure_scale
         )
         gamma_shape, gamma_rate = self.predictive_gamma(posterior, multiplier, 0.0)
         return PropProjection(fixture_id, player_id, market_type, gamma_shape, gamma_rate, lineup)
@@ -703,10 +714,11 @@ class QuantEngine:
         is_home: bool,
         lineup: LineupExpectation,
         prior_strength_90s: float = 6.0,
+        exposure_scale: Sequence[float] | None = None,
     ) -> FactorProjection:
         """As project_count_market, but keeps the posterior and k apart for fixture-level covariance."""
         posterior, multiplier = self._count_inputs(
-            market_type, counts, minutes, league_rate_per90, referee, is_home, prior_strength_90s
+            market_type, counts, minutes, league_rate_per90, referee, is_home, prior_strength_90s, exposure_scale
         )
         return FactorProjection(
             fixture_id, player_id, market_type, self.rate_posterior(posterior, multiplier, 0.0), self.game_state_k, lineup

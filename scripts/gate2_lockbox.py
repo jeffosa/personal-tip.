@@ -8,9 +8,9 @@ climatology with a fixture-clustered bootstrap 90% lower bound > 0, calibration 
 >= 50 within 0.03. A market passes when all its lines pass.
 
 Not judged here: the market benchmark (criterion 4) needs devigged closing prices, which are not captured; card
-markets are not priced by the scan. Deviations from the PRD protocol: lineups are the scan's estimates, not team
-sheets; a player's position is his latest stored one (players.primary_position), which may come from the lockbox
-match itself.
+markets are not priced by the scan. Deviation from the PRD protocol: lineups are the scan's estimates, not team
+sheets. Positions are as of kickoff (player_match_stats.match_position, migration 007), so a lockbox match never
+informs its own price.
 
 Refuses to run when the pricing code differs from the freeze (model_freeze.FROZEN_DIGEST). Read-only on the working
 database. Run from the repository root:

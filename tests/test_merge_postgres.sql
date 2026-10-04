@@ -94,4 +94,16 @@ SELECT pg_temp.expect(
     'attributes_as_of is the kickoff of the match that set them'
 );
 
+-- 5. Each match keeps the position staged with it (migration 007), whatever the player's latest position is.
+CREATE FUNCTION pg_temp.match_position_of(p_fixture text, p_player text) RETURNS text LANGUAGE sql AS $$
+    SELECT s.match_position
+    FROM prop_alpha.player_match_stats s
+    JOIN prop_alpha.fixtures f USING (fixture_id)
+    JOIN prop_alpha.players p USING (player_id)
+    WHERE f.vendor_fixture_uid = p_fixture AND p.vendor_player_uid = p_player;
+$$;
+SELECT pg_temp.expect(pg_temp.match_position_of('f00', 'p1') = 'GK', 'the old match keeps its own position');
+SELECT pg_temp.expect(pg_temp.match_position_of('f2', 'p1') = 'DM', 'a re-ingested match keeps its own position');
+SELECT pg_temp.expect(pg_temp.match_position_of('f3', 'p1') = 'AM', 'the latest match keeps its own position');
+
 ROLLBACK;

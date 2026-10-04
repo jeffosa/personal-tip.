@@ -9,6 +9,7 @@ from prop_alpha.modeling.engine import QuantEngine
 from prop_alpha.modeling.league_level import (
     SEASON_PRIOR_MINUTES,
     SeasonTotals,
+    level_ratios,
     level_scaled_minutes,
     season_of,
     season_rates,
@@ -77,3 +78,19 @@ def test_a_lower_current_level_lowers_the_over_probability() -> None:
     lower = walk_forward_over_probability(_history(), 1.5, 1.5, engine, level=lambda as_of: {2025: 1.6, 2026: 1.5})
     this_season = [i for i, p in enumerate(same) if p.kickoff_at >= _utc(2026, 7, 1)]
     assert this_season and all(lower[i].p_over < same[i].p_over for i in this_season)
+
+
+def test_level_ratios_weight_minutes_without_inflating_them() -> None:
+    """2026-10-04: a 125-minute match in a busier season became 137.5 scaled minutes, over MAX_MATCH_MINUTES, and
+    refused the whole fixture. The ratio now goes to the engine as a weight; the minutes stay as played."""
+    kickoffs = [_utc(2025, 9, 1), _utc(2026, 9, 1)]
+    ratios, now_level = level_ratios(kickoffs, {2025: 1.65, 2026: 1.5}, _utc(2026, 10, 3))
+    assert now_level == 1.5 and ratios == pytest.approx([1.1, 1.0])
+    prior = QuantEngine.positional_prior(1.5)
+    weighted = QuantEngine.gamma_poisson_update(prior, [3, 1], [125.0, 90.0], ratios)
+    assert weighted.beta == pytest.approx(prior.beta + (125.0 * 1.1 + 90.0) / 90.0)
+    with pytest.raises(ValueError, match="minutes must lie"):
+        QuantEngine.gamma_poisson_update(prior, [3, 1], [125.0 * 1.1, 90.0])  # the old way
+    for bad in ([1.1], [1.1, 0.0], [1.1, float("nan")]):
+        with pytest.raises(ValueError, match="exposure_scale"):
+            QuantEngine.gamma_poisson_update(prior, [3, 1], [125.0, 90.0], bad)

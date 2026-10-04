@@ -69,6 +69,7 @@ from prop_alpha.scanner.slate import (
     RECENT_TEAM_MATCHES,
     SCAN_GAME_STATE_K,
     SCAN_GAME_STATE_K_BY_MARKET,
+    SCAN_PRIOR_STRENGTH_BY_MARKET,
     SCAN_RATE_MULTIPLIER_BY_MARKET,
     Appearance,
     FairPrice,
@@ -118,12 +119,17 @@ TEAM_RECENT_SQL: Final[str] = """
     ORDER BY f.kickoff_at DESC
     LIMIT %s
 """
+# Position as of kickoff: the player's position in his latest of these (pre-kickoff) matches, from
+# player_match_stats.match_position (migration 007), never players.primary_position, which follows his latest
+# match overall and would leak later matches into an earlier price (audit 2026-10-04).
 SQUAD_SQL: Final[str] = """
-    SELECT DISTINCT p.player_id, p.full_name, p.primary_position
+    SELECT DISTINCT ON (p.player_id) p.player_id, p.full_name, s.match_position
     FROM prop_alpha.player_match_stats s
     JOIN prop_alpha.players p USING (player_id)
+    JOIN prop_alpha.fixtures f USING (fixture_id)
     JOIN prop_alpha.teams t ON t.team_id = s.team_id
-    WHERE s.fixture_id = ANY(%s) AND t.vendor_team_uid = %s
+    WHERE s.fixture_id = ANY(%s) AND t.vendor_team_uid = %s AND s.match_position IS NOT NULL
+    ORDER BY p.player_id, f.kickoff_at DESC, f.fixture_id DESC
 """
 HISTORY_SQL: Final[str] = """
     SELECT s.player_id, s.fixture_id, t.vendor_team_uid, f.kickoff_at, s.started, s.minutes_played,
@@ -137,14 +143,14 @@ HISTORY_SQL: Final[str] = """
 # Per position and kickoff, for the league level (modeling.league_level): totals from the current season and the
 # LEVEL_SEASONS - 1 before it, strictly before the fixture's kickoff.
 LEVEL_SQL: Final[str] = """
-    SELECT p.primary_position, f.kickoff_at,
+    SELECT s.match_position, f.kickoff_at,
            sum(s.tackles_attempted), sum(s.fouls_committed), sum(s.minutes_played)
     FROM prop_alpha.player_match_stats s
-    JOIN prop_alpha.players p USING (player_id)
     JOIN prop_alpha.fixtures f USING (fixture_id)
     JOIN prop_alpha.leagues l USING (league_id)
     WHERE l.name = %s AND f.kickoff_at < %s AND f.kickoff_at >= %s AND s.minutes_played > 0
-    GROUP BY p.primary_position, f.kickoff_at
+      AND s.match_position IS NOT NULL
+    GROUP BY s.match_position, f.kickoff_at
 """
 LEVEL_SEASONS: Final[int] = 3
 
@@ -274,7 +280,7 @@ def price_fixture(
     return build_projections(
         fixture, inputs.squad, inputs.history_by_player, inputs.team_recent_fixtures, inputs.league_rates, engine,
         season_levels=inputs.season_levels or None, market_engines=market_engines,
-        rate_multipliers=SCAN_RATE_MULTIPLIER_BY_MARKET,
+        rate_multipliers=SCAN_RATE_MULTIPLIER_BY_MARKET, prior_strengths=SCAN_PRIOR_STRENGTH_BY_MARKET,
     )
 
 

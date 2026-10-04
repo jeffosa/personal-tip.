@@ -30,7 +30,8 @@ PRICING_CODE: Final[Mapping[str, tuple[str, ...]]] = {
     "prop_alpha/modeling/league_level.py": ("*",),
     "prop_alpha/scanner/slate.py": (
         "SCAN_MARKETS", "RECENT_TEAM_MATCHES", "HISTORY_MATCHES", "MIN_P_START", "SCAN_GAME_STATE_K",
-        "SCAN_GAME_STATE_K_BY_MARKET", "SCAN_RATE_MULTIPLIER_BY_MARKET", "UpcomingFixture", "SquadPlayer",
+        "SCAN_GAME_STATE_K_BY_MARKET", "SCAN_RATE_MULTIPLIER_BY_MARKET", "DEFAULT_PRIOR_STRENGTH_90S",
+        "SCAN_PRIOR_STRENGTH_BY_MARKET", "UpcomingFixture", "SquadPlayer",
         "Appearance", "lineup_estimate", "build_projections",
     ),
     "prop_alpha/alerts/scan.py": (

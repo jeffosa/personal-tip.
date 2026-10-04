@@ -270,8 +270,9 @@ MIGRATION_003 = (ROOT / "migrations" / "003_integrity_constraints.sql").read_tex
 MIGRATION_004 = (ROOT / "migrations" / "004_merge_hardening.sql").read_text(encoding="utf-8")
 MIGRATION_005 = (ROOT / "migrations" / "005_player_current_team.sql").read_text(encoding="utf-8")
 MIGRATION_006 = (ROOT / "migrations" / "006_player_attributes_by_kickoff.sql").read_text(encoding="utf-8")
+MIGRATION_007 = (ROOT / "migrations" / "007_match_position.sql").read_text(encoding="utf-8")
 MERGE_SOURCES = {"schema.sql": SCHEMA, "003": MIGRATION_003, "004": MIGRATION_004, "005": MIGRATION_005,
-                 "006": MIGRATION_006}
+                 "006": MIGRATION_006, "007": MIGRATION_007}
 CORE_CONSTRAINTS = (
     "chk_possession_bounds", "chk_minute_logic", "chk_tackles_won_le_attempted", "chk_duels_won_le_total",
 )
@@ -331,7 +332,7 @@ def _merge_stats_insert_columns(function: str) -> list[str]:
     return [column.strip() for column in match.group(1).replace("\n", " ").split(",")]
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "003", "004", "005", "006"])
+@pytest.mark.parametrize("source", ["schema.sql", "003", "004", "005", "006", "007"])
 def test_merge_rejects_every_row_a_core_constraint_would_refuse(source: str) -> None:
     block = _player_reject_block(_merge_function(MERGE_SOURCES[source]))
     for constraint, fragments in REJECT_PREDICATES.items():
@@ -341,7 +342,7 @@ def test_merge_rejects_every_row_a_core_constraint_would_refuse(source: str) -> 
         assert f"CONSTRAINT {constraint}" in SCHEMA
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "004", "005", "006"])
+@pytest.mark.parametrize("source", ["schema.sql", "004", "005", "006", "007"])
 def test_merge_rejects_null_market_metrics(source: str) -> None:
     block = _player_reject_block(_merge_function(MERGE_SOURCES[source]))
     for fragment in NULL_METRIC_PREDICATES:
@@ -350,7 +351,8 @@ def test_merge_rejects_null_market_metrics(source: str) -> None:
 
 
 def test_merge_function_identical_in_schema_and_latest_migration() -> None:
-    assert _merge_function(SCHEMA) == _merge_function(MIGRATION_006)
+    assert _merge_function(SCHEMA) == _merge_function(MIGRATION_007)
+    assert _merge_function(MIGRATION_006) != _merge_function(MIGRATION_007)
     assert _merge_function(MIGRATION_005) != _merge_function(MIGRATION_006)
     assert _merge_function(MIGRATION_004) != _merge_function(MIGRATION_005)
     assert _merge_function(MIGRATION_003) != _merge_function(MIGRATION_004)
@@ -363,7 +365,7 @@ CURRENT_TEAM_FROM_LATEST_KICKOFF = (
 )
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "005", "006"])
+@pytest.mark.parametrize("source", ["schema.sql", "005", "006", "007"])
 def test_merge_moves_player_to_team_of_latest_fixture(source: str) -> None:
     function = _merge_function(MERGE_SOURCES[source])
     for fragment in CURRENT_TEAM_FROM_LATEST_KICKOFF:
@@ -493,11 +495,12 @@ def test_staging_ddl_matches_staging_columns() -> None:
 
 
 def test_core_stats_ddl_and_merge_lists_match_stats_columns() -> None:
-    assert _table_columns(SCHEMA, "player_match_stats") == [*STATS_COLUMNS, "source_updated_at"]
+    # match_position (migration 007) is not a transform statistic: the merge copies the staged player_position.
+    assert _table_columns(SCHEMA, "player_match_stats") == [*STATS_COLUMNS, "source_updated_at", "match_position"]
     function = _merge_function(SCHEMA)
-    assert _merge_stats_insert_columns(function) == list(STATS_COLUMNS)
+    assert _merge_stats_insert_columns(function) == [*STATS_COLUMNS, "match_position"]
     update_set = function[function.index("ON CONFLICT (fixture_id, player_id) DO UPDATE SET"):]
-    for column in STATS_COLUMNS[2:]:
+    for column in [*STATS_COLUMNS[2:], "match_position"]:
         assert re.search(rf"\b{column}\s+= EXCLUDED\.{column}\b", update_set), column
 
 
@@ -563,3 +566,12 @@ def test_migration_006_adds_the_column_replaces_the_merge_and_repairs_in_one_tra
     assert "IS DISTINCT FROM (latest.name, latest.position, latest.kickoff_at)" in repair
     for statement in ("TRUNCATE", "VACUUM FULL", "CLUSTER", "ALTER COLUMN", "SET DEFAULT"):
         assert statement not in body
+
+
+def test_merge_stores_each_matchs_own_position() -> None:
+    """Migration 007 (audit 2026-10-04): pricing reads positions as of kickoff from player_match_stats."""
+    function = _merge_function(MIGRATION_007)
+    assert "match_position           = EXCLUDED.match_position" in function
+    assert "x.player_position" in function
+    assert "match_position           VARCHAR(16)" in SCHEMA
+    assert "ADD COLUMN IF NOT EXISTS match_position" in MIGRATION_007 and "SET lock_timeout" in MIGRATION_007

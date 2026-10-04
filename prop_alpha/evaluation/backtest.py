@@ -19,7 +19,7 @@ from prop_alpha.modeling.engine import (
     ProjectionError,
     QuantEngine,
 )
-from prop_alpha.modeling.league_level import level_scaled_minutes
+from prop_alpha.modeling.league_level import level_ratios
 
 # Season start year -> trailing league rate per 90, as known strictly before the given kickoff.
 LevelSource = Callable[[datetime], Mapping[int, float]]
@@ -207,10 +207,10 @@ def _over_probability(
     # Only time on the pitch informs a per-minute rate: zero-minute rows (including bench bookings,
     # which the engine's exposure validation rejects) are left out of the rate inputs.
     on_pitch = [o for o in prior if o.minutes_played > 0.0]
-    exposure = [o.minutes_played for o in on_pitch]
+    exposure_scale: list[float] | None = None
     if level is not None:
-        exposure, league_rate_per90 = level_scaled_minutes(
-            exposure, [o.kickoff_at for o in on_pitch], level(target.kickoff_at), target.kickoff_at
+        exposure_scale, league_rate_per90 = level_ratios(
+            [o.kickoff_at for o in on_pitch], level(target.kickoff_at), target.kickoff_at
         )
     start_minutes = [o.minutes_played for o in on_pitch if o.started]
     sub_minutes = [o.minutes_played for o in on_pitch if not o.started]
@@ -225,12 +225,13 @@ def _over_probability(
         player_id=target.player_id,
         market_type=market_type,
         counts=[o.count for o in on_pitch],
-        minutes=exposure,
+        minutes=[o.minutes_played for o in on_pitch],
         league_rate_per90=league_rate_per90,
         referee=NEUTRAL_REFEREE,
         is_home=True,
         lineup=lineup,
         prior_strength_90s=prior_strength_90s,
+        exposure_scale=exposure_scale,
     )
     return projection.side_probabilities(line, "over").p_win
 

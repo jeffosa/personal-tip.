@@ -33,7 +33,7 @@ from prop_alpha.modeling.engine import (
     QuantEngine,
     VoidRule,
 )
-from prop_alpha.modeling.league_level import level_scaled_minutes, season_of
+from prop_alpha.modeling.league_level import level_ratios, season_of
 from prop_alpha.scanner.market_scanner import LiveOddsQuote, ProjectionKey, price_for_ev, stressed_probabilities
 
 SCAN_INTERVAL: Final[timedelta] = timedelta(hours=4)
@@ -55,6 +55,10 @@ SCAN_GAME_STATE_K_BY_MARKET: Final[Mapping[str, float]] = MappingProxyType({"tac
 # 36.9% v 36.5%) and raised skill on every line. Fouls' fitted 0.9354 made the test worse (O1.5 29.5% -> 27.1% v
 # 29.4%): the league level already corrects fouls, so fouls stay at 1.
 SCAN_RATE_MULTIPLIER_BY_MARKET: Final[Mapping[str, float]] = MappingProxyType({"tackles": 0.9483, "fouls": 1.0})
+# The engine's default prior weight (QuantEngine.factor_count_market prior_strength_90s), in 90-minute matches.
+DEFAULT_PRIOR_STRENGTH_90S: Final[float] = 6.0
+SCAN_PRIOR_STRENGTH_BY_MARKET: Final[Mapping[str, float]] = MappingProxyType(
+    {"tackles": DEFAULT_PRIOR_STRENGTH_90S, "fouls": DEFAULT_PRIOR_STRENGTH_90S})
 
 MOCK_SPORTSBOOK: Final[str] = "MOCK"
 MOCK_LINES: Final[tuple[float, ...]] = (0.5, 1.5, 2.5, 3.5)
@@ -166,6 +170,7 @@ def build_projections(
     season_levels: Mapping[tuple[str, str], Mapping[int, float]] | None = None,
     market_engines: Mapping[str, QuantEngine] | None = None,
     rate_multipliers: Mapping[str, float] | None = None,
+    prior_strengths: Mapping[str, float] | None = None,
 ) -> tuple[dict[ProjectionKey, FactorProjection], list[str]]:
     """Projections for every regular starter and scan market, plus the reasons players were left out.
 
@@ -175,7 +180,8 @@ def build_projections(
     seasons does not carry into the price; a player whose history reaches a season with no rate is left out.
     `market_engines` overrides `engine` per market (each market's game-state k). `rate_multipliers` scales each
     market's predictive rate (level recalibration): the posterior mean moves by the factor, its shape is kept, so
-    every line and side moves consistently.
+    every line and side moves consistently. `prior_strengths` sets each market's prior weight in 90-minute
+    matches (default 6): how far a player's own history moves him from his position's league rate.
     """
     for market, factor in (rate_multipliers or {}).items():
         if not (math.isfinite(factor) and factor > 0.0):
@@ -196,26 +202,27 @@ def build_projections(
             if rate is None or not (math.isfinite(rate) and rate > 0.0):
                 skipped.append(f"{player.name}: no league {market} rate for position {player.position}")
                 continue
-            exposure = [a.minutes for a in on_pitch]
+            exposure_scale: list[float] | None = None
             levels = (season_levels or {}).get((player.position, market))
             if season_levels is not None:
                 needed = {season_of(a.kickoff_at) for a in on_pitch} | {season_of(fixture.kickoff_at)}
                 if levels is None or not needed <= set(levels):
                     skipped.append(f"{player.name}: no {market} league level for every season of his history")
                     continue
-                exposure, rate = level_scaled_minutes(exposure, [a.kickoff_at for a in on_pitch], levels,
-                                                      fixture.kickoff_at)
+                exposure_scale, rate = level_ratios([a.kickoff_at for a in on_pitch], levels, fixture.kickoff_at)
             market_engine = (market_engines or {}).get(market, engine)
             projection = market_engine.factor_count_market(
                 fixture_id=fixture.fixture_id,
                 player_id=player.player_id,
                 market_type=market,
                 counts=[a.count(market) for a in on_pitch],
-                minutes=exposure,
+                minutes=[a.minutes for a in on_pitch],
+                exposure_scale=exposure_scale,
                 league_rate_per90=rate,
                 referee=NEUTRAL_REFEREE,
                 is_home=player.team_uid == fixture.home_team_uid,
                 lineup=lineup,
+                prior_strength_90s=(prior_strengths or {}).get(market, DEFAULT_PRIOR_STRENGTH_90S),
             )
             factor = (rate_multipliers or {}).get(market, 1.0)
             if factor != 1.0:

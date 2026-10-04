@@ -82,23 +82,38 @@ def season_rates(totals: Mapping[int, SeasonTotals], prior_minutes: float = SEAS
     return rates
 
 
+def level_ratios(
+    kickoffs: Sequence[datetime], rates: Mapping[int, float], now: datetime
+) -> tuple[list[float], float]:
+    """(L(season of each past match) / L_now, L_now): the weight of each match's minutes in the rate update
+    (QuantEngine exposure_scale). Kept apart from the minutes so they stay within MAX_MATCH_MINUTES (a 125-minute
+    match in a season 10% busier than today's would otherwise become 137.5 "minutes" and refuse the fixture).
+
+    Raises ValueError when a season of the history, or the season of `now`, has no rate.
+    """
+    season_now = season_of(now)
+    if season_now not in rates:
+        raise ValueError(f"no league level for season {season_now}")
+    level_now = rates[season_now]
+    ratios: list[float] = []
+    for kickoff in kickoffs:
+        season = season_of(kickoff)
+        if season not in rates:
+            raise ValueError(f"no league level for season {season}")
+        ratios.append(rates[season] / level_now)
+    return ratios, level_now
+
+
 def level_scaled_minutes(
     minutes: Sequence[float], kickoffs: Sequence[datetime], rates: Mapping[int, float], now: datetime
 ) -> tuple[list[float], float]:
-    """(each past match's minutes scaled by L(season of that match) / L_now, L_now).
+    """(each past match's minutes scaled by L(season of that match) / L_now, L_now). For totals only (the tuning
+    scripts' recalibration sums): pass level_ratios to the engine as exposure_scale instead, because a scaled
+    value can exceed MAX_MATCH_MINUTES.
 
     Raises ValueError when a season of the history, or the season of `now`, has no rate.
     """
     if len(minutes) != len(kickoffs):
         raise ValueError("minutes and kickoffs must have equal length")
-    season_now = season_of(now)
-    if season_now not in rates:
-        raise ValueError(f"no league level for season {season_now}")
-    level_now = rates[season_now]
-    scaled: list[float] = []
-    for played, kickoff in zip(minutes, kickoffs):
-        season = season_of(kickoff)
-        if season not in rates:
-            raise ValueError(f"no league level for season {season}")
-        scaled.append(played * rates[season] / level_now)
-    return scaled, level_now
+    ratios, level_now = level_ratios(kickoffs, rates, now)
+    return [played * ratio for played, ratio in zip(minutes, ratios)], level_now

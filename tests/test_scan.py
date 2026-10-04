@@ -434,3 +434,12 @@ def test_board_messages_split_and_keep_the_paper_label() -> None:
     assert [item.number for item in messages[1][1]] == list(range(26, 40))
     assert messages[1][1][0].player == "Player 26 (Walsall)" and messages[1][1][0].sides == {"over": 2.12}
     assert all(item.kind == "board" and item.book is None for _, items in messages for item in items)
+
+
+def test_pricing_reads_positions_as_of_kickoff_never_the_latest_one() -> None:
+    """Audit 2026-10-04: players.primary_position follows the latest match, so an earlier price that read it could
+    use a later match's position. Squad and league levels read player_match_stats.match_position (migration 007)."""
+    for sql in (scan.SQUAD_SQL, scan.LEVEL_SQL, scan.HISTORY_SQL, scan.TEAM_RECENT_SQL):
+        assert "primary_position" not in sql
+    assert "s.match_position" in scan.SQUAD_SQL and "f.kickoff_at DESC" in scan.SQUAD_SQL
+    assert "GROUP BY s.match_position" in scan.LEVEL_SQL

@@ -107,6 +107,9 @@ CREATE TABLE player_match_stats (
     dribbled_past_rate       NUMERIC(5,4),     -- NULL when undefined (no duels)
 
     source_updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- The player's position in this match (migration 007): pricing reads positions as of kickoff from here, never
+    -- players.primary_position, which follows the latest match and would leak later matches into earlier prices.
+    match_position           VARCHAR(16),
     PRIMARY KEY (fixture_id, player_id),
     CONSTRAINT chk_possession_bounds        CHECK (team_possession_pct BETWEEN 0.00 AND 100.00),
     CONSTRAINT chk_minute_logic             CHECK (minute_off >= minute_on AND minutes_played <= 130),
@@ -403,7 +406,7 @@ BEGIN
         tackles_attempted, tackles_won, interceptions, dribbled_past, duels_total, duels_won,
         fouls_committed, fouls_drawn, yellow_cards, red_cards,
         zone14_entries, halfspace_entries, long_balls_targeted, team_possession_pct,
-        padj_tackles, padj_interceptions, padj_fouls, dribbled_past_rate
+        padj_tackles, padj_interceptions, padj_fouls, dribbled_past_rate, match_position
     )
     SELECT f.fixture_id, p.player_id, t.team_id,
            COALESCE(x.is_home, x.team_uid = x.home_team_uid), COALESCE(x.started, FALSE),
@@ -415,7 +418,8 @@ BEGIN
            COALESCE(x.fouls_committed, 0), COALESCE(x.fouls_drawn, 0),
            COALESCE(x.yellow_cards, 0), COALESCE(x.red_cards, 0),
            COALESCE(x.zone14_entries, 0), COALESCE(x.halfspace_entries, 0), COALESCE(x.long_balls_targeted, 0),
-           x.team_possession_pct, x.padj_tackles, x.padj_interceptions, x.padj_fouls, x.dribbled_past_rate
+           x.team_possession_pct, x.padj_tackles, x.padj_interceptions, x.padj_fouls, x.dribbled_past_rate,
+           x.player_position
     FROM (
         SELECT DISTINCT ON (cf.vendor_fixture_uid, cf.vendor_player_uid) cf.*
         FROM claimed_feed cf
@@ -454,6 +458,7 @@ BEGIN
         padj_interceptions       = EXCLUDED.padj_interceptions,
         padj_fouls               = EXCLUDED.padj_fouls,
         dribbled_past_rate       = EXCLUDED.dribbled_past_rate,
+        match_position           = EXCLUDED.match_position,
         source_updated_at        = now();
     GET DIAGNOSTICS v_rows = ROW_COUNT;
 
