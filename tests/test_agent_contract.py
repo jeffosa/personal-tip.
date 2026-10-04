@@ -60,6 +60,8 @@ PURE_MODULES: tuple[str, ...] = (
     "prop_alpha/ingestion/oddspapi.py",
     # Scan slate: projections and mock quotes for the 4-hourly opportunity scan.
     "prop_alpha/scanner/slate.py",
+    # Bet-recording replies: parse "placed 3 @1.95 5" and resolve it against the replied-to message.
+    "prop_alpha/alerts/replies.py",
 )
 IO_LIBRARIES = frozenset({
     "psycopg2", "requests", "urllib3", "socket", "http", "sqlite3", "threading", "concurrent", "asyncio", "subprocess",

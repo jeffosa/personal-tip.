@@ -38,11 +38,14 @@ from typing import Any, Callable, Final, Mapping, Sequence
 import numpy as np
 import requests
 
+from prop_alpha.alerts.ledger import PlacedBetStore, combined_exposure
+from prop_alpha.alerts.replies import USAGE, AlertItem
 from prop_alpha.alerts.status import DEFAULT_DSN, DSN_ENV
 from prop_alpha.alerts.telegram import (
     DEFAULT_CRITERIA,
     PAPER_LABEL,
     AlertContext,
+    MessageIndex,
     SentAlertStore,
     TelegramNotifier,
     load_config,
@@ -79,6 +82,7 @@ logger = logging.getLogger("prop_alpha.scan")
 
 MOCK_LABEL: Final[str] = "MOCK ODDS - test run, made-up bookmaker prices. NOT a real opportunity."
 MOCK_STATE_FILE: Final[Path] = DEFAULT_ENV_FILE.parent / ".prop_alpha_state" / "mock_sent_alerts.jsonl"
+MOCK_INDEX_FILE: Final[Path] = MOCK_STATE_FILE.parent / "mock_alert_messages.jsonl"
 BANKROLL_ENV: Final[str] = "PROP_ALPHA_BANKROLL"
 DEFAULT_BANKROLL: Final[float] = 1000.0
 MAX_ALERTS_ENV: Final[str] = "PROP_ALPHA_MAX_ALERTS"
@@ -257,9 +261,12 @@ def descriptions(
     }
 
 
-def format_board(fixture: UpcomingFixture, inputs: SlateInputs, entries: Sequence[FairPrice]) -> list[str]:
-    """Board messages for one fixture: one row per player and market with each listed side's minimum odds, home
-    side first; split every BOARD_ROWS_PER_MESSAGE rows."""
+def format_board(
+    fixture: UpcomingFixture, inputs: SlateInputs, entries: Sequence[FairPrice]
+) -> list[tuple[str, list[AlertItem]]]:
+    """Board messages for one fixture, each with the numbered items it lists (for bet-recording replies): one
+    numbered row per player and market with each listed side's minimum odds, home side first; split every
+    BOARD_ROWS_PER_MESSAGE rows. Numbers run on across the messages of one board."""
     players = {p.player_id: p for p in inputs.squad}
     team_names = {fixture.home_team_uid: fixture.home_name, fixture.away_team_uid: fixture.away_name}
     rows: dict[tuple[int, str, float], dict[str, FairPrice]] = {}
@@ -270,19 +277,26 @@ def format_board(fixture: UpcomingFixture, inputs: SlateInputs, entries: Sequenc
         player = players[key[0]]
         return player.team_uid != fixture.home_team_uid, player.name, key[1]
 
-    lines: list[str] = []
-    for key in sorted(rows, key=order):
+    title = f"{fixture.name}, {fixture.kickoff_at:%a %d %b %H:%M} UTC"
+    numbered: list[tuple[str, AlertItem]] = []
+    for number, key in enumerate(sorted(rows, key=order), start=1):
         player, sides = players[key[0]], rows[key]
         over, under = sides.get("over"), sides.get("under")
         p_over = over.model_probability if over is not None else 1.0 - sides["under"].model_probability
-        prices = " | ".join(f"{side.title()} >= {entry.min_odds:.2f}"
-                            for side, entry in (("over", over), ("under", under)) if entry is not None)
-        lines.append(f"{player.name} ({team_names[player.team_uid]}) {key[1]} {key[2]:g}: {prices} "
-                     f"(model: over {p_over:.0%})")
-    title = f"{fixture.name}, {fixture.kickoff_at:%a %d %b %H:%M} UTC"
-    chunks = [lines[i:i + BOARD_ROWS_PER_MESSAGE] for i in range(0, len(lines), BOARD_ROWS_PER_MESSAGE)]
+        listed = [(side, entry) for side, entry in (("over", over), ("under", under)) if entry is not None]
+        prices = " | ".join(f"{side.title()} >= {entry.min_odds:.2f}" for side, entry in listed)
+        who = f"{player.name} ({team_names[player.team_uid]})"
+        numbered.append((
+            f"{number}. {who} {key[1]} {key[2]:g}: {prices} (model: over {p_over:.0%})",
+            AlertItem(number=number, kind="board", fixture_id=fixture.fixture_id, player_id=player.player_id,
+                      market=key[1], line=key[2], min_odds=tuple((side, entry.min_odds) for side, entry in listed),
+                      match=title, player=who),
+        ))
+    chunks = [numbered[i:i + BOARD_ROWS_PER_MESSAGE] for i in range(0, len(numbered), BOARD_ROWS_PER_MESSAGE)]
     return [
-        "\n".join([PAPER_LABEL, *((BOARD_HEADER,) if i == 0 else ()), title + (" (continued)" if i else ""), *chunk])
+        ("\n".join([PAPER_LABEL, *((BOARD_HEADER,) if i == 0 else ()), title + (" (continued)" if i else ""),
+                    *(line for line, _ in chunk), "", USAGE]),
+         [item for _, item in chunk])
         for i, chunk in enumerate(chunks)
     ]
 
@@ -302,8 +316,10 @@ def send_boards(
         entries = fair_price_board(projections, DEFAULT_CRITERIA.loss_floor, DEFAULT_CRITERIA.min_ev_per_unit)
         if not entries:
             continue
-        for text in format_board(fixture, inputs, entries):
-            notifier.send_message(text)
+        for text, items in format_board(fixture, inputs, entries):
+            message_id = notifier.send_message(text)
+            if notifier.index is not None:
+                notifier.index.record(message_id, items, datetime.now(timezone.utc))
         sent.add(fixture.fixture_id)
         boarded += 1
         state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -403,8 +419,9 @@ def run_scan(
     now: datetime, client: Any, dsn: str, notifier: TelegramNotifier | None, store: SentAlertStore,
     bankroll: float, label: str, max_alerts: int = DEFAULT_MAX_ALERTS, *,
     odds: str = "mock", odds_client: Any | None = None, books: Sequence[str] = DEFAULT_BOOKMAKERS,
-    state_dir: Path = STATE_DIR,
+    state_dir: Path = STATE_DIR, bets: PlacedBetStore | None = None,
 ) -> ScanSummary:
+    """With `bets`, exposure per market is the larger of the stakes alerted and the stakes recorded as placed."""
     import psycopg2
 
     start, end = scan_window(now)
@@ -449,7 +466,7 @@ def run_scan(
     combined = AllocationReport()
     all_projections: dict[ProjectionKey, FactorProjection] = {}
     all_descriptions: dict[ProjectionKey, AlertContext] = {}
-    exposure = store.exposure(now)
+    exposure = store.exposure(now) if bets is None else combined_exposure(store, bets, now)
     unquoted: list[tuple[UpcomingFixture, SlateInputs, Mapping[ProjectionKey, FactorProjection]]] = []
     for fixture, inputs in slate:
         projections, report, quotes = scan_fixture(fixture, inputs, now, quotes_for, manager, engine, summary, exposure)
@@ -493,13 +510,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     label = "" if real else MOCK_LABEL
     odds_client = build_odds_client(os.environ) if real else None
     store = SentAlertStore() if real else SentAlertStore(MOCK_STATE_FILE)
-    notifier = TelegramNotifier(load_config(), store=store) if args.send else None
+    # Mock messages are indexed separately, so a reply to one can never be recorded as a real bet.
+    index = MessageIndex() if real else MessageIndex(MOCK_INDEX_FILE)
+    notifier = TelegramNotifier(load_config(), store=store, index=index) if args.send else None
     books = tuple(b.strip() for b in os.environ.get(BOOKMAKERS_ENV, ",".join(DEFAULT_BOOKMAKERS)).split(",") if b.strip())
     try:
         summary = run_scan(now, client, os.environ.get(DSN_ENV, DEFAULT_DSN), notifier, store,
                            float(os.environ.get(BANKROLL_ENV, DEFAULT_BANKROLL)), label,
                            int(os.environ.get(MAX_ALERTS_ENV, DEFAULT_MAX_ALERTS)),
-                           odds=args.odds, odds_client=odds_client, books=books)
+                           odds=args.odds, odds_client=odds_client, books=books,
+                           bets=PlacedBetStore() if real else None)
     finally:
         client.close()
         if odds_client is not None:

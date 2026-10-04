@@ -17,7 +17,9 @@ One alert is sent per market, line, side and book, whatever the price does after
 following the alerts is not told to stack the same position on every price tick. With a SentAlertStore
 (default `.prop_alpha_state/sent_alerts.jsonl`, gitignored) this holds across runs, and
 SentAlertStore.exposure() gives the allocator the stakes already suggested, so a second run sizes net of
-the first. Until the bet ledger ([N]) records real fills, every recent alert counts as an open position.
+the first. Every recent alert counts as an open position; prop_alpha.alerts.ledger adds the bets the maintainer
+records by replying, taking the larger of alerted and placed stake per market. Each sent alert message is indexed
+(MessageIndex) so that a reply resolves to one numbered bet.
 
 Usage:
     python -m prop_alpha.alerts.telegram --check        # getMe + one test message
@@ -45,6 +47,7 @@ from typing import Any, Callable, Final, Mapping, Sequence
 import numpy as np
 import requests
 
+from prop_alpha.alerts.replies import USAGE, AlertItem
 from prop_alpha.config import DEFAULT_ENV_FILE, parse_env_file
 from prop_alpha.modeling.engine import FactorProjection, LineupExpectation, QuantEngine, RefereeProfile, VoidRule
 from prop_alpha.scanner.market_scanner import (
@@ -65,6 +68,8 @@ TELEGRAM_API_BASE: Final[str] = "https://api.telegram.org"
 TOKEN_ENV: Final[str] = "TELEGRAM_BOT_TOKEN"
 CHAT_ID_ENV: Final[str] = "TELEGRAM_CHAT_ID"
 DEFAULT_STATE_FILE: Final[Path] = Path(__file__).resolve().parents[2] / ".prop_alpha_state" / "sent_alerts.jsonl"
+# Telegram message id -> the numbered bets it lists, so a reply ("placed 3 @1.95 5") resolves to one bet.
+DEFAULT_INDEX_FILE: Final[Path] = DEFAULT_STATE_FILE.parent / "alert_messages.jsonl"
 # How long an alerted stake counts as open exposure. Player props settle within a day or two of kickoff and
 # alerts go out before kickoff; 4 days over-counts rather than under-counts until the ledger records fills.
 OPEN_POSITION_WINDOW: Final[timedelta] = timedelta(days=4)
@@ -180,6 +185,71 @@ class SentAlertStore:
         return ExposureBook(dict(totals))
 
 
+def _item_record(item: AlertItem) -> dict[str, Any]:
+    return {
+        "number": item.number, "kind": item.kind, "fixture_id": item.fixture_id, "player_id": item.player_id,
+        "market": item.market, "line": item.line, "min_odds": [list(pair) for pair in item.min_odds],
+        "match": item.match, "player": item.player, "book": item.book,
+    }
+
+
+def _item_from_record(raw: Any) -> AlertItem:
+    if not isinstance(raw, dict):
+        raise ValueError("indexed item is not an object")
+    return AlertItem(
+        number=int(raw["number"]), kind=str(raw["kind"]), fixture_id=int(raw["fixture_id"]),
+        player_id=int(raw["player_id"]), market=str(raw["market"]), line=float(raw["line"]),
+        min_odds=tuple((str(side), float(odds)) for side, odds in raw["min_odds"]),
+        match=str(raw["match"]), player=str(raw["player"]),
+        book=None if raw.get("book") is None else str(raw["book"]),
+    )
+
+
+class MessageIndex:
+    """Append-only JSON-lines map from each sent alert or board message to the numbered bets it lists."""
+
+    def __init__(self, path: Path = DEFAULT_INDEX_FILE) -> None:
+        self.path = path
+
+    def record(self, message_id: int, items: Sequence[AlertItem], sent_at: datetime) -> None:
+        if sent_at.tzinfo is None or sent_at.utcoffset() != timedelta(0):
+            raise ValueError("sent_at must be a timezone-aware UTC datetime")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({"message_id": message_id, "sent_at": sent_at.isoformat(),
+                           "items": [_item_record(item) for item in items]})
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def load(self) -> dict[int, dict[int, AlertItem]]:
+        """message id -> {item number -> item}. A corrupt line raises: a guessed mapping could record the wrong bet."""
+        if not self.path.is_file():
+            return {}
+        messages: dict[int, dict[int, AlertItem]] = {}
+        for number, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            record: Any = json.loads(line)
+            if not (isinstance(record, dict) and isinstance(record.get("message_id"), int)
+                    and isinstance(record.get("items"), list)):
+                raise ValueError(f"{self.path.name} line {number} is not a message-index record")
+            items = [_item_from_record(raw) for raw in record["items"]]
+            messages[int(record["message_id"])] = {item.number: item for item in items}
+        return messages
+
+
+def item_from_directive(number: int, directive: StakingDirective, context: AlertContext | None) -> AlertItem:
+    return AlertItem(
+        number=number, kind="alert", fixture_id=directive.fixture_id, player_id=directive.player_id,
+        market=directive.market_type, line=directive.line_value,
+        min_odds=((directive.side, directive.min_acceptable_odds),),
+        match=context.match if context else f"Fixture {directive.fixture_id}",
+        player=context.player if context else f"player {directive.player_id}",
+        book=directive.sportsbook,
+    )
+
+
 def _flood_wait_seconds(body: Any) -> float | None:
     """Seconds Telegram asks to wait on a 429 (parameters.retry_after), else None."""
     if not isinstance(body, dict) or body.get("error_code") != 429:
@@ -244,6 +314,7 @@ def format_digest(
             f"{assessment.n_simulations:,} simulations",
             f"   Stake: {currency}{directive.stake:.2f} ({directive.fraction:.1%} of bankroll)",
         ]
+    lines += ["", USAGE]
     return "\n".join(lines)
 
 
@@ -287,6 +358,7 @@ class TelegramNotifier:
         store: SentAlertStore | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        index: MessageIndex | None = None,
     ) -> None:
         if not timeout_s > 0.0:
             raise ValueError("timeout_s must be positive")
@@ -298,6 +370,8 @@ class TelegramNotifier:
         self._last_send: float | None = None
         self._store = store
         self._sent: set[AlertKey] = {alert.key for alert in store.load()} if store is not None else set()
+        # Where sent alert and board messages are indexed for bet-recording replies; None records nothing.
+        self.index = index
 
     def _call(self, method: str, payload: Mapping[str, Any], *, retry_on_flood: bool = True) -> Any:
         url = f"{TELEGRAM_API_BASE}/bot{self._config.bot_token}/{method}"
@@ -332,7 +406,8 @@ class TelegramNotifier:
                 chats[str(chat["id"])] = name or str(chat.get("username", ""))
         return sorted(chats.items())
 
-    def send_message(self, text: str) -> int:
+    def send_message(self, text: str, reply_to: int | None = None) -> int:
+        """Send `text` to the configured chat, as a reply to message `reply_to` when given."""
         if not text.strip():
             raise ValueError("message text must not be empty")
         if self._config.chat_id is None:
@@ -342,10 +417,25 @@ class TelegramNotifier:
             if wait > 0.0:
                 self._sleep(wait)
         self._last_send = self._clock()
-        result = self._call(
-            "sendMessage", {"chat_id": self._config.chat_id, "text": text[:4096], "disable_web_page_preview": True}
-        )
+        payload: dict[str, Any] = {"chat_id": self._config.chat_id, "text": text[:4096], "disable_web_page_preview": True}
+        if reply_to is not None:
+            payload["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
+        result = self._call("sendMessage", payload)
         return int(result["message_id"])
+
+    def get_updates(self, offset: int | None) -> list[Any]:
+        """New messages to the bot from `offset` on (Telegram drops updates below the offset). Never blocks."""
+        payload: dict[str, Any] = {"timeout": 0, "allowed_updates": ["message"]}
+        if offset is not None:
+            payload["offset"] = offset
+        result = self._call("getUpdates", payload)
+        if not isinstance(result, list):
+            raise TelegramError("getUpdates returned no update list")
+        return result
+
+    @property
+    def chat_id(self) -> str | None:
+        return self._config.chat_id
 
     def notify(
         self,
@@ -404,7 +494,13 @@ class TelegramNotifier:
             text = format_digest(entries, part * per_message + 1, len(passing), part + 1, parts, label, bankroll_currency)
             for directive, _ in chunk:
                 self._record(directive)
-            message_ids.append(self.send_message(text))
+            message_id = self.send_message(text)
+            message_ids.append(message_id)
+            if self.index is not None:
+                self.index.record(message_id, [
+                    item_from_directive(number, directive, context)
+                    for number, (directive, _, context) in enumerate(entries, part * per_message + 1)
+                ], datetime.now(timezone.utc))
             logger.info("digest message %d/%d sent with %d bets", part + 1, parts, len(chunk))
         return len(passing), message_ids
 

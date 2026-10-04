@@ -330,7 +330,13 @@ def test_board_messages_split_and_keep_the_paper_label() -> None:
     squad = tuple(SquadPlayer(i, f"Player {i:02d}", "MID", "76") for i in range(1, 40))
     inputs = scan.SlateInputs(squad, {}, {}, RATES)
     entries = [FairPrice(9001, i, "fouls", 1.5, "over", 0.5, 2.0, 2.12) for i in range(1, 40)]
-    texts = scan.format_board(FIXTURE, inputs, entries)
+    messages = scan.format_board(FIXTURE, inputs, entries)
+    texts = [text for text, _ in messages]
     assert len(texts) == 2 and all(t.startswith(PAPER_LABEL) and len(t) < 4096 for t in texts)
     assert scan.BOARD_HEADER in texts[0] and scan.BOARD_HEADER not in texts[1] and "(continued)" in texts[1]
-    assert "Player 01 (Walsall) fouls 1.5: Over >= 2.12 (model: over 50%)" in texts[0]
+    assert "1. Player 01 (Walsall) fouls 1.5: Over >= 2.12 (model: over 50%)" in texts[0]
+    # Numbers run on across the messages, and each message indexes exactly the rows it shows.
+    assert [item.number for item in messages[0][1]] == list(range(1, 26))
+    assert [item.number for item in messages[1][1]] == list(range(26, 40))
+    assert messages[1][1][0].player == "Player 26 (Walsall)" and messages[1][1][0].sides == {"over": 2.12}
+    assert all(item.kind == "board" and item.book is None for _, items in messages for item in items)
