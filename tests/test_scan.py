@@ -265,6 +265,17 @@ def test_constant_season_levels_change_no_price_and_a_lower_level_lowers_the_mea
     assert lowered and all(lowered[k].rate_posterior.mean < unscaled[k].rate_posterior.mean for k in lowered)
 
 
+def test_each_market_is_priced_with_its_own_game_state_k() -> None:
+    from prop_alpha.scanner.slate import SCAN_GAME_STATE_K_BY_MARKET
+
+    squad, history, recent = _inputs()
+    engines = {market: QuantEngine(game_state_k=k) for market, k in SCAN_GAME_STATE_K_BY_MARKET.items()}
+    projections, _ = build_projections(FIXTURE, squad, history, recent, RATES, QuantEngine(game_state_k=6.0),
+                                       market_engines=engines)
+    assert {p.game_state_k for (_, _, m), p in projections.items() if m == "tackles"} == {6.0}
+    assert {p.game_state_k for (_, _, m), p in projections.items() if m == "fouls"} == {1000.0}
+
+
 def test_a_history_season_without_a_level_is_skipped_not_guessed() -> None:
     squad, history, recent = _inputs()
     projections, skipped = build_projections(FIXTURE, squad, history, recent, RATES, QuantEngine(game_state_k=6.0),

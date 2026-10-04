@@ -22,9 +22,11 @@ from typing import Final, Mapping, Sequence
 
 # Seasons start on 1 July (English and Italian leagues kick off in August).
 SEASON_START_MONTH: Final[int] = 7
-# About a quarter of a season of one position in one league (552 matches x 2 teams x ~3.5 players x 90 min / 4),
-# so the current season carries half the weight after roughly a quarter of its matches. Not fitted.
-SEASON_PRIOR_MINUTES: Final[float] = 90_000.0
+# Tuned on 2026-10-04 (scripts/tune_backtest.py): 30,000 beat 90,000 on the tune window (mean log loss 0.56152 v
+# 0.56158) and cut the worst calibration bin on 4 of 5 lines in the untouched test window (2026-09-12 on). With one
+# position in one league playing about 350,000 minutes a season, the current season carries half the weight after
+# under a tenth of its matches.
+SEASON_PRIOR_MINUTES: Final[float] = 30_000.0
 
 
 def season_of(when: datetime) -> int:

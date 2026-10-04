@@ -67,6 +67,7 @@ from prop_alpha.scanner.slate import (
     HISTORY_MATCHES,
     RECENT_TEAM_MATCHES,
     SCAN_GAME_STATE_K,
+    SCAN_GAME_STATE_K_BY_MARKET,
     Appearance,
     FairPrice,
     OddsCoverage,
@@ -247,12 +248,13 @@ def load_slate_inputs(cur: Any, fixture: UpcomingFixture) -> SlateInputs:
 def scan_fixture(
     fixture: UpcomingFixture, inputs: SlateInputs, now: datetime, quotes_for: QuoteSource,
     manager: InstitutionalAssetManager, engine: QuantEngine, summary: ScanSummary, exposure: Any,
+    market_engines: Mapping[str, QuantEngine] | None = None,
 ) -> tuple[dict[ProjectionKey, FactorProjection], AllocationReport | None, list[LiveOddsQuote]]:
     """Projections, quotes and the allocation for one fixture; a pricing failure is recorded and skipped."""
     try:
         projections, skipped = build_projections(
             fixture, inputs.squad, inputs.history_by_player, inputs.team_recent_fixtures, inputs.league_rates, engine,
-            season_levels=inputs.season_levels or None,
+            season_levels=inputs.season_levels or None, market_engines=market_engines,
         )
         quotes = quotes_for(fixture, projections)
         report = manager.allocate(projections, quotes, now=now, exposure=exposure)
@@ -481,13 +483,15 @@ def run_scan(
         raise ValueError(f"unknown odds source {odds!r}")
     manager = InstitutionalAssetManager(bankroll, model_risk_loss_floor=MODEL_RISK_LOSS_FLOOR)
     engine = QuantEngine(game_state_k=SCAN_GAME_STATE_K)
+    market_engines = {market: QuantEngine(game_state_k=k) for market, k in SCAN_GAME_STATE_K_BY_MARKET.items()}
     combined = AllocationReport()
     all_projections: dict[ProjectionKey, FactorProjection] = {}
     all_descriptions: dict[ProjectionKey, AlertContext] = {}
     exposure = store.exposure(now) if bets is None else combined_exposure(store, bets, now)
     unquoted: list[tuple[UpcomingFixture, SlateInputs, Mapping[ProjectionKey, FactorProjection]]] = []
     for fixture, inputs in slate:
-        projections, report, quotes = scan_fixture(fixture, inputs, now, quotes_for, manager, engine, summary, exposure)
+        projections, report, quotes = scan_fixture(fixture, inputs, now, quotes_for, manager, engine, summary, exposure,
+                                                   market_engines)
         if report is None:
             continue
         if odds == "oddspapi" and not quotes and projections:

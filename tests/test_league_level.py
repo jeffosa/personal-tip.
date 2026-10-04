@@ -40,8 +40,9 @@ def test_trailing_rate_moves_from_last_season_to_this_one() -> None:
 
 
 def test_season_rates_chain_and_skip_empty_first_seasons() -> None:
-    rates = season_rates({2024: SeasonTotals(0.0, 0.0), 2025: SeasonTotals(1552.0, 90_000.0),
-                          2026: SeasonTotals(1485.0, 90_000.0)})
+    m = SEASON_PRIOR_MINUTES
+    rates = season_rates({2024: SeasonTotals(0.0, 0.0), 2025: SeasonTotals(1.552 * m / 90.0, m),
+                          2026: SeasonTotals(1.485 * m / 90.0, m)})
     assert set(rates) == {2025, 2026}
     assert rates[2025] == pytest.approx(1.552) and rates[2026] == pytest.approx((1.485 + 1.552) / 2)
 
