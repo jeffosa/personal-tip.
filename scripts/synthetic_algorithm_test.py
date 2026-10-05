@@ -60,10 +60,10 @@ def bootstrap_mean(values: np.ndarray, clusters: np.ndarray, rng: np.random.Gene
     unique, inverse = np.unique(clusters, return_inverse=True)
     sums = np.bincount(inverse, weights=values, minlength=len(unique))
     sizes = np.bincount(inverse, minlength=len(unique))
-    draws = []
+    draws: list[float] = []
     for _ in range(n):
         pick = rng.integers(len(unique), size=len(unique))
-        draws.append(sums[pick].sum() / max(sizes[pick].sum(), 1))
+        draws.append(float(sums[pick].sum()) / max(float(sizes[pick].sum()), 1.0))
     return float(np.percentile(draws, 5)), float(np.percentile(draws, 95))
 
 

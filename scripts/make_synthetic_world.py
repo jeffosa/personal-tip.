@@ -116,7 +116,7 @@ def main() -> int:
             squad[position] = ids
         squads.append(squad)
     by_id = {p["player_id"]: p for p in players}
-    referees = [{"referee_id": i + 1, "name": f"Synthetic Referee {i + 1:02d}", "strictness": float(math.exp(rng.normal(0.0, REFEREE_SD)))}
+    referees: list[dict[str, Any]] = [{"referee_id": i + 1, "name": f"Synthetic Referee {i + 1:02d}", "strictness": float(math.exp(rng.normal(0.0, REFEREE_SD)))}
                 for i in range(20)]
 
     # ---- fixtures and match simulation ------------------------------------------------------------------------
@@ -196,7 +196,7 @@ def main() -> int:
     files: dict[str, Any] = {}
     files["teams.csv"] = write_csv(out / "teams.csv", ["team_id", "name"], [[t + 1, f"Synthetic FC {t + 1:02d}"] for t in range(TEAMS)])
     files["referees.csv"] = write_csv(out / "referees.csv", ["referee_id", "name", "true_strictness"],
-                                      [[r["referee_id"], r["name"], round(r["strictness"], 5)] for r in referees])
+                                      [[r["referee_id"], r["name"], round(float(r["strictness"]), 5)] for r in referees])
     files["players.csv"] = write_csv(out / "players.csv", ["player_id", "name", "position", "team_id", "first_choice",
                                                           "true_skill_tackles", "true_skill_fouls"],
                                      [[p["player_id"], p["name"], p["position"], p["team"] + 1, int(p["first_choice"]),
