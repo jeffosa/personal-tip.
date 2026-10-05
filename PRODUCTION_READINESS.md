@@ -176,9 +176,12 @@ Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not e
   - The BETS SETTLED message is now queued before it is sent. Before, a failed send was lost for good, because the
     next run finds nothing new to settle; the next ledger poll now re-sends it. Pinned by 3 tests in
     `tests/test_delivery_gaps.py` that fail on the earlier code.
-  - **Open, needs a scheduler decision:** since about 10:51 BST every scheduled run has been killed with exit code
-    0xC000013A (console closed or Ctrl+C) before it wrote a log line. No scan, status report or ledger poll has run
-    since then, and nothing reported it: `task_health` runs inside the killed script, and is not wired in yet. By
+  - **Fixed the same day at the maintainer's request (hidden launch, `scripts/run_hidden.py`):** each run opened a
+    visible console that took the keyboard focus, and a Ctrl+C or close killed it (`^C` marks in the logs). Both
+    tasks, started by the scheduler afterwards, finished with result 0 and wrote their logs. Earlier finding:
+    since about 10:51 BST every scheduled run had been killed with exit code
+    0xC000013A (console closed or Ctrl+C) before it wrote a log line. No scan, status report or ledger poll ran
+    until the fix, and nothing reported it: `task_health` runs inside the killed script, and is not wired in yet. By
     hand the ledger script completes in 7.5 s with exit 0.
 - **Gate 1 criterion 7 (lineups):** passes on 50 archived line-ups (f55bb65): 50/50 succeeded, 0 problems in 2,574
   rows. These are post-match line-ups as Sportmonks recorded them, not team sheets captured 60 minutes before

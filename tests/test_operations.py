@@ -196,3 +196,49 @@ def test_prune_keeps_the_newest_complete_backups_and_touches_nothing_else(tmp_pa
     assert remaining == sorted([*(f.name for f in folders[2:]), "notes.txt", "prop_alpha_20261001T000000Z.incomplete"])
     with pytest.raises(ValueError, match="at least 1"):
         backup.prune(tmp_path / "backups", 0, folders[-1])
+
+
+# ---------------- scripts/run_hidden.py: scheduled scripts without a console window ----------------
+def _launcher_module() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("prop_alpha_run_hidden", ROOT / "scripts" / "run_hidden.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeRun:
+    def __init__(self, returncode: int) -> None:
+        self.returncode = returncode
+        self.calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def __call__(self, command: list[str], **kwargs: Any) -> Any:
+        self.calls.append((command, kwargs))
+        return type("Completed", (), {"returncode": self.returncode})()
+
+
+@pytest.mark.parametrize("returncode", [0, 1, 3])
+def test_launcher_runs_the_script_in_a_hidden_console_and_passes_its_exit_code_on(returncode: int) -> None:
+    """2026-10-05: each run opened a visible console; a Ctrl+C or close killed it (0xC000013A) before it logged."""
+    launcher = _launcher_module()
+    fake = _FakeRun(returncode)
+    assert launcher.main(["scripts/ledger_poll.cmd"], run=fake) == returncode
+    [(command, kwargs)] = fake.calls
+    assert command == ["cmd.exe", "/d", "/c", str((ROOT / "scripts" / "ledger_poll.cmd").resolve())]
+    assert kwargs["creationflags"] == launcher.CREATE_NO_WINDOW == 0x08000000
+    assert kwargs["cwd"] == str(ROOT) and kwargs["check"] is False
+
+
+def test_launcher_runs_only_an_existing_cmd_script_inside_the_repository(tmp_path: Path) -> None:
+    launcher = _launcher_module()
+    fake = _FakeRun(0)
+    outside = tmp_path / "evil.cmd"
+    outside.write_text("@echo off\n", encoding="utf-8")
+    for bad in ([r"scripts\backup.py"], [r"scripts\missing.cmd"], [str(outside)], [r"..\x.cmd"], [],
+                [r"scripts\ledger_poll.cmd", r"scripts\telegram_status.cmd"]):
+        with pytest.raises(ValueError):
+            launcher.main(bad, run=fake)
+    assert fake.calls == []
+    for script in ("ledger_poll.cmd", "telegram_status.cmd"):
+        assert launcher.resolve_script(f"scripts/{script}") == (ROOT / "scripts" / script).resolve()
