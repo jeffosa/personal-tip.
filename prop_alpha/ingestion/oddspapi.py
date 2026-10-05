@@ -16,7 +16,6 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from types import MappingProxyType
 from typing import Any, Final, Mapping, Sequence
 
 BASE_URL: Final[str] = "https://api.oddspapi.io/v4"
@@ -29,12 +28,11 @@ MARKET_TYPES: Final[Mapping[str, str]] = {"playertotals-tackles": "tackles", "pl
 # Lower-league prop limits are £50-£500 (PRD Gate 4); a quote without a published limit is assumed to take 50.
 UNKNOWN_LIMIT_STAKE: Final[float] = 50.0
 
-# The only replies counted as "no fixtures" (HTTP status -> text the body must contain), both seen live on
-# 2026-10-04: skybet 400 INVALID_PARAMETER "...is not supported or does not have any fixtures available." and
-# williamhill 404 FIXTURE_NOT_FOUND "No fixtures found for the specified tournament IDs and bookmaker." Any other
-# 400 or 404 is an error. The 400 wording does not separate a misspelt bookmaker from one with no fixtures.
-NO_FIXTURES_REPLIES: Final[Mapping[int, str]] = MappingProxyType(
-    {400: "does not have any fixtures available", 404: "FIXTURE_NOT_FOUND"})
+# The only reply counted as "no fixtures": HTTP 400 INVALID_PARAMETER whose details end with this (seen for skybet
+# on 2026-10-04: "The bookmaker 'skybet' is not supported or does not have any fixtures available."). Any other 400
+# or 404 is an error. The message does not separate a misspelt bookmaker from one with no fixtures.
+NO_FIXTURES_STATUS: Final[frozenset[int]] = frozenset({400})
+NO_FIXTURES_MESSAGE: Final[str] = "does not have any fixtures available"
 
 MARKETS_PATH: Final[str] =f"markets?sportId={SOCCER_SPORT_ID}"
 PARTICIPANTS_PATH: Final[str] = f"participants?sportId={SOCCER_SPORT_ID}"
@@ -46,10 +44,11 @@ _COMMON_TEAM_WORDS: Final[frozenset[str]] = frozenset({
 
 
 def odds_path(bookmaker: str, tournament_ids: Sequence[int]) -> str:
-    """One bookmaker per call, in the documented `bookmakers` parameter. The v4 docs allow up to 3, but the live API
-    (checked 2026-10-04) answers three with HTTP 400 "Please provide exactly one bookmaker"; with one book the
-    documented plural returned bet365's 24 League One/Two fixtures, as the singular did."""
-    return (f"odds-by-tournaments?bookmakers={bookmaker}&tournamentIds={','.join(str(t) for t in sorted(tournament_ids))}"
+    """One bookmaker per call, as the singular `bookmaker` parameter. The v4 docs name it `bookmakers` (up to 3), but
+    the live API (checked 2026-10-04) answers three with HTTP 400 "Please provide exactly one bookmaker using the
+    'bookmaker' query parameter"; singular and plural both work for one book, and the singular returned bet365's
+    24 League One/Two fixtures."""
+    return (f"odds-by-tournaments?bookmaker={bookmaker}&tournamentIds={','.join(str(t) for t in sorted(tournament_ids))}"
             "&oddsFormat=decimal")
 
 

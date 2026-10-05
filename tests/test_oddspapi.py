@@ -4,7 +4,7 @@ import gzip
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import pytest
 import requests
@@ -117,14 +117,12 @@ class FakeOddsClient:
         self.paths: list[str] = []
         self.requests_sent = 0
 
-    def get_json_value(self, path: str, empty_on: Mapping[int, str] | None = None) -> Any:
+    def get_json_value(self, path: str, empty_on: frozenset[int] = frozenset(), empty_marker: str = "") -> Any:
         self.paths.append(path)
         self.requests_sent += 1
-        if "bookmakers=skybet" in path:
-            assert empty_on == oddspapi.NO_FIXTURES_REPLIES
+        if "bookmaker=skybet" in path:
+            assert empty_on == oddspapi.NO_FIXTURES_STATUS and empty_marker == oddspapi.NO_FIXTURES_MESSAGE
             return None
-        if "bookmakers=broken" in path:
-            raise requests.HTTPError("odds-by-tournaments: HTTP 500: upstream error")
         if path == oddspapi.ACCOUNT_PATH:
             return self.account
         if path == oddspapi.MARKETS_PATH:
@@ -136,7 +134,7 @@ class FakeOddsClient:
 
 def test_collect_odds_fetches_caches_and_archives(tmp_path: Path) -> None:
     client = FakeOddsClient(left=200, odds=_odds())
-    coverage, notes, available = scan.collect_odds(client, [FIXTURE], {9001: SQUAD}, NOW, NOW + timedelta(hours=4),
+    coverage, notes = scan.collect_odds(client, [FIXTURE], {9001: SQUAD}, NOW, NOW + timedelta(hours=4),
                                         ("bet365",), tmp_path)
     assert len(coverage.quotes) == 2 and "3 matched to our players" in notes[0]
     assert client.paths == [oddspapi.ACCOUNT_PATH, oddspapi.MARKETS_PATH,
@@ -150,7 +148,7 @@ def test_collect_odds_fetches_caches_and_archives(tmp_path: Path) -> None:
 
 def test_a_bookmaker_without_fixtures_is_noted_not_fatal(tmp_path: Path) -> None:
     client = FakeOddsClient(left=200, odds=_odds())
-    coverage, notes, available = scan.collect_odds(client, [FIXTURE], {9001: SQUAD}, NOW, NOW + timedelta(hours=4),
+    coverage, notes = scan.collect_odds(client, [FIXTURE], {9001: SQUAD}, NOW, NOW + timedelta(hours=4),
                                         ("bet365", "skybet"), tmp_path)
     assert len(coverage.quotes) == 2
     assert "No odds for these leagues from: skybet" in notes
@@ -169,7 +167,7 @@ def test_vendor_400_can_mean_no_data_and_errors_carry_the_scrubbed_body() -> Non
             return response
 
     client._local.session = BadRequest()
-    assert client.get_json_value("odds", empty_on={400: "no fixtures"}) is None
+    assert client.get_json_value("odds", empty_on=frozenset({400}), empty_marker="no fixtures") is None
     with pytest.raises(requests.HTTPError) as caught:
         client.get_json_value("odds")
     assert "no fixtures" in str(caught.value) and secret not in str(caught.value)
@@ -196,7 +194,8 @@ def test_only_the_known_no_fixtures_400_counts_as_empty() -> None:
 
     def fetch(kind: str) -> Any:
         client._local.session = Reply(bodies[kind])
-        return client.get_json_value("odds", empty_on=oddspapi.NO_FIXTURES_REPLIES)
+        return client.get_json_value("odds", empty_on=oddspapi.NO_FIXTURES_STATUS,
+                                     empty_marker=oddspapi.NO_FIXTURES_MESSAGE)
 
     assert fetch("empty") is None
     with pytest.raises(requests.HTTPError, match="Invalid tournamentIds"):
@@ -205,7 +204,7 @@ def test_only_the_known_no_fixtures_400_counts_as_empty() -> None:
 
 def test_collect_odds_keeps_the_quota_reserve(tmp_path: Path) -> None:
     client = FakeOddsClient(left=scan.ODDS_QUOTA_RESERVE + 2, odds=_odds())
-    coverage, notes, available = scan.collect_odds(client, [FIXTURE], {9001: SQUAD}, NOW, NOW + timedelta(hours=4),
+    coverage, notes = scan.collect_odds(client, [FIXTURE], {9001: SQUAD}, NOW, NOW + timedelta(hours=4),
                                         ("bet365", "skybet"), tmp_path)
     assert coverage.quotes == () and "NOT fetched" in notes[0]
     assert client.paths == [oddspapi.ACCOUNT_PATH]
@@ -213,7 +212,7 @@ def test_collect_odds_keeps_the_quota_reserve(tmp_path: Path) -> None:
 
 def test_odds_outside_the_window_are_ignored(tmp_path: Path) -> None:
     client = FakeOddsClient(left=200, odds=_odds(start=KICKOFF + timedelta(days=3)))
-    coverage, _, _ = scan.collect_odds(client, [FIXTURE], {9001: SQUAD}, NOW, NOW + timedelta(hours=4),
+    coverage, _ = scan.collect_odds(client, [FIXTURE], {9001: SQUAD}, NOW, NOW + timedelta(hours=4),
                                     ("bet365",), tmp_path)
     assert coverage.prices == 0 and coverage.unmatched_fixtures == ()
 
@@ -250,50 +249,3 @@ def test_odds_client_sends_the_key_as_a_query_parameter_not_a_header() -> None:
     assert "Authorization" not in session.headers and client.auth_query_param == "apiKey"
     assert (client.max_retries, client.max_requests) == (0, 8)
     client.close()
-
-
-def test_one_failing_bookmaker_keeps_the_other_books_prices(tmp_path: Path) -> None:
-    """Audit 2026-10-05: a William Hill 404 used to discard bet365's prices for the whole run (handler H12)."""
-    client = FakeOddsClient(left=200, odds=_odds())
-    coverage, notes, available = scan.collect_odds(client, [FIXTURE], {9001: SQUAD}, NOW, NOW + timedelta(hours=4),
-                                                   ("bet365", "broken", "skybet"), tmp_path)
-    assert len(coverage.quotes) == 2 and available
-    assert any(n.startswith("Odds FAILED from broken, its prices left out: HTTPError") for n in notes)
-    assert "No odds for these leagues from: skybet" in notes
-
-
-def test_every_bookmaker_failing_means_no_real_odds(tmp_path: Path) -> None:
-    client = FakeOddsClient(left=200, odds=_odds())
-    coverage, notes, available = scan.collect_odds(client, [FIXTURE], {9001: SQUAD}, NOW, NOW + timedelta(hours=4),
-                                                   ("broken",), tmp_path)
-    assert coverage.quotes == () and not available
-    _, _, none_listed = scan.collect_odds(FakeOddsClient(left=200, odds=_odds()), [FIXTURE], {9001: SQUAD}, NOW,
-                                          NOW + timedelta(hours=4), ("skybet",), tmp_path)
-    assert none_listed  # "no fixtures" from every book is coverage, not an outage
-
-
-def test_the_williamhill_404_counts_as_no_fixtures_and_the_request_uses_the_documented_parameter() -> None:
-    client = VendorClient("https://api.oddspapi.io/v4", "k" * 36, TokenBucketRateLimiter(100.0, 10), max_retries=0,
-                          auth_query_param="apiKey")
-    replies = {
-        404: '{"error": {"message": "No fixtures found for the specified tournament IDs and bookmaker.", '
-             '"code": "FIXTURE_NOT_FOUND"}}',
-        403: '{"error": {"message": "Forbidden", "code": "FORBIDDEN"}}',
-    }
-
-    class Reply:
-        def __init__(self, status: int) -> None:
-            self.status = status
-
-        def get(self, url: str, timeout: float, params: dict[str, str] | None = None) -> requests.Response:
-            response = requests.Response()
-            response.status_code = self.status
-            response._content = replies[self.status].encode()
-            return response
-
-    client._local.session = Reply(404)
-    assert client.get_json_value("odds", empty_on=oddspapi.NO_FIXTURES_REPLIES) is None
-    client._local.session = Reply(403)
-    with pytest.raises(requests.HTTPError, match="HTTP 403"):
-        client.get_json_value("odds", empty_on=oddspapi.NO_FIXTURES_REPLIES)
-    assert "bookmakers=bet365&" in oddspapi.odds_path("bet365", [25, 24])

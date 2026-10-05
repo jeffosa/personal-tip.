@@ -431,10 +431,6 @@ _TOKEN_SHAPED = "1234567890" + ":" + "A" * 35
         (_secret_hits, f"TELEGRAM_BOT_TOKEN={_TOKEN_SHAPED}\n"),
         (_secret_hits, "dsn = 'postgresql://admin:" + "hunter2@db.internal/prod'\n"),
     ],
-    # Named cases: the default ids would print the fake token and placeholder in `pytest -v` output, which then
-    # trips the secrets and placeholder scans in any report that captures it.
-    ids=["bare-pass-handler", "bare-except", "io-import", "cursor-parameter", "clock-read", "raw-moment",
-         "outer-moment", "pass-body", "sql-placeholder", "telegram-token", "dsn-password"],
 )
 def test_contract_detectors_flag_deliberate_violations(detector: Callable[[str], object], violation: str) -> None:
     assert detector(violation)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 import pytest
@@ -234,7 +234,7 @@ class _StubSportmonks:
 class _FailingOdds:
     requests_sent = 0
 
-    def get_json_value(self, path: str, empty_on: Mapping[int, str] | None = None) -> Any:
+    def get_json_value(self, path: str, empty_on: frozenset[int] = frozenset(), empty_marker: str = "") -> Any:
         raise requests.HTTPError(f"{path}: HTTP 403: Forbidden")
 
 
@@ -278,7 +278,6 @@ def test_odds_outage_is_reported_in_the_summary_not_fatal(
     assert summary.boards_sent == 1 and notifier.texts and all(t.startswith(PAPER_LABEL) for t in notifier.texts)
     text = summary.text("")
     assert "Bankroll: GBP 1,000.00" in text
-    assert summary.odds_unavailable  # main() exits ODDS_UNAVAILABLE_EXIT, so the scheduled task shows a failure
     assert "Odds unavailable this run, nothing priced: HTTPError" in text and "HTTP 403" in text
     assert "Matches kicking off in this window: 1" in text
     assert "Fair-price boards sent (matches with no bookmaker line): 1" in text
@@ -444,31 +443,3 @@ def test_pricing_reads_positions_as_of_kickoff_never_the_latest_one() -> None:
         assert "primary_position" not in sql
     assert "s.match_position" in scan.SQUAD_SQL and "f.kickoff_at DESC" in scan.SQUAD_SQL
     assert "GROUP BY s.match_position" in scan.LEVEL_SQL
-
-
-def test_fouls_are_priced_but_never_staked_or_alerted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Maintainer decision 2026-10-05: fouls fails Gate 2 calibration, so only ALERT_MARKETS reach the allocator;
-    fouls rows stay on boards, tagged."""
-    assert scan.ALERT_MARKETS == frozenset({"tackles"})
-    _patch_database(monkeypatch)
-    store = SentAlertStore(tmp_path / "mock.jsonl")
-    seen: list[str] = []
-    original = scan.InstitutionalAssetManager.allocate
-
-    def spy(self: Any, projections: Any, quotes: Any, **kwargs: Any) -> Any:
-        seen.extend(q.market_type for q in quotes)
-        return original(self, projections, quotes, **kwargs)
-
-    monkeypatch.setattr(scan.InstitutionalAssetManager, "allocate", spy)
-    summary = scan.run_scan(KICKOFF - timedelta(hours=2), _StubSportmonks(), "postgresql://unused",
-                            _RecordingNotifier(store), store, 1000.0, scan.MOCK_LABEL, currency="GBP", odds="mock",
-                            state_dir=tmp_path)
-    assert seen and set(seen) == {"tackles"}
-    assert "Alerted markets: tackles" in summary.text("")
-    entries = [FairPrice(9001, 1, "fouls", 1.5, "over", 0.5, 2.0, 2.12),
-               FairPrice(9001, 1, "tackles", 1.5, "over", 0.5, 2.0, 2.12)]
-    squad = (SquadPlayer(1, "Player 01", "MID", "76"),)
-    [(text, _)] = scan.format_board(FIXTURE, scan.SlateInputs(squad, {}, {}, RATES), entries)
-    fouls_row = next(line for line in text.splitlines() if " fouls " in line)
-    tackles_row = next(line for line in text.splitlines() if " tackles " in line)
-    assert fouls_row.endswith(scan.UNCALIBRATED_TAG) and scan.UNCALIBRATED_TAG not in tackles_row

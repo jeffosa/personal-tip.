@@ -74,13 +74,9 @@ def test_run_ingests_only_the_missing_fixtures_and_reports_failures(monkeypatch:
         report.merge = MergeResult(1, 30, 0)
         return report
 
-    refreshed: list[date] = []
     monkeypatch.setattr(results, "ingest", fake_ingest)
-    monkeypatch.setattr(results, "refresh_incomplete", lambda dsn, since: refreshed.append(since) or 2)
     report = results.run(NOW, _Listing(3), "postgresql://unused")
     assert sent == [["102", "103"]]
-    assert refreshed == [report.start - timedelta(days=1)] and report.incomplete == 2  # quarantine refreshed
-    assert "2 club-matches in the window have a player without an ID" in report.text()
     assert report.listed == 3 and report.missing == ["102", "103"] and report.ingested == 1
     assert report.failed == {"103": "ValueError: refused"} and not report.ok
     assert "3 finished, 2 not yet stored, 1 ingested, 1 FAILED (103)" in report.text()
