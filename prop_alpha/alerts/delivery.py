@@ -95,9 +95,11 @@ def resend(notifier: TelegramNotifier, log: DeliveryLog, delivery_id: int, now: 
                          "use --dismiss instead")
     notifier.send_message(RESENT_HEADER)
     message_id = notifier.send_message(delivery.text)
-    log.resolve(delivery_id, "resent", datetime.now(timezone.utc), message_id)
+    # Index before confirming, as TelegramNotifier._send_and_confirm does: a copy that takes no reply is worse than
+    # one still listed for review.
     if notifier.index is not None and delivery.items:
         notifier.index.record(message_id, delivery.items, datetime.now(timezone.utc))
+    log.resolve(delivery_id, "resent", datetime.now(timezone.utc), message_id)
     return message_id
 
 

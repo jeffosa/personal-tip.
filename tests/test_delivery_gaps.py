@@ -193,3 +193,42 @@ def test_a_board_message_already_recorded_is_not_sent_again(tmp_path: Path) -> N
     assert notifier.send_tracked("FAIR-PRICE BOARD part 1", "board", [BOARD], kickoff) is None
     assert notifier.send_tracked("FAIR-PRICE BOARD part 2", "board", [BOARD], kickoff) == 6
     assert len(session.calls) == 2
+
+
+# ---------------- delivery audit rerun (2026-10-05, second pass) ----------------
+def test_a_message_stopped_between_send_and_confirmation_still_takes_bet_replies(tmp_path: Path) -> None:
+    """The message was indexed only after its delivery was confirmed: stopped in between, it was confirmed but not
+    indexed, so every reply was refused and the quoted-text recovery (unconfirmed deliveries only) skipped it."""
+    log, index = DeliveryLog(tmp_path / "deliveries.jsonl"), MessageIndex(tmp_path / "messages.jsonl")
+    notifier = TelegramNotifier(TelegramConfig(FAKE_TOKEN, CHAT), session=FakeSession(_ok({"message_id": 77})),
+                                sleep=lambda s: None, index=index, deliveries=log)
+
+    def stopped(*args: Any, **kwargs: Any) -> None:
+        raise KeyboardInterrupt("process stopped")
+
+    log.resolve = stopped  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        notifier.send_tracked("FAIR-PRICE BOARD\n1. B (Walsall)", "board", [BOARD], NOW + timedelta(hours=3))
+    assert index.load()[77] == {2: BOARD}  # a "placed 2 under @..." reply to message 77 is recorded
+    assert DeliveryLog(tmp_path / "deliveries.jsonl").needs_review(NOW + timedelta(hours=1))  # and it is reviewed
+
+
+def test_two_ledger_writers_cannot_run_at_once_and_a_finished_one_releases_the_lock(tmp_path: Path) -> None:
+    """A manual --poll during the scheduled one could read the same update in both and record one bet twice."""
+    from prop_alpha.alerts.ledger import ledger_lock
+
+    lock = tmp_path / "ledger.lock"
+    with ledger_lock(lock):
+        with pytest.raises(OSError):
+            with ledger_lock(lock):
+                pytest.fail("a second writer must not get the lock")
+    with ledger_lock(lock):  # released: the next run proceeds
+        pass
+
+
+def test_a_simulated_run_time_is_refused_with_real_odds(capsys: pytest.CaptureFixture[str]) -> None:
+    """--at with --odds oddspapi sent real alerts into the real store and archived real prices under the simulated
+    time; --at is for mock runs only."""
+    with pytest.raises(SystemExit) as refused:
+        scan.main(["--odds", "oddspapi", "--at", "2026-10-10T12:00:00+00:00"])
+    assert refused.value.code == 2 and "works only with --odds mock" in capsys.readouterr().err

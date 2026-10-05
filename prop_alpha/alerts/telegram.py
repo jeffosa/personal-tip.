@@ -745,10 +745,13 @@ class TelegramNotifier:
         delivery pending, which becomes "outcome unknown" for the operator to review."""
         message_id = self.send_message(text)
         sent_at = datetime.now(timezone.utc)
-        if self.deliveries is not None and delivery_id is not None:
-            self.deliveries.resolve(delivery_id, "delivered", sent_at, message_id)
+        # Index before confirming (delivery audit 2026-10-05): stopped in between, an indexed but unconfirmed message
+        # still takes bet replies and is listed for review; a confirmed but unindexed one refused every reply, and the
+        # quoted-text recovery (ledger.confirm_quoted_deliveries) looks only at unconfirmed deliveries.
         if self.index is not None and items:
             self.index.record(message_id, items, sent_at)
+        if self.deliveries is not None and delivery_id is not None:
+            self.deliveries.resolve(delivery_id, "delivered", sent_at, message_id)
         return message_id
 
     def _record(self, directive: StakingDirective) -> None:

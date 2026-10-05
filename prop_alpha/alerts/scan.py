@@ -656,6 +656,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--send", action="store_true", help="send alerts and the summary to Telegram")
     parser.add_argument("--at", type=datetime.fromisoformat, default=None, help="simulated UTC run time (testing)")
     args = parser.parse_args(argv)
+    if args.at is not None and args.odds == "oddspapi":
+        # Delivery audit 2026-10-05: a simulated run time with real odds sent real alerts into the real alert store
+        # and archived real prices under the simulated time (an archive file stamped five days ahead was found).
+        parser.error("--at simulates the run time, so it works only with --odds mock; real odds are priced now")
     now = _utc(args.at) if args.at is not None else datetime.now(timezone.utc)
     currency = bankroll_currency()
     book_rate = book_to_bankroll(currency, now.date())

@@ -29,10 +29,11 @@ import logging
 import os
 import sys
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Final, Mapping, Sequence
+from typing import Any, Final, Iterator, Mapping, Sequence
 
 from prop_alpha.alerts.closing import load_closing_quotes
 from prop_alpha.alerts.fx import BOOK_CURRENCY, CURRENCY_SYMBOLS, ExchangeRate, bankroll_currency, cached_rate, is_fresh
@@ -80,6 +81,8 @@ DEFAULT_OFFSET_FILE: Final[Path] = STATE_DIR / "telegram_offset.json"
 # read Telegram (status report: Telegram keeps an unread reply for 24 hours only).
 DEFAULT_ANSWERS_FILE: Final[Path] = STATE_DIR / "ledger_answers.jsonl"
 DEFAULT_HEARTBEAT_FILE: Final[Path] = STATE_DIR / "ledger_last_poll.json"
+# Held by every run that writes the ledger (ledger_lock).
+DEFAULT_LOCK_FILE: Final[Path] = STATE_DIR / "ledger.lock"
 # An answer that failed this many sends is left for the status report instead of being retried for ever.
 MAX_ANSWER_ATTEMPTS: Final[int] = 3
 DELAYED_PREFIX: Final[str] = "(Delayed answer - this was not delivered when you sent your reply.) "
@@ -635,6 +638,34 @@ def results_summary(settled: Sequence[tuple[PlacedBet, Settlement]],
             f"void): staked {staked:.2f}, profit {total:+.2f}{roi}{caveat}{clv}")
 
 
+@contextmanager
+def ledger_lock(path: Path = DEFAULT_LOCK_FILE) -> Iterator[None]:
+    """Hold an exclusive OS lock for a run that writes the ledger (--poll, --settle). Delivery audit 2026-10-05: the
+    scheduled task runs one instance at a time, but a manual --poll during it could read the same Telegram update in
+    both runs before either recorded it, recording one bet twice. The lock is released by the OS if the process dies,
+    so a crash never leaves it stuck. A second writer fails at once (OSError from the lock call), recorded by the
+    scheduled script as a failed step, rather than waiting or writing."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        logger.info("ledger lock taken (%s)", path.name)
+        yield
+        if sys.platform == "win32":
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        handle.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Record manually placed bets from Telegram replies.")
@@ -666,7 +697,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"UNDELIVERED answer #{answer_id} to your message {reply_to} ({attempts} failed sends): {text}")
         return 0
     if args.settle:
-        settled = settle(store, os.environ.get(DSN_ENV, DEFAULT_DSN), now)
+        with ledger_lock():
+            settled = settle(store, os.environ.get(DSN_ENV, DEFAULT_DSN), now)
         closing = closing_values(settled, load_closing_quotes(STATE_DIR))
         lines = [settlement_text(bet, settlement, closing.get(bet.bet_id)) for bet, settlement in settled]
         print("\n".join(lines) if lines else "no open bet has a final match in the database")
@@ -687,8 +719,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     currency = bankroll_currency()
     rate = None if currency == BOOK_CURRENCY else cached_rate()
     fresh = rate if rate is not None and is_fresh(rate, now.date()) else None
-    sent = poll(TelegramNotifier(load_config()), MessageIndex(), store, DEFAULT_OFFSET_FILE, now, currency, fresh,
-                outbox=AnswerOutbox(), deliveries=DeliveryLog(), heartbeat_file=DEFAULT_HEARTBEAT_FILE)
+    with ledger_lock():
+        sent = poll(TelegramNotifier(load_config()), MessageIndex(), store, DEFAULT_OFFSET_FILE, now, currency, fresh,
+                    outbox=AnswerOutbox(), deliveries=DeliveryLog(), heartbeat_file=DEFAULT_HEARTBEAT_FILE)
     print(f"answered {sent} message(s)")
     return 0
 
