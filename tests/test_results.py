@@ -76,7 +76,11 @@ def test_run_ingests_only_the_missing_fixtures_and_reports_failures(monkeypatch:
 
     refreshed: list[date] = []
     monkeypatch.setattr(results, "ingest", fake_ingest)
-    monkeypatch.setattr(results, "refresh_incomplete", lambda dsn, since: refreshed.append(since) or 2)
+    def refresh_incomplete(dsn: str, since: date) -> int:
+        refreshed.append(since)
+        return 2
+
+    monkeypatch.setattr(results, "refresh_incomplete", refresh_incomplete)
     report = results.run(NOW, _Listing(3), "postgresql://unused")
     assert sent == [["102", "103"]]
     assert refreshed == [report.start - timedelta(days=1)] and report.incomplete == 2  # quarantine refreshed

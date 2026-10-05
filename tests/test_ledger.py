@@ -367,3 +367,18 @@ def test_automatic_results_are_labelled_provisional_and_manual_ones_are_not(tmp_
     texts = [ledger.settlement_text(bet, s) for bet, s in store.settled_bets()]
     assert "WON (provisional)" in texts[0] and "LOST" in texts[1] and "provisional" not in texts[1]
     assert "1 provisional (automatic, assumed market rules" in ledger.results_summary(store.settled_bets())
+
+
+def test_the_confirmed_only_total_leaves_out_provisional_automatic_results(tmp_path: Path) -> None:
+    """Readiness item 2 (2026-10-05): automatic results rest on the assumed market contract, so a performance claim
+    quotes the confirmed-only total, which counts manual settlements alone."""
+    store = PlacedBetStore(tmp_path / "bets.jsonl")
+    process_updates([_update(1, "placed 1 @2.05 5"), _update(2, "placed 2 under @2.90 4")], CHAT, MESSAGES,
+                    store, NOW)
+    store.record_settlement(Settlement(1, "won", "auto", "auto", NOW))
+    process_updates([_update(3, "settled 2 lost")], CHAT, MESSAGES, store, NOW)
+    summary = ledger.results_summary(store.settled_bets())
+    assert "staked 9.00, profit +1.25" in summary  # all results, provisional included: +5.25 - 4.00
+    assert "confirmed only: 1 bet(s), staked 4.00, profit -4.00" in summary
+    manual_only = [(bet, s) for bet, s in store.settled_bets() if s.source == "manual"]
+    assert "confirmed only" not in ledger.results_summary(manual_only)  # nothing provisional: one total is enough

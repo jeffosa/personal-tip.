@@ -12,6 +12,7 @@ does not play is void (VOID_IF_NO_APPEARANCE).
 
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -40,6 +41,8 @@ MARKETS_PATH: Final[str] =f"markets?sportId={SOCCER_SPORT_ID}"
 PARTICIPANTS_PATH: Final[str] = f"participants?sportId={SOCCER_SPORT_ID}"
 ACCOUNT_PATH: Final[str] = "account"
 
+# Object keys carry ids as strings ("102661"); only ASCII digits are ids (str.isdigit also accepts "²").
+_DIGITS: Final[re.Pattern[str]] = re.compile(r"[0-9]+")
 _COMMON_TEAM_WORDS: Final[frozenset[str]] = frozenset({
     "fc", "afc", "town", "city", "united", "utd", "county", "rovers", "athletic", "wanderers", "albion", "the",
 })
@@ -60,24 +63,55 @@ class LineMarket:
     sides: Mapping[int, str]  # outcomeId -> "over" | "under"
 
 
-def line_catalogue(markets: Sequence[Mapping[str, Any]]) -> dict[int, LineMarket]:
-    """marketId -> LineMarket for the player O/U markets in MARKET_TYPES."""
+def _object(value: Any, where: str) -> Mapping[str, Any]:
+    """`value` as a JSON object; any other shape is a malformed response (ValueError, never KeyError/TypeError)."""
+    if not isinstance(value, Mapping):
+        raise ValueError(f"malformed OddsPapi response: {where} is not an object")
+    return value
+
+
+def _identifier(value: Any, where: str) -> int:
+    """A non-negative integer id, given as a JSON number or as a string of ASCII digits (object keys)."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    if isinstance(value, str) and _DIGITS.fullmatch(value):
+        return int(value)
+    raise ValueError(f"malformed OddsPapi response: {where} {value!r} is not an id")
+
+
+def _finite(value: Any, where: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"malformed OddsPapi response: {where} {value!r} is not a finite number")
+    return float(value)
+
+
+def line_catalogue(markets: Any) -> dict[int, LineMarket]:
+    """marketId -> LineMarket for the player O/U markets in MARKET_TYPES. Raises ValueError on a malformed list."""
+    if not isinstance(markets, list):
+        raise ValueError("malformed OddsPapi response: the market catalogue is not a list")
     catalogue: dict[int, LineMarket] = {}
-    for market in markets:
+    for raw in markets:
+        market = _object(raw, "a catalogue market")
         kind = MARKET_TYPES.get(str(market.get("marketType")))
         if kind is None or not market.get("playerProp"):
             continue
-        sides = {int(o["outcomeId"]): str(o["outcomeName"]).lower() for o in market.get("outcomes") or []}
+        market_id = _identifier(market.get("marketId"), "catalogue marketId")
+        outcomes = market.get("outcomes") or []
+        if not isinstance(outcomes, list):
+            raise ValueError(f"malformed OddsPapi response: market {market_id} outcomes are not a list")
+        sides = {
+            _identifier(outcome.get("outcomeId"), f"market {market_id} outcomeId"): str(outcome.get("outcomeName")).lower()
+            for outcome in (_object(o, f"market {market_id} outcome") for o in outcomes)
+        }
         if sorted(sides.values()) != ["over", "under"]:
-            raise ValueError(f"market {market.get('marketId')}: outcomes are not Over/Under: {sorted(sides.values())}")
-        catalogue[int(market["marketId"])] = LineMarket(kind, float(market["handicap"]), sides)
+            raise ValueError(f"market {market_id}: outcomes are not Over/Under: {sorted(sides.values())}")
+        catalogue[market_id] = LineMarket(kind, _finite(market.get("handicap"), f"market {market_id} handicap"), sides)
     return catalogue
 
 
 def participant_names(body: Any) -> dict[int, str]:
-    if not isinstance(body, Mapping):
-        raise ValueError("OddsPapi participants response is not an object")
-    return {int(key): str(name) for key, name in body.items()}
+    names = _object(body, "the participants response")
+    return {_identifier(key, "participant id"): str(name) for key, name in names.items()}
 
 
 @dataclass(frozen=True)
@@ -103,7 +137,9 @@ class PropPrice:
     limit: float | None
 
 
-def _kickoff(raw: str) -> datetime:
+def _kickoff(raw: Any) -> datetime:
+    if not isinstance(raw, str):
+        raise ValueError(f"malformed OddsPapi response: startTime {raw!r} is not a timestamp")
     value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     if value.utcoffset() != timedelta(0):
         raise ValueError(f"OddsPapi startTime {raw!r} is not UTC")
@@ -111,33 +147,49 @@ def _kickoff(raw: str) -> datetime:
 
 
 def prop_prices(body: Any, catalogue: Mapping[int, LineMarket], bookmaker: str) -> list[PropPrice]:
-    """Every active player O/U price in `body` (an odds-by-tournaments response) for MARKET_TYPES."""
+    """Every active player O/U price in `body` (an odds-by-tournaments response) for MARKET_TYPES.
+
+    A malformed body (wrong shape, missing fixture fields, a non-finite price or limit) raises ValueError, so the
+    caller can drop this bookmaker's reply whole and keep the others' (scan.collect_odds, handler H12). An inactive
+    quote, or a price of 1.0 or less, is not malformed: it is simply not on offer and is skipped."""
     if not isinstance(body, list):
-        raise ValueError("OddsPapi odds response is not a list")
+        raise ValueError("malformed OddsPapi response: the odds response is not a list")
     prices: list[PropPrice] = []
-    for raw in body:
-        fixture = OddsFixture(str(raw["fixtureId"]), int(raw["participant1Id"]), int(raw["participant2Id"]),
-                              _kickoff(str(raw["startTime"])))
-        book = (raw.get("bookmakerOdds") or {}).get(bookmaker)
-        if not book or not book.get("bookmakerIsActive", True) or book.get("suspended"):
+    for raw_fixture in body:
+        raw = _object(raw_fixture, "a fixture")
+        if raw.get("fixtureId") in (None, ""):
+            raise ValueError("malformed OddsPapi response: a fixture has no fixtureId")
+        fixture = OddsFixture(str(raw["fixtureId"]), _identifier(raw.get("participant1Id"), "participant1Id"),
+                              _identifier(raw.get("participant2Id"), "participant2Id"), _kickoff(raw.get("startTime")))
+        book = _object(raw.get("bookmakerOdds") or {}, f"fixture {fixture.odds_fixture_id} bookmakerOdds").get(bookmaker)
+        if not book:
             continue
-        for market_id, market in (book.get("markets") or {}).items():
-            line_market = catalogue.get(int(market_id))
+        book = _object(book, f"fixture {fixture.odds_fixture_id} {bookmaker} odds")
+        if not book.get("bookmakerIsActive", True) or book.get("suspended"):
+            continue
+        for market_id, raw_market in _object(book.get("markets") or {}, "markets").items():
+            market = _object(raw_market, f"market {market_id}")
+            line_market = catalogue.get(_identifier(market_id, "marketId"))
             if line_market is None or not market.get("marketActive", True):
                 continue
-            for outcome_id, outcome in (market.get("outcomes") or {}).items():
-                side = line_market.sides.get(int(outcome_id))
+            for outcome_id, raw_outcome in _object(market.get("outcomes") or {}, f"market {market_id} outcomes").items():
+                side = line_market.sides.get(_identifier(outcome_id, f"market {market_id} outcomeId"))
                 if side is None:
                     continue
-                for player_ref, quote in (outcome.get("players") or {}).items():
-                    price = quote.get("price")
-                    if not quote.get("active", True) or not isinstance(price, (int, float)) or price <= 1.0:
+                outcome = _object(raw_outcome, f"market {market_id} outcome {outcome_id}")
+                for player_ref, raw_quote in _object(outcome.get("players") or {}, f"outcome {outcome_id} players").items():
+                    quote = _object(raw_quote, f"player {player_ref} quote")
+                    if not quote.get("active", True) or quote.get("price") is None:
+                        continue
+                    price = _finite(quote.get("price"), f"player {player_ref} price")
+                    if price <= 1.0:
                         continue
                     limit = quote.get("limit")
+                    stake_limit = None if limit is None else _finite(limit, f"player {player_ref} limit")
                     prices.append(PropPrice(
                         fixture, bookmaker, line_market.market, line_market.line, side, str(player_ref),
-                        str(quote.get("playerName") or ""), float(price),
-                        float(limit) if isinstance(limit, (int, float)) and limit > 0 else None,
+                        str(quote.get("playerName") or ""), price,
+                        stake_limit if stake_limit is not None and stake_limit > 0 else None,
                     ))
     return prices
 

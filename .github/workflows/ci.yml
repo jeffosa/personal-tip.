@@ -1,0 +1,57 @@
+# Release gate (production-readiness item 3, 2026-10-05): every push and pull request runs ci/bootstrap.sh --release
+# against a throwaway PostgreSQL 18 service, so the database stage (fresh install, migration re-apply, the
+# 003 -> 008 upgrade path and the merge behaviour test) and both type checkers can never be skipped.
+#
+# The service lives only for this job and listens only to the runner, so it uses trust authentication: there is no
+# password to store. Nothing here touches the working prop_alpha database or any vendor API.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: prop_alpha_ci
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d prop_alpha_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PROP_ALPHA_CI_DATABASE_URL: postgresql://postgres@localhost:5432/prop_alpha_ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Mark the service database disposable (ci/bootstrap.sh refuses to reset an unmarked one)
+        run: >-
+          psql "$PROP_ALPHA_CI_DATABASE_URL" -X -v ON_ERROR_STOP=1
+          -c "COMMENT ON DATABASE prop_alpha_ci IS 'prop_alpha disposable CI database'"
+      - name: Release gate
+        env:
+          PROP_ALPHA_PYTHON: python
+        run: bash ci/bootstrap.sh --release
+      - name: Keep the test report and the installed versions
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-artifacts
+          path: ci-artifacts/

@@ -322,7 +322,9 @@ class PropProjection:
         if not (math.isfinite(minutes) and 0.0 < minutes <= MAX_MATCH_MINUTES):
             raise ProjectionError(f"minutes={minutes!r} must be finite and in (0, {MAX_MATCH_MINUTES}]")
         exposure = minutes / 90.0
-        return nbinom(self.gamma_shape, self.gamma_rate / (self.gamma_rate + exposure))
+        # scipy's stubs type every frozen distribution as rv_continuous_frozen | rv_discrete_frozen; nbinom is discrete
+        # (it has pmf). A comment, not a cast: this module is fingerprinted by model_freeze.
+        return nbinom(self.gamma_shape, self.gamma_rate / (self.gamma_rate + exposure))  # pyright: ignore[reportReturnType]
 
     def side_probabilities(
         self,
@@ -416,7 +418,8 @@ class FactorProjection:
         under: list[float] = []
         push: list[float] = []
         for minutes, minutes_weight in zip(mixture.minutes, mixture.weights):
-            p_over, p_under, p_push = _line_masses(nbinom(alpha, beta / (beta + nodes * (minutes / 90.0))), line)
+            # As in count_distribution: nbinom is discrete, but scipy's stubs return a union with the continuous type.
+            p_over, p_under, p_push = _line_masses(nbinom(alpha, beta / (beta + nodes * (minutes / 90.0))), line)  # pyright: ignore[reportArgumentType]
             if not (np.isfinite(p_over).all() and np.isfinite(p_under).all() and np.isfinite(p_push).all()):
                 raise ProjectionError("conditional count probabilities are not finite")
             over.append(minutes_weight * float(weights @ p_over))

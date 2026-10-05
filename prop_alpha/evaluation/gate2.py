@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Final, Sequence
 
 import numpy as np
+from numpy.typing import ArrayLike
 
 from prop_alpha.evaluation.backtest import brier_score, calibration_table, log_loss
 
@@ -29,7 +30,7 @@ NEWTON_TOLERANCE: Final[float] = 1e-10
 MAX_HESSIAN_CONDITION: Final[float] = 1e12
 
 
-def _arrays(probabilities: Sequence[float], outcomes: Sequence[int]) -> tuple[np.ndarray, np.ndarray]:
+def _arrays(probabilities: ArrayLike, outcomes: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
     p = np.asarray(probabilities, dtype=np.float64)
     y = np.asarray(outcomes, dtype=np.float64)
     if p.ndim != 1 or p.shape != y.shape or len(p) == 0:
@@ -53,7 +54,7 @@ class CalibrationFit:
     note: str = ""
 
 
-def calibration_fit(probabilities: Sequence[float], outcomes: Sequence[int]) -> CalibrationFit:
+def calibration_fit(probabilities: ArrayLike, outcomes: ArrayLike) -> CalibrationFit:
     """The logistic calibration fit, by Newton's method with a conditioning check before every step."""
     p, y = _arrays(probabilities, outcomes)
     x = np.column_stack([np.ones_like(p), np.log(p / (1.0 - p))])
@@ -74,7 +75,7 @@ def calibration_fit(probabilities: Sequence[float], outcomes: Sequence[int]) -> 
 
 
 def clustered_skill_interval(
-    fixtures: Sequence[int], probabilities: Sequence[float], outcomes: Sequence[int], rng: np.random.Generator,
+    fixtures: Sequence[int], probabilities: ArrayLike, outcomes: ArrayLike, rng: np.random.Generator,
     resamples: int = BOOTSTRAP_RESAMPLES,
 ) -> tuple[float, float]:
     """90% interval of the Brier skill score against climatology, resampling whole fixtures with replacement."""
@@ -102,7 +103,7 @@ def clustered_skill_interval(
     return float(low), float(high)
 
 
-def worst_bin_gap(probabilities: Sequence[float], outcomes: Sequence[int]) -> float:
+def worst_bin_gap(probabilities: ArrayLike, outcomes: ArrayLike) -> float:
     """Largest |mean predicted - observed| over calibration bins with >= MIN_BIN_PREDICTIONS; nan if none."""
     p, y = _arrays(probabilities, outcomes)
     gaps = [abs(b.mean_predicted - b.observed_rate) for b in calibration_table(p, y) if b.n >= MIN_BIN_PREDICTIONS]
@@ -141,7 +142,7 @@ class LineScore:
         return all(self.criteria.values())
 
 
-def score_line(fixtures: Sequence[int], probabilities: Sequence[float], outcomes: Sequence[int],
+def score_line(fixtures: Sequence[int], probabilities: ArrayLike, outcomes: ArrayLike,
                rng: np.random.Generator, resamples: int = BOOTSTRAP_RESAMPLES) -> LineScore:
     p, y = _arrays(probabilities, outcomes)
     base = float(y.mean())
@@ -183,8 +184,8 @@ class MarketBenchmark:
                 and self.p_value < BENCHMARK_ALPHA)
 
 
-def market_benchmark(market_probabilities: Sequence[float], probabilities: Sequence[float],
-                     outcomes: Sequence[int]) -> MarketBenchmark:
+def market_benchmark(market_probabilities: ArrayLike, probabilities: ArrayLike,
+                     outcomes: ArrayLike) -> MarketBenchmark:
     """The criterion-4 fit by Newton's method with the same conditioning check as calibration_fit."""
     q, y = _arrays(market_probabilities, outcomes)
     p, _ = _arrays(probabilities, outcomes)

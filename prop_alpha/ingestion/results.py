@@ -142,7 +142,10 @@ def refresh_incomplete(dsn: str, since: date) -> int:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(REFRESH_INCOMPLETE_SQL, (datetime(since.year, since.month, since.day, tzinfo=timezone.utc),))
-                return int(cur.fetchone()[0])
+                row = cur.fetchone()
+                if row is None:
+                    raise ValueError("incomplete_team_matches refresh returned no row count")
+                return int(row[0])
     finally:
         conn.close()
 

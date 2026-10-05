@@ -191,11 +191,13 @@ def clustered_interval(
         bs_base = np.mean((base[pick] - y[pick]) ** 2)
         clim.append(1 - bs / bs_clim if bs_clim > 0 else np.nan)
         rel.append(1 - bs / bs_base if bs_base > 0 else np.nan)
-    return (tuple(np.nanpercentile(clim, [5, 95])), tuple(np.nanpercentile(rel, [5, 95])))  # type: ignore[return-value]
+    clim_low, clim_high = np.nanpercentile(clim, [5, 95])
+    rel_low, rel_high = np.nanpercentile(rel, [5, 95])
+    return (float(clim_low), float(clim_high)), (float(rel_low), float(rel_high))
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--level", action="store_true",
                         help="trailing league level and level-scaled history (modeling.league_level)")
     args = parser.parse_args()

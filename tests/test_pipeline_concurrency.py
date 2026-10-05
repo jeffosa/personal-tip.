@@ -8,10 +8,11 @@ from typing import Any, Callable
 import pytest
 
 psycopg2 = pytest.importorskip("psycopg2")
-import psycopg2.errors  # noqa: E402
+pg_errors = pytest.importorskip("psycopg2.errors")
 
 from conftest import make_fixture_payload, make_lineup_payload  # noqa: E402
 import requests  # noqa: E402
+from requests.adapters import HTTPAdapter  # noqa: E402
 
 from prop_alpha.ingestion.pipeline import (  # noqa: E402
     MAX_RETRY_AFTER_S,
@@ -194,7 +195,7 @@ class FakeVendor:
         self.payloads = payloads
         self.lineups: dict[str, dict[str, Any]] = {}
         self.errors: dict[str, BaseException] = {}
-        self.before_fetch: Callable[[str], None] | None = None
+        self.before_fetch: Callable[[str], object] | None = None  # its return value is ignored
         self.violations: list[str] = []
         self.fetch_threads: set[int] = set()
 
@@ -255,7 +256,7 @@ def test_no_connection_is_held_during_network_io() -> None:
 
 def test_transient_database_error_is_retried() -> None:
     db, pool, vendor, uids = _setup(1)
-    db.failures.append(("staging_player_feed", psycopg2.errors.DeadlockDetected("deadlock detected")))
+    db.failures.append(("staging_player_feed", pg_errors.DeadlockDetected("deadlock detected")))
     with _engine(vendor, pool) as engine:
         report = engine.run_slate(uids, job="stats", merge=False)
     result = report.results["FX-0"]
@@ -266,7 +267,7 @@ def test_transient_database_error_is_retried() -> None:
 
 def test_statement_timeout_fails_closed_without_retry(caplog: pytest.LogCaptureFixture) -> None:
     db, pool, vendor, uids = _setup(1)
-    db.failures.append(("staging_player_feed", psycopg2.errors.QueryCanceled("canceling statement due to statement timeout")))
+    db.failures.append(("staging_player_feed", pg_errors.QueryCanceled("canceling statement due to statement timeout")))
     with caplog.at_level(logging.ERROR, logger="prop_alpha.ingestion"), _engine(vendor, pool) as engine:
         report = engine.run_slate(uids, job="stats")
     assert not report.results["FX-0"].ok
@@ -280,7 +281,7 @@ def test_statement_timeout_fails_closed_without_retry(caplog: pytest.LogCaptureF
 def test_retries_exhausted_marks_fixture_failed() -> None:
     db, pool, vendor, uids = _setup(1)
     db.failures.extend(
-        ("raw_payloads", psycopg2.errors.LockNotAvailable("lock timeout")) for _ in range(3)
+        ("raw_payloads", pg_errors.LockNotAvailable("lock timeout")) for _ in range(3)
     )
     with _engine(vendor, pool) as engine:
         report = engine.run_slate(uids, job="stats")
@@ -320,7 +321,7 @@ def test_deadline_reports_timed_out_fixtures() -> None:
 
 def test_merge_failure_is_recorded_and_staging_preserved() -> None:
     db, pool, vendor, uids = _setup(2)
-    db.failures.append(("merge_staging_player_feed", psycopg2.errors.QueryCanceled("statement timeout")))
+    db.failures.append(("merge_staging_player_feed", pg_errors.QueryCanceled("statement timeout")))
     with _engine(vendor, pool) as engine:
         report = engine.run_slate(uids, job="stats")
     assert report.merge is None
@@ -543,7 +544,9 @@ def test_short_retry_after_is_honoured_and_exhaustion_raises(monkeypatch: pytest
 
 def test_adapter_retries_only_connects_which_never_reach_the_vendor() -> None:
     client = VendorClient("https://vendor.invalid/api", "test-key", TokenBucketRateLimiter(100.0, 10))
-    retries = client._session().get_adapter("https://vendor.invalid").max_retries
+    adapter = client._session().get_adapter("https://vendor.invalid")
+    assert isinstance(adapter, HTTPAdapter)
+    retries = adapter.max_retries
     assert (retries.total, retries.connect, retries.read, retries.status) == (None, client.max_retries, 0, 0)
     assert client.max_retries == 1
     client.close()

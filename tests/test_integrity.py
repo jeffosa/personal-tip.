@@ -167,7 +167,7 @@ def test_lineup_parse_validates_per_player_bench_probabilities() -> None:
     assert entries[payload["lineups"]["T-AWAY"]["bench"][0]].p_sub_appearance == 0.35
     for bad in (1.5, -0.1, True):
         with pytest.raises(ValueError):
-            parse_lineup_payload(payload, 0.35, {bench: bad})  # type: ignore[dict-item]
+            parse_lineup_payload(payload, 0.35, {bench: bad})
 
 
 def test_staging_rows_have_header_and_full_width(fixture_payload: PayloadFactory) -> None:
@@ -201,7 +201,7 @@ def test_staging_player_columns_mirror_stats_columns() -> None:
 
 # ---------------- referee job: lock first, ordered update ----------------
 class _RecordingCursor:
-    def __init__(self, log: list[tuple[str, object]]) -> None:
+    def __init__(self, log: list[tuple[str, Any]]) -> None:
         self.log = log
         self.connection = self
         self.encoding = "UTF8"
@@ -220,13 +220,13 @@ class _RecordingCursor:
         self.log.append(("row", args))
         return repr(args).encode("utf-8")
 
-    def fetchall(self) -> list[tuple[int, ...]]:
+    def fetchall(self) -> Sequence[tuple[int, ...]]:
         return [(2, 7, 10 + f, 9, 11, 2, 0) for f in range(3)] + [(1, 7, 20 + f, 14, 16, 4, 0) for f in range(3)]
 
 
 class _RecordingConnection:
     def __init__(self) -> None:
-        self.log: list[tuple[str, object]] = []
+        self.log: list[tuple[str, Any]] = []
         self.closed = False
 
     def __enter__(self) -> _RecordingConnection:
@@ -247,7 +247,12 @@ def test_referee_job_takes_merge_lock_before_reading_and_updates_in_id_order(mon
 
     connection = _RecordingConnection()
     options: list[str] = []
-    monkeypatch.setattr(psycopg2, "connect", lambda dsn, **kwargs: options.append(kwargs.get("options", "")) or connection)
+
+    def connect(dsn: str, **kwargs: Any) -> _RecordingConnection:
+        options.append(kwargs.get("options", ""))
+        return connection
+
+    monkeypatch.setattr(psycopg2, "connect", connect)
     assert referee_job.run_referee_job("postgresql://unused", league_id=7) == 2
     statements = [entry for entry in connection.log if entry[0] != "row"]
     assert statements[0] == (referee_job.ADVISORY_LOCK_SQL, (referee_job.MERGE_LOCK_KEY,))
@@ -595,3 +600,23 @@ def test_incomplete_team_matches_is_mirrored_in_schema_and_read_by_pricing() -> 
     from prop_alpha.alerts import scan
     for sql in (scan.TEAM_RECENT_SQL, scan.LEVEL_SQL):
         assert "prop_alpha.incomplete_team_matches" in sql and "NOT EXISTS" in sql
+
+
+# ---------------- CI release gate (production-readiness item 3, 2026-10-05) ----------------
+def test_ci_resets_only_a_named_marked_and_empty_database_and_release_never_skips_it() -> None:
+    """Stage 6 drops the prop_alpha schema: the name, the operator-set marker and the no-real-data check must all run
+    before the drop, and --release must refuse to start without a database or pyright instead of skipping them."""
+    script = (ROOT / "ci" / "bootstrap.sh").read_text(encoding="utf-8")
+    drop = script.index("psql_ci -c 'DROP SCHEMA IF EXISTS prop_alpha CASCADE'")
+    for guard in ('[[ "${db_name}" == "${CI_DATABASE_NAME}" ]]', '[[ "${db_marker}" == "${CI_DATABASE_MARKER}" ]]',
+                  '[[ "${ci_rows}" == "0" ]]'):
+        assert 0 < script.index(guard) < drop, guard
+    assert "shobj_description(oid, 'pg_database')" in script and "prop_alpha.player_match_stats" in script
+    release = script.index('if [[ "${RELEASE}" -eq 1 ]]; then')
+    assert release < script.index('log "stage 2/6')  # refuses before building or installing anything
+    assert "--release requires PROP_ALPHA_CI_DATABASE_URL" in script[release:script.index('log "stage 2/6')]
+    assert '"${VENV_PY}" -m mypy --config-file mypy.ini' in script and 'npx --yes "pyright@${PYRIGHT_VERSION}"' in script
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "bash ci/bootstrap.sh --release" in workflow and "PROP_ALPHA_CI_DATABASE_URL" in workflow
+    marker = script.split('readonly CI_DATABASE_MARKER="', 1)[1].split('"', 1)[0]
+    assert f"COMMENT ON DATABASE prop_alpha_ci IS '{marker}'" in workflow

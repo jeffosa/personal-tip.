@@ -47,6 +47,7 @@ from prop_alpha.alerts.telegram import (
     DEFAULT_CRITERIA,
     PAPER_LABEL,
     AlertContext,
+    DeliveryLog,
     MessageIndex,
     SentAlertStore,
     TelegramNotifier,
@@ -89,6 +90,7 @@ logger = logging.getLogger("prop_alpha.scan")
 MOCK_LABEL: Final[str] = "MOCK ODDS - test run, made-up bookmaker prices. NOT a real opportunity."
 MOCK_STATE_FILE: Final[Path] = DEFAULT_ENV_FILE.parent / ".prop_alpha_state" / "mock_sent_alerts.jsonl"
 MOCK_INDEX_FILE: Final[Path] = MOCK_STATE_FILE.parent / "mock_alert_messages.jsonl"
+MOCK_DELIVERY_FILE: Final[Path] = MOCK_STATE_FILE.parent / "mock_alert_deliveries.jsonl"
 BANKROLL_ENV: Final[str] = "PROP_ALPHA_BANKROLL"
 DEFAULT_BANKROLL: Final[float] = 1000.0
 MAX_ALERTS_ENV: Final[str] = "PROP_ALPHA_MAX_ALERTS"
@@ -394,9 +396,7 @@ def send_boards(
         if not entries:
             continue
         for text, items in format_board(fixture, inputs, entries):
-            message_id = notifier.send_message(text)
-            if notifier.index is not None:
-                notifier.index.record(message_id, items, datetime.now(timezone.utc))
+            notifier.send_tracked(text, "board", items, fixture.kickoff_at)
         sent.add(fixture.fixture_id)
         boarded += 1
         state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -405,9 +405,15 @@ def send_boards(
 
 
 def _load_catalogue(path: Path) -> dict[int, oddspapi.LineMarket]:
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    """The cached catalogue. A damaged cache raises ValueError (handler H11 reports it); delete the file to refetch."""
+    raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or not all(
+        isinstance(m, dict) and isinstance(m.get("market"), str) and isinstance(m.get("line"), (int, float))
+        and isinstance(m.get("sides"), dict) for m in raw.values()
+    ):
+        raise ValueError(f"{path} is not a market catalogue; delete it so the next run fetches a fresh one")
     return {
-        int(mid): oddspapi.LineMarket(m["market"], float(m["line"]), {int(o): side for o, side in m["sides"].items()})
+        int(mid): oddspapi.LineMarket(m["market"], float(m["line"]), {int(o): str(side) for o, side in m["sides"].items()})
         for mid, m in raw.items()
     }
 
@@ -420,13 +426,32 @@ def _save_catalogue(path: Path, catalogue: Mapping[int, oddspapi.LineMarket]) ->
     }), encoding="utf-8")
 
 
+def _archive(path: Path, body: Any) -> None:
+    with gzip.open(path, "wt", encoding="utf-8") as handle:
+        json.dump(body, handle)
+
+
+def _load_names(path: Path) -> dict[int, str]:
+    raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path} is not a participant-name map; delete it so the next run fetches a fresh one")
+    return {int(k): str(v) for k, v in raw.items()}
+
+
 def _requests_left(account: Any) -> int:
     if not isinstance(account, Mapping):
         raise ValueError("OddsPapi account response is not an object")
     current = account.get("current_subscription_id")
-    for subscription in account.get("subscriptions") or []:
-        if subscription.get("subscription_id") == current:
-            return int(subscription["request_limit"]) - int(subscription["request_count"])
+    subscriptions: Any = account.get("subscriptions") or []
+    if not isinstance(subscriptions, list):
+        raise ValueError("OddsPapi account subscriptions are not a list")
+    for subscription in subscriptions:
+        if isinstance(subscription, Mapping) and subscription.get("subscription_id") == current:
+            limit, count = subscription.get("request_limit"), subscription.get("request_count")
+            if not (isinstance(limit, int) and isinstance(count, int)) or isinstance(limit, bool) \
+                    or isinstance(count, bool):
+                raise ValueError("OddsPapi account subscription has no integer request_limit and request_count")
+            return limit - count
     raise ValueError("OddsPapi account has no current subscription")
 
 
@@ -437,7 +462,11 @@ def collect_odds(
     """Real player-prop quotes for `fixtures` from OddsPapi, summary lines on coverage and quota, and whether real
     odds were available: False when the quota reserve stopped the fetch or every bookmaker failed (a bookmaker that
     reports no fixtures is not a failure). One failing bookmaker is recorded and skipped (handler H12); the others'
-    prices are kept (audit 2026-10-04: a William Hill 404 had discarded bet365's prices)."""
+    prices are kept (audit 2026-10-04: a William Hill 404 had discarded bet365's prices). A bookmaker whose reply is
+    malformed (oddspapi.prop_prices raises ValueError) fails the same way: its whole reply is left out, never part of
+    it, and the raw body is archived as <stamp>_<book>.rejected.json.gz for diagnosis (readiness item 5, 2026-10-05).
+    Its name does not match <stamp>_<book>.json.gz, so closing capture never asks that bookmaker on this scan's
+    behalf."""
     empty = OddsCoverage((), 0, 0, (), ())
     cache = state_dir / "oddspapi"
     catalogue_file, names_file = cache / "line_markets.json", cache / "participants.json"
@@ -464,23 +493,24 @@ def collect_odds(
     failed: dict[str, str] = {}
     answered = 0
     for book in books:
+        body: Any = None
         try:
             body = client.get_json_value(oddspapi.odds_path(book, tournaments), empty_on=oddspapi.NO_FIXTURES_REPLIES)
-        except (requests.RequestException, VendorError) as exc:
+            book_prices = [] if body is None else oddspapi.prop_prices(body, catalogue, book)
+        except (requests.RequestException, VendorError, ValueError) as exc:
             failed[book] = f"{type(exc).__name__}: {exc}"
             logger.error("odds: %s failed: %s", book, failed[book])
+            if body is not None:
+                _archive(archive / f"{now:%Y%m%dT%H%M%SZ}_{book}.rejected.json.gz", body)
             continue
         answered += 1
         if body is None:
             no_odds.append(book)
             continue
-        with gzip.open(archive / f"{now:%Y%m%dT%H%M%SZ}_{book}.json.gz", "wt", encoding="utf-8") as handle:
-            json.dump(body, handle)
-        prices += [p for p in oddspapi.prop_prices(body, catalogue, book)
+        _archive(archive / f"{now:%Y%m%dT%H%M%SZ}_{book}.json.gz", body)
+        prices += [p for p in book_prices
                    if window_start <= p.fixture.kickoff_at < window_end + FIXTURE_KICKOFF_TOLERANCE]
-    names: dict[int, str] = (
-        {int(k): v for k, v in json.loads(names_file.read_text(encoding="utf-8")).items()} if names_file.is_file() else {}
-    )
+    names = _load_names(names_file) if names_file.is_file() else {}
     if any(team not in names for p in prices for team in (p.fixture.home_id, p.fixture.away_id)):
         names = oddspapi.participant_names(client.get_json_value(oddspapi.PARTICIPANTS_PATH))
         cache.mkdir(parents=True, exist_ok=True)
@@ -628,7 +658,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     store = SentAlertStore() if real else SentAlertStore(MOCK_STATE_FILE)
     # Mock messages are indexed separately, so a reply to one can never be recorded as a real bet.
     index = MessageIndex() if real else MessageIndex(MOCK_INDEX_FILE)
-    notifier = TelegramNotifier(load_config(), store=store, index=index) if args.send else None
+    deliveries = DeliveryLog() if real else DeliveryLog(MOCK_DELIVERY_FILE)
+    notifier = TelegramNotifier(load_config(), store=store, index=index, deliveries=deliveries) if args.send else None
     books = tuple(b.strip() for b in os.environ.get(BOOKMAKERS_ENV, ",".join(DEFAULT_BOOKMAKERS)).split(",") if b.strip())
     try:
         summary = run_scan(now, client, os.environ.get(DSN_ENV, DEFAULT_DSN), notifier, store,

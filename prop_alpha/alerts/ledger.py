@@ -364,6 +364,10 @@ def settle_open_bets(
     return settled
 
 
+def _nullable_int(value: Any) -> int | None:
+    return None if value is None else int(value)
+
+
 def read_settlement_rows(
     dsn: str, bets: Sequence[PlacedBet],
 ) -> dict[tuple[int, int], tuple[str, int | None, int | None, int | None] | None]:
@@ -382,7 +386,7 @@ def read_settlement_rows(
                     cur.execute(SETTLEMENT_SQL, (bet.player_id, str(bet.fixture_id)))
                     found = cur.fetchone()
                     rows[(bet.fixture_id, bet.player_id)] = None if found is None else (
-                        str(found[0]), *(None if value is None else int(value) for value in found[1:])
+                        str(found[0]), _nullable_int(found[1]), _nullable_int(found[2]), _nullable_int(found[3])
                     )
     finally:
         conn.close()
@@ -427,8 +431,12 @@ def results_summary(settled: Sequence[tuple[PlacedBet, Settlement]],
     by_result = {result: sum(1 for _, s in settled if s.result == result) for result in RESULTS}
     roi = f", return on stake {total / staked:+.1%}" if staked > 0 else ""
     provisional = sum(1 for _, s in settled if s.source == "auto")
-    caveat = (f"; {provisional} provisional (automatic, assumed market rules; not validated results)"
-              if provisional else "")
+    # Automatic results rest on the assumed market contract until bookmakers' settlements confirm it (readiness item
+    # 2): they are kept out of a separate confirmed-only total, which is the one a performance claim may quote.
+    confirmed = [(bet, s) for bet, s in settled if s.source != "auto"]
+    caveat = (f"; {provisional} provisional (automatic, assumed market rules; not validated results); confirmed "
+              f"only: {len(confirmed)} bet(s), staked {sum(bet.stake for bet, _ in confirmed):.2f}, profit "
+              f"{sum(profit(bet, s) for bet, s in confirmed):+.2f}" if provisional else "")
     values = [closing[bet.bet_id].clv for bet, _ in settled if closing and bet.bet_id in closing]
     clv = (f"; mean CLV {sum(values) / len(values):+.1%} over {len(values)} bet(s) with a closing price" if values
            else "; no closing price captured yet")

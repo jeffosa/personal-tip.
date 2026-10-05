@@ -164,7 +164,7 @@ class _RecordingNotifier(TelegramNotifier):
         super().__init__(TelegramConfig(FAKE_TOKEN, "1"), store=store, sleep=lambda s: None)
         self.texts: list[str] = []
 
-    def send_message(self, text: str) -> int:
+    def send_message(self, text: str, reply_to: int | None = None) -> int:
         self.texts.append(text)
         return len(self.texts)
 

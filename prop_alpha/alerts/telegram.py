@@ -13,6 +13,10 @@ Only high-value bets are sent (prop_alpha.scanner.value_screen): mispriced by th
 expected profit per unit staked, and an edge that still returns at least 4% in more than 60% of 1,000
 simulated match conditions, all after the model-risk loss floor (MODEL_RISK_LOSS_FLOOR).
 
+Every alert, digest and board message is tracked in a DeliveryLog (pending before the send, delivered with
+Telegram's message id after it). A send that fails or is cut off leaves "outcome unknown", for the operator to
+review with python -m prop_alpha.alerts.delivery; nothing is re-sent automatically.
+
 One alert is sent per market, line, side and book, whatever the price does afterwards, so a person
 following the alerts is not told to stack the same position on every price tick. With a SentAlertStore
 (default `.prop_alpha_state/sent_alerts.jsonl`, gitignored) this holds across runs, and
@@ -72,6 +76,15 @@ CHAT_ID_ENV: Final[str] = "TELEGRAM_CHAT_ID"
 DEFAULT_STATE_FILE: Final[Path] = Path(__file__).resolve().parents[2] / ".prop_alpha_state" / "sent_alerts.jsonl"
 # Telegram message id -> the numbered bets it lists, so a reply ("placed 3 @1.95 5") resolves to one bet.
 DEFAULT_INDEX_FILE: Final[Path] = DEFAULT_STATE_FILE.parent / "alert_messages.jsonl"
+# Delivery record of every alert, digest and board message (DeliveryLog): pending before the send, delivered after.
+DEFAULT_DELIVERY_FILE: Final[Path] = DEFAULT_STATE_FILE.parent / "alert_deliveries.jsonl"
+DELIVERY_KINDS: Final[frozenset[str]] = frozenset({"alert", "digest", "board"})
+DELIVERY_EVENTS: Final[frozenset[str]] = frozenset({"pending", "delivered", "resent", "confirmed_by_operator",
+                                                     "dismissed"})
+DELIVERY_STATES: Final[frozenset[str]] = frozenset({"sending", "confirmed", "unknown", "dismissed"})
+# A send takes at most the 10 s request timeout plus one flood wait (MAX_TELEGRAM_RETRY_AFTER_S); a delivery still
+# pending this long after it began belongs to a send that failed or a process that stopped.
+PENDING_GRACE: Final[timedelta] = timedelta(minutes=5)
 # How long an alerted stake counts as open exposure. Player props settle within a day or two of kickoff and
 # alerts go out before kickoff; 4 days over-counts rather than under-counts until the ledger records fills.
 OPEN_POSITION_WINDOW: Final[timedelta] = timedelta(days=4)
@@ -205,6 +218,128 @@ def _item_from_record(raw: Any) -> AlertItem:
         match=str(raw["match"]), player=str(raw["player"]),
         book=None if raw.get("book") is None else str(raw["book"]),
     )
+
+
+@dataclass(frozen=True)
+class Delivery:
+    """One alert, digest or board message and what is known about its delivery (DeliveryLog.load folds the events).
+
+    `state`: "sending" (began, no outcome yet, within PENDING_GRACE), "confirmed" (Telegram returned a message id,
+    or the operator saw it in the chat), "unknown" (began, then no outcome was ever recorded: the send failed, timed
+    out or the process stopped, so the message may or may not be in the chat), or "dismissed" (the operator chose
+    not to re-send it)."""
+
+    delivery_id: int
+    kind: str
+    text: str
+    items: tuple[AlertItem, ...]
+    began_at: datetime
+    valid_until: datetime
+    state: str
+    message_id: int | None = None
+    resolution: str = ""
+
+    def __post_init__(self) -> None:
+        if self.delivery_id < 1 or self.kind not in DELIVERY_KINDS or self.state not in DELIVERY_STATES:
+            raise ValueError(f"malformed delivery {self.delivery_id}: kind {self.kind!r}, state {self.state!r}")
+        if not self.text.strip():
+            raise ValueError(f"delivery {self.delivery_id} has no text")
+        for name, value in (("began_at", self.began_at), ("valid_until", self.valid_until)):
+            if value.tzinfo is None or value.utcoffset() != timedelta(0):
+                raise ValueError(f"delivery {self.delivery_id}: {name} must be a timezone-aware UTC datetime")
+
+
+class DeliveryLog:
+    """Append-only JSON-lines delivery record of every alert, digest and board message (production-readiness item 6,
+    2026-10-05). A "pending" event, with the full text and the numbered bets, is written before the send; a
+    "delivered" event with Telegram's message id after it. A pending event that never gets an outcome means the send
+    failed or the process stopped mid-send: the message may or may not have reached the chat, and only the operator
+    can tell, so it is listed for review (python -m prop_alpha.alerts.delivery) instead of being re-sent
+    automatically, which could duplicate a bet. A corrupt line raises."""
+
+    def __init__(self, path: Path = DEFAULT_DELIVERY_FILE) -> None:
+        self.path = path
+
+    def _append(self, record: Mapping[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(record)) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def _events(self) -> list[dict[str, Any]]:
+        if not self.path.is_file():
+            return []
+        events: list[dict[str, Any]] = []
+        for number, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            record: Any = json.loads(line)
+            if not (isinstance(record, dict) and isinstance(record.get("delivery_id"), int)
+                    and record.get("event") in DELIVERY_EVENTS and isinstance(record.get("at"), str)):
+                raise ValueError(f"{self.path.name} line {number} is not a delivery event")
+            events.append(record)
+        return events
+
+    def begin(self, kind: str, text: str, items: Sequence[AlertItem], valid_until: datetime, at: datetime) -> int:
+        """Record a message about to be sent; returns its delivery id."""
+        known = [event["delivery_id"] for event in self._events()]
+        delivery_id = max(known, default=0) + 1
+        Delivery(delivery_id, kind, text, tuple(items), at, valid_until, "sending")  # validates before writing
+        self._append({"delivery_id": delivery_id, "event": "pending", "at": at.isoformat(), "kind": kind,
+                      "text": text, "items": [_item_record(item) for item in items],
+                      "valid_until": valid_until.isoformat()})
+        return delivery_id
+
+    def resolve(self, delivery_id: int, event: str, at: datetime, message_id: int | None = None) -> None:
+        """Record an outcome: "delivered" or "resent" (with Telegram's message id), or the operator's
+        "confirmed_by_operator" or "dismissed"."""
+        if event not in DELIVERY_EVENTS or event == "pending":
+            raise ValueError(f"{event!r} is not a delivery outcome")
+        if (message_id is None) == (event in ("delivered", "resent")):
+            raise ValueError(f"a {event!r} outcome {'needs' if message_id is None else 'takes no'} message id")
+        if at.tzinfo is None or at.utcoffset() != timedelta(0):
+            raise ValueError("at must be a timezone-aware UTC datetime")
+        if delivery_id not in self.load(at):
+            raise ValueError(f"no delivery {delivery_id} in {self.path.name}")
+        self._append({"delivery_id": delivery_id, "event": event, "at": at.isoformat(),
+                      **({} if message_id is None else {"message_id": message_id})})
+
+    def load(self, now: datetime) -> dict[int, Delivery]:
+        """delivery id -> its current state as of `now` (which decides "sending" v "unknown")."""
+        begun: dict[int, dict[str, Any]] = {}
+        outcome: dict[int, dict[str, Any]] = {}
+        for event in self._events():
+            if event["event"] == "pending":
+                begun[event["delivery_id"]] = event
+            elif event["delivery_id"] in begun:
+                outcome[event["delivery_id"]] = event
+            else:
+                raise ValueError(f"{self.path.name}: outcome for delivery {event['delivery_id']} before it began")
+        deliveries: dict[int, Delivery] = {}
+        for delivery_id, start in begun.items():
+            began_at = datetime.fromisoformat(str(start["at"]))
+            last = outcome.get(delivery_id)
+            if last is None:
+                state = "sending" if now - began_at < PENDING_GRACE else "unknown"
+            else:
+                state = "dismissed" if last["event"] == "dismissed" else "confirmed"
+            raw_items: Any = start.get("items")
+            if not isinstance(raw_items, list):
+                raise ValueError(f"{self.path.name}: delivery {delivery_id} has no item list")
+            message_id: Any = None if last is None else last.get("message_id")
+            deliveries[delivery_id] = Delivery(
+                delivery_id, str(start.get("kind")), str(start.get("text") or ""),
+                tuple(_item_from_record(raw) for raw in raw_items), began_at,
+                datetime.fromisoformat(str(start.get("valid_until"))), state,
+                int(message_id) if isinstance(message_id, int) else None,
+                "" if last is None else str(last["event"]),
+            )
+        return deliveries
+
+    def needs_review(self, now: datetime) -> list[Delivery]:
+        """Deliveries whose outcome is unknown, oldest first."""
+        return [d for d in sorted(self.load(now).values(), key=lambda d: d.delivery_id) if d.state == "unknown"]
 
 
 class MessageIndex:
@@ -383,6 +518,7 @@ class TelegramNotifier:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         index: MessageIndex | None = None,
+        deliveries: DeliveryLog | None = None,
     ) -> None:
         if not timeout_s > 0.0:
             raise ValueError("timeout_s must be positive")
@@ -396,6 +532,8 @@ class TelegramNotifier:
         self._sent: set[AlertKey] = {alert.key for alert in store.load()} if store is not None else set()
         # Where sent alert and board messages are indexed for bet-recording replies; None records nothing.
         self.index = index
+        # Where alert, digest and board deliveries are tracked (pending -> delivered); None tracks nothing (demo).
+        self.deliveries = deliveries
 
     def _call(self, method: str, payload: Mapping[str, Any], *, retry_on_flood: bool = True) -> Any:
         url = f"{TELEGRAM_API_BASE}/bot{self._config.bot_token}/{method}"
@@ -487,8 +625,9 @@ class TelegramNotifier:
         for directive, assessment in self._high_value(report, projections, criteria, max_alerts):
             context = (descriptions or {}).get((directive.fixture_id, directive.player_id, directive.market_type))
             text = format_directive(directive, assessment, bankroll_currency, label, context, book_rate)
+            delivery_id = self._begin_delivery("alert", text, (), directive.expires_at)
             self._record(directive)
-            message_ids.append(self.send_message(text))
+            message_ids.append(self._send_and_confirm(text, delivery_id, ()))
             logger.info("alert sent for %s", alert_key(directive))
         return message_ids
 
@@ -519,17 +658,39 @@ class TelegramNotifier:
             ]
             text = format_digest(entries, part * per_message + 1, len(passing), part + 1, parts, label, bankroll_currency,
                                  book_rate)
+            items = [item_from_directive(number, directive, context)
+                     for number, (directive, _, context) in enumerate(entries, part * per_message + 1)]
+            delivery_id = self._begin_delivery("digest", text, items, max(d.expires_at for d, _ in chunk))
             for directive, _ in chunk:
                 self._record(directive)
-            message_id = self.send_message(text)
-            message_ids.append(message_id)
-            if self.index is not None:
-                self.index.record(message_id, [
-                    item_from_directive(number, directive, context)
-                    for number, (directive, _, context) in enumerate(entries, part * per_message + 1)
-                ], datetime.now(timezone.utc))
+            message_ids.append(self._send_and_confirm(text, delivery_id, items))
             logger.info("digest message %d/%d sent with %d bets", part + 1, parts, len(chunk))
         return len(passing), message_ids
+
+    def send_tracked(self, text: str, kind: str, items: Sequence[AlertItem], valid_until: datetime) -> int:
+        """Send one alert-bearing message (a fair-price board) with its delivery tracked and its numbered items
+        indexed for replies. Returns Telegram's message id."""
+        delivery_id = self._begin_delivery(kind, text, items, valid_until)
+        return self._send_and_confirm(text, delivery_id, items)
+
+    def _begin_delivery(self, kind: str, text: str, items: Sequence[AlertItem], valid_until: datetime) -> int | None:
+        """Written before the alert store and the send, so a crash at any later point leaves a reviewable record."""
+        if self._config.chat_id is None:
+            raise ValueError(f"{CHAT_ID_ENV} is not set; run with --get-chat-id to find it")
+        if self.deliveries is None:
+            return None
+        return self.deliveries.begin(kind, text, items, valid_until, datetime.now(timezone.utc))
+
+    def _send_and_confirm(self, text: str, delivery_id: int | None, items: Sequence[AlertItem]) -> int:
+        """Send; only a message id from Telegram confirms the delivery. A failure propagates and leaves the
+        delivery pending, which becomes "outcome unknown" for the operator to review."""
+        message_id = self.send_message(text)
+        sent_at = datetime.now(timezone.utc)
+        if self.deliveries is not None and delivery_id is not None:
+            self.deliveries.resolve(delivery_id, "delivered", sent_at, message_id)
+        if self.index is not None and items:
+            self.index.record(message_id, items, sent_at)
+        return message_id
 
     def _record(self, directive: StakingDirective) -> None:
         if self._config.chat_id is None:

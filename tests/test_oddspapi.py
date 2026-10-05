@@ -114,6 +114,7 @@ class FakeOddsClient:
         self.account = {"current_subscription_id": "s", "subscriptions": [
             {"subscription_id": "s", "request_limit": 250, "request_count": 250 - left}]}
         self.odds = odds
+        self.garbled: Any = None
         self.paths: list[str] = []
         self.requests_sent = 0
 
@@ -125,6 +126,8 @@ class FakeOddsClient:
             return None
         if "bookmakers=broken" in path:
             raise requests.HTTPError("odds-by-tournaments: HTTP 500: upstream error")
+        if "bookmakers=garbled" in path:
+            return self.garbled
         if path == oddspapi.ACCOUNT_PATH:
             return self.account
         if path == oddspapi.MARKETS_PATH:
@@ -225,6 +228,7 @@ def test_query_param_key_never_appears_in_errors() -> None:
 
     class Failing:
         def get(self, url: str, timeout: float, params: dict[str, str] | None = None) -> requests.Response:
+            assert params is not None
             raise requests.ConnectionError(f"Max retries exceeded with url: /v4/account?apiKey={params['apiKey']}")
 
     client._local.session = Failing()
@@ -234,6 +238,7 @@ def test_query_param_key_never_appears_in_errors() -> None:
 
     class NotFound:
         def get(self, url: str, timeout: float, params: dict[str, str] | None = None) -> requests.Response:
+            assert params is not None
             response = requests.Response()
             response.status_code, response.url = 404, f"https://api.oddspapi.io/v4/x?apiKey={params['apiKey']}"
             return response
@@ -297,3 +302,74 @@ def test_the_williamhill_404_counts_as_no_fixtures_and_the_request_uses_the_docu
     with pytest.raises(requests.HTTPError, match="HTTP 403"):
         client.get_json_value("odds", empty_on=oddspapi.NO_FIXTURES_REPLIES)
     assert "bookmakers=bet365&" in oddspapi.odds_path("bet365", [25, 24])
+
+
+def _garbled_bodies() -> list[Any]:
+    """Malformed odds-by-tournaments replies from bookmaker "garbled". Before readiness item 5 (2026-10-05) the first
+    raised ValueError, which handler H11 turned into "no odds at all" (bet365's prices discarded too); the next three
+    raised KeyError/AttributeError, which no handler catches, so the scan crashed before its summary; the NaN price
+    was passed on as a price."""
+    nested = _odds()
+    nested[0]["bookmakerOdds"] = {"garbled": {"markets": [1, 2]}}
+    nan_price = _odds()
+    nan_price[0]["bookmakerOdds"] = {"garbled": nan_price[0]["bookmakerOdds"]["bet365"]}
+    nan_price[0]["bookmakerOdds"]["garbled"]["markets"]["102661"]["outcomes"]["102661"]["players"]["2342841"]["price"]         = float("nan")
+    return [
+        {"error": "not a list"},
+        [{"fixtureId": "f1", "startTime": "2026-10-10T14:00:00.000Z"}],
+        nested,
+        [{**_odds()[0], "bookmakerOdds": {"garbled": {"markets": {"102661": {"outcomes": {"102661": {
+            "players": {"9": "2.40"}}}}}}}}],
+        nan_price,
+    ]
+
+
+@pytest.mark.parametrize("body", _garbled_bodies())
+def test_prop_prices_refuse_a_malformed_reply_with_value_error_only(body: Any) -> None:
+    with pytest.raises(ValueError, match="malformed OddsPapi response"):
+        oddspapi.prop_prices(body, oddspapi.line_catalogue(MARKETS), "garbled")
+
+
+@pytest.mark.parametrize("body", _garbled_bodies())
+def test_one_malformed_bookmaker_reply_is_dropped_and_the_others_prices_kept(tmp_path: Path, body: Any) -> None:
+    client = FakeOddsClient(left=200, odds=_odds())
+    client.garbled = body
+    coverage, notes, available = scan.collect_odds(client, [FIXTURE], {9001: SQUAD}, NOW, NOW + timedelta(hours=4),
+                                                   ("garbled", "bet365"), tmp_path)
+    assert len(coverage.quotes) == 2 and {q.sportsbook for q in coverage.quotes} == {"bet365"} and available
+    assert any(n.startswith("Odds FAILED from garbled, its prices left out: ValueError: malformed OddsPapi response")
+               for n in notes)
+    archive = tmp_path / "odds_archive"
+    assert len(list(archive.glob("*_garbled.rejected.json.gz"))) == 1  # kept for diagnosis
+    assert list(archive.glob("*_garbled.json.gz")) == []  # so closing capture never asks this book for the scan
+    assert len(list(archive.glob("*_bet365.json.gz"))) == 1
+
+
+def test_every_bookmaker_malformed_means_no_real_odds(tmp_path: Path) -> None:
+    client = FakeOddsClient(left=200, odds=_odds())
+    client.garbled = _garbled_bodies()[1]
+    coverage, notes, available = scan.collect_odds(client, [FIXTURE], {9001: SQUAD}, NOW, NOW + timedelta(hours=4),
+                                                   ("garbled",), tmp_path)
+    assert coverage.quotes == () and not available  # fail closed: run_scan exits ODDS_UNAVAILABLE_EXIT
+
+
+@pytest.mark.parametrize("account", [
+    {"current_subscription_id": "s", "subscriptions": [{"subscription_id": "s"}]},
+    {"current_subscription_id": "s", "subscriptions": [{"subscription_id": "s", "request_limit": "250",
+                                                         "request_count": 3}]},
+    {"current_subscription_id": "s", "subscriptions": {"s": 1}},
+    ["not", "an", "object"],
+])
+def test_a_malformed_account_or_catalogue_raises_value_error_for_handler_h11(tmp_path: Path, account: Any) -> None:
+    """Run-level replies (account, catalogue, names) have no per-bookmaker fallback: they must raise ValueError, which
+    H11 reports as "Odds unavailable this run", never KeyError/AttributeError, which would crash the run."""
+    client = FakeOddsClient(left=200, odds=_odds())
+    client.account = account
+    with pytest.raises(ValueError):
+        scan.collect_odds(client, [FIXTURE], {9001: SQUAD}, NOW, NOW + timedelta(hours=4), ("bet365",), tmp_path)
+    for catalogue in ({"not": "a list"}, [{**MARKETS[0], "marketId": None}], [{**MARKETS[0], "handicap": "1.5"}],
+                      [{**MARKETS[0], "outcomes": [None]}]):
+        with pytest.raises(ValueError):
+            oddspapi.line_catalogue(catalogue)
+    with pytest.raises(ValueError):
+        oddspapi.participant_names({"x56": "Walsall"})

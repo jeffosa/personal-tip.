@@ -46,8 +46,10 @@ SANCTIONED_HANDLERS: frozenset[tuple[str, str, str]] = frozenset({
     # in the scan summary instead of ending the run silently.
     ("prop_alpha/alerts/scan.py", "run_scan", "(requests.RequestException, QuotaExhaustedError, ValueError)"),
     # H12, approved by the maintainer on 2026-10-05: one failing bookmaker is recorded and skipped, the others' prices
-    # are kept.
-    ("prop_alpha/alerts/scan.py", "collect_odds", "(requests.RequestException, VendorError)"),
+    # are kept. Widened to ValueError on 2026-10-05 at the maintainer's request (production-readiness item 5): a
+    # malformed reply from one bookmaker is dropped whole and recorded, instead of discarding every book's prices
+    # (H11) or, for a KeyError/TypeError, crashing the run; pending formal approval.
+    ("prop_alpha/alerts/scan.py", "collect_odds", "(requests.RequestException, VendorError, ValueError)"),
 })
 
 PURE_MODULES: tuple[str, ...] = (

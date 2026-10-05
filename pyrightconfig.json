@@ -1,0 +1,8 @@
+{
+  "include": ["prop_alpha", "scripts", "tests"],
+  "exclude": ["**/__pycache__", ".venv", ".venv-1", ".venv-ci", "ci-artifacts"],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "standard",
+  "venvPath": ".",
+  "venv": ".venv"
+}

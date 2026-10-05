@@ -85,6 +85,14 @@ def copy_database() -> None:
     run([str(BIN / "pg_restore"), "-w", "-h", "localhost", "-U", "postgres", "-d", SOAK_DB, "--no-owner", str(dump)])
 
 
+def _scalar(cur: Any) -> int:
+    """The single integer of a one-row, one-column query; a missing row is a fault, not a None to subscript."""
+    row = cur.fetchone()
+    if row is None:
+        raise RuntimeError("expected one row")
+    return int(row[0])
+
+
 def percentile(values: list[float], q: float) -> float:
     ordered = sorted(values)
     return ordered[min(len(ordered) - 1, max(0, int(round(q * (len(ordered) - 1)))))] if ordered else float("nan")
@@ -172,7 +180,7 @@ def main() -> int:
         cur.execute("SELECT league_id FROM prop_alpha.leagues ORDER BY 1")
         leagues = [int(r[0]) for r in cur.fetchall()]
         cur.execute("SELECT deadlocks FROM pg_stat_database WHERE datname = %s", (SOAK_DB,))
-        deadlocks_before = int(cur.fetchone()[0])
+        deadlocks_before = _scalar(cur)
     conn.close()
     chosen = random.Random(SEED).sample(uids, args.slates * args.slate_size)
 
@@ -219,13 +227,13 @@ def main() -> int:
     conn = psycopg2.connect(dsn)
     with conn, conn.cursor() as cur:
         cur.execute("SELECT deadlocks FROM pg_stat_database WHERE datname = %s", (SOAK_DB,))
-        deadlocks = int(cur.fetchone()[0]) - deadlocks_before
+        deadlocks = _scalar(cur) - deadlocks_before
         cur.execute("SELECT count(*) FROM prop_alpha.staging_player_feed")
-        staged_left = int(cur.fetchone()[0])
+        staged_left = _scalar(cur)
         cur.execute("SELECT count(*) FROM prop_alpha.staging_rejects")
-        rejects = int(cur.fetchone()[0])
+        rejects = _scalar(cur)
         cur.execute("SELECT count(*) FROM pg_indexes WHERE indexname = %s", (INDEX_NAME,))
-        leftover_index = int(cur.fetchone()[0])
+        leftover_index = _scalar(cur)
     conn.close()
 
     failed = {uid: err for s in slates for uid, err in s["failed"].items()}

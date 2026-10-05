@@ -502,8 +502,8 @@ class InstitutionalAssetManager:
         """
         if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() != timedelta(0):
             raise ValueError("now must be provided as a timezone-aware UTC datetime")
-        for key, projection in projections.items():
-            identity = (projection.fixture_id, projection.player_id, projection.market_type)
+        for key, filed in projections.items():
+            identity = (filed.fixture_id, filed.player_id, filed.market_type)
             if identity != key:
                 # A misfiled projection would be priced against another market's quotes; the whole
                 # mapping is suspect, so refuse it rather than skip the one entry.

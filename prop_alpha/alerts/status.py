@@ -1,6 +1,7 @@
 """Periodic Telegram status report (scheduled every 4 hours). Sends text only; it never places a bet.
 
-Reads the database (one short read-only transaction), the sent-alert and placed-bet state files and the clock,
+Reads the database (one short read-only transaction), the sent-alert, alert-delivery and placed-bet state files
+and the clock,
 and calls no vendor API, so it spends no data quota. Open bets older than ledger.STALE_AFTER are flagged. A database that cannot be reached is reported in the message
 (sanctioned handler H8) rather than silencing the report.
 
@@ -21,7 +22,7 @@ from typing import Final, Sequence
 from prop_alpha.alerts.fx import MAX_RATE_AGE, ExchangeRate, cached_rate, is_fresh
 from prop_alpha.alerts.closing import load_closing_quotes
 from prop_alpha.alerts.ledger import STALE_AFTER, PlacedBetStore, closing_values, results_summary
-from prop_alpha.alerts.telegram import PAPER_LABEL, SentAlertStore, TelegramNotifier, load_config
+from prop_alpha.alerts.telegram import PAPER_LABEL, DeliveryLog, SentAlertStore, TelegramNotifier, load_config
 from prop_alpha.config import DEFAULT_DSN, DSN_ENV
 
 logger = logging.getLogger("prop_alpha.status")
@@ -115,6 +116,15 @@ def bet_section(bets: PlacedBetStore, now: datetime) -> list[str]:
     return lines
 
 
+def delivery_section(deliveries: DeliveryLog, now: datetime) -> list[str]:
+    """Alert messages whose delivery outcome is unknown (readiness item 6): each may or may not be in the chat."""
+    unknown = deliveries.needs_review(now)
+    if not unknown:
+        return []
+    return [f"WARNING: {len(unknown)} alert message(s) with an unknown delivery outcome "
+            f"({', '.join(f'#{d.delivery_id}' for d in unknown)}): python -m prop_alpha.alerts.delivery"]
+
+
 def fx_section(rate: ExchangeRate | None, now: datetime) -> list[str]:
     """The cached book-currency rate, flagged when the scan would refuse it as too old."""
     if rate is None:
@@ -145,10 +155,12 @@ def format_report(now: datetime, database_lines: list[str], alerts_in_window: in
 
 
 def build_report(now: datetime, dsn: str, store: SentAlertStore, bets: PlacedBetStore | None = None,
-                 rate: ExchangeRate | None = None) -> str:
+                 rate: ExchangeRate | None = None, deliveries: DeliveryLog | None = None) -> str:
     alerts = [alert for alert in store.load() if alert.sent_at > now - REPORT_INTERVAL]
     return format_report(now, database_section(dsn), len(alerts), store.exposure(now).total,
-                         [*(bet_section(bets, now) if bets is not None else ()), *fx_section(rate, now)])
+                         [*(bet_section(bets, now) if bets is not None else ()),
+                          *(delivery_section(deliveries, now) if deliveries is not None else ()),
+                          *fx_section(rate, now)])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -157,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--send", action="store_true", help="send the report (default: print only)")
     args = parser.parse_args(argv)
     report = build_report(datetime.now(timezone.utc), os.environ.get(DSN_ENV, DEFAULT_DSN), SentAlertStore(),
-                          PlacedBetStore(), cached_rate())
+                          PlacedBetStore(), cached_rate(), DeliveryLog())
     print(report)
     if args.send:
         message_id = TelegramNotifier(load_config()).send_message(report)

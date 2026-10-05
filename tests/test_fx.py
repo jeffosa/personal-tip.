@@ -45,6 +45,7 @@ def test_rates_are_validated() -> None:
 def test_parse_rate_reads_the_frankfurter_reply_and_refuses_anything_else() -> None:
     body = {"amount": 1.0, "base": "GBP", "date": "2026-10-02", "rates": {"USD": 1.3201}}
     assert fx.parse_rate(body, "GBP", "USD") == RATE
+    bad: Any
     for bad in ({"base": "EUR", "date": "2026-10-02", "rates": {"USD": 1.1}}, {"base": "GBP", "rates": {}},
                 {"base": "GBP", "date": "2026-10-02", "rates": {"USD": "1.32"}}, []):
         with pytest.raises(ValueError):
