@@ -52,7 +52,7 @@ python -m mypy                 # pinned in requirements.txt; config in mypy.ini 
 npx --yes pyright@1.1.406      # the checker the audits use; config in pyrightconfig.json
 ```
 
-The only suppressions are the two `# pyright: ignore` comments in `modeling/engine.py` (scipy's stubs type `nbinom(...)`
+pyright checks as Python 3.14 (`pyrightconfig.json`), the interpreter it resolves the standard library from: set to 3.12, it judged the 3.14-only `string/templatelib.py` by 3.12 rules and failed the first GitHub release gate (2026-10-05). mypy checks as 3.12, the runtime floor. Tests never see the real `.env` or credential variables (`tests/conftest.py`, autouse), so a local run behaves like a clean CI runner. The only suppressions are the two `# pyright: ignore` comments in `modeling/engine.py` (scipy's stubs type `nbinom(...)`
 as continuous-or-discrete; it is discrete). They are comments, not casts, because `engine.py` is fingerprinted by
 `model_freeze` and a code change would roll the lockbox forward.
 

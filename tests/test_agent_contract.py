@@ -266,7 +266,9 @@ def test_cli_exit_code_signals_an_incomplete_slate(monkeypatch: pytest.MonkeyPat
         def closeall(self) -> None:
             return None
 
-    for name, value in (("DATA_VENDOR_BASE_URL", "https://vendor.invalid"), ("DATA_VENDOR_API_KEY", "unused"),
+    # The generic vendor takes its key from these variables; the default (sportmonks) would need a real token.
+    for name, value in (("DATA_VENDOR", "generic"), ("DATA_VENDOR_BASE_URL", "https://vendor.invalid"),
+                        ("DATA_VENDOR_API_KEY", "unused"),
                         ("PROP_ALPHA_DB_DSN", "postgresql://unused"), ("TARGET_FIXTURE_UIDS", "FX-9")):
         monkeypatch.setenv(name, value)
     monkeypatch.setattr(pipeline, "build_pool", lambda dsn, workers: StubPool())

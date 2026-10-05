@@ -53,6 +53,7 @@ import requests
 
 from prop_alpha.alerts.fx import BOOK_CURRENCY, ExchangeRate
 from prop_alpha.alerts.replies import USAGE, AlertItem
+from prop_alpha import config
 from prop_alpha.config import DEFAULT_ENV_FILE, parse_env_file
 from prop_alpha.ingestion.oddspapi import UNKNOWN_LIMIT_STAKE
 from prop_alpha.modeling.engine import FactorProjection, LineupExpectation, QuantEngine, RefereeProfile, VoidRule
@@ -130,8 +131,8 @@ class TelegramConfig:
 
 
 def load_config(env_file: Path = DEFAULT_ENV_FILE) -> TelegramConfig:
-    text = env_file.read_text(encoding="utf-8") if env_file.is_file() else None
-    return TelegramConfig.from_sources(os.environ, text)
+    # Through config.read_env_file, the one place `.env` is read (tests/conftest.py hides the real file there).
+    return TelegramConfig.from_sources(os.environ, config.read_env_file(env_file))
 
 
 @dataclass(frozen=True)

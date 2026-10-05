@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 from typing import Any, Callable
 
 import pytest
@@ -76,3 +77,26 @@ def fixture_payload() -> Callable[..., dict[str, Any]]:
         return copy.deepcopy(make_fixture_payload(uid, n_players))
 
     return factory
+
+
+# Variables that carry credentials or the bankroll currency; a test that needs one sets it itself.
+CREDENTIAL_VARIABLES = ("SPORTMONKS_API_TOKEN", "ODDSPAPI_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+                        "PROP_ALPHA_CURRENCY", "DATA_VENDOR", "DATA_VENDOR_API_KEY", "PROP_ALPHA_DB_DSN")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test runs as on a clean CI runner: the maintainer's `.env` and credential variables are invisible.
+    (2026-10-05: a test passed locally only because it read SPORTMONKS_API_TOKEN from the real `.env`, and failed
+    the GitHub release gate.) A test that passes its own env_file still reads that file."""
+    from prop_alpha import config
+
+    real_read = config.read_env_file
+    real_file = config.DEFAULT_ENV_FILE.resolve()
+
+    def read_env_file(env_file: Path = config.DEFAULT_ENV_FILE) -> str | None:
+        return None if Path(env_file).resolve() == real_file else real_read(env_file)
+
+    monkeypatch.setattr(config, "read_env_file", read_env_file)
+    for name in CREDENTIAL_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
