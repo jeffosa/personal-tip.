@@ -262,10 +262,17 @@ def fixture_payload(body: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def lineup_payload(body: Mapping[str, Any]) -> dict[str, Any]:
-    """A Sportmonks fixture (fetched with LINEUPS_INCLUDE) as the payload parse_lineup_payload expects."""
+    """A Sportmonks fixture (fetched with LINEUPS_INCLUDE) as the payload parse_lineup_payload expects.
+
+    A sheet row without a player_id (Sportmonks lists some named players without an identity) used to become the
+    player "None", which matched the bogus players row 954 (vendor_player_uid 'None', created before the stats
+    adapter learned to skip such rows on 2026-10-04): every unidentified player was filed as that one player
+    (found by Gate 1 criterion 7, 2026-10-05). Now an unidentified starter refuses the sheet, since its starting XI
+    cannot be keyed, and an unidentified bench player is left out and logged, as the stats adapter does."""
     fixture = _data(body)
     home, away = _sides(fixture)
     sheets: dict[str, dict[str, list[str]]] = {home: {"starters": [], "bench": []}, away: {"starters": [], "bench": []}}
+    unidentified: list[str] = []
     for row in fixture.get("lineups") or []:
         team = str(row["team_id"])
         if team not in sheets:
@@ -273,7 +280,17 @@ def lineup_payload(body: Mapping[str, Any]) -> dict[str, Any]:
         kind = row.get("type_id")
         if kind not in (STARTING_XI, BENCH):
             raise ValueError(f"fixture {fixture.get('id')}: unknown lineup type_id {kind!r}")
+        if row.get("player_id") is None:
+            name = row.get("player_name") or "unnamed"
+            if kind == STARTING_XI:
+                raise ValueError(f"fixture {fixture.get('id')}: team {team}'s starting XI lists {name} without a "
+                                 "player_id, so the sheet cannot be keyed")
+            unidentified.append(str(name))
+            continue
         sheets[team]["starters" if kind == STARTING_XI else "bench"].append(str(row["player_id"]))
+    if unidentified:
+        logger.warning("fixture %s: bench players without a player_id left off the sheet: %s", fixture.get("id"),
+                       ", ".join(unidentified))
     return {"fixture": {"uid": str(fixture["id"]), "home_team_uid": home, "away_team_uid": away}, "lineups": sheets}
 
 

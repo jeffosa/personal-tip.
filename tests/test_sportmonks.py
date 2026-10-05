@@ -206,6 +206,21 @@ def test_lineup_payload_maps_starting_eleven_and_bench() -> None:
     assert {e.vendor_player_uid for e in entries if e.p_sub_appearance == 0.35} == {"111", "112", "113"}
 
 
+def test_lineup_rows_without_a_player_id_never_become_player_none() -> None:
+    """Gate 1 criterion 7 (2026-10-05): a sheet row without a player_id became uid "None", which matched the bogus
+    players row 954 in the working database, so every unidentified player was filed as one player."""
+    body = _fixture()
+    bench_row = next(row for row in body["data"]["lineups"] if row["type_id"] == sportmonks.BENCH)
+    body["data"]["lineups"].append({**bench_row, "player_id": None, "player_name": "Frederick Issaka"})
+    sheet = sportmonks.lineup_payload(body)["lineups"]
+    listed = [uid for roles in sheet.values() for uid in roles["starters"] + roles["bench"]]
+    assert "None" not in listed and len(parse_lineup_payload(sportmonks.lineup_payload(body), 0.35)) == len(listed)
+    starter_row = next(row for row in body["data"]["lineups"] if row["type_id"] == sportmonks.STARTING_XI)
+    starter_row["player_id"] = None
+    with pytest.raises(ValueError, match="starting XI lists .* without a player_id"):
+        sportmonks.lineup_payload(body)
+
+
 def test_vendor_client_sends_sportmonks_auth_and_adapts_responses(tmp_path: Path) -> None:
     client = VendorClient(
         sportmonks.BASE_URL, "secret-token", TokenBucketRateLimiter(100.0, 10), auth_prefix="",
