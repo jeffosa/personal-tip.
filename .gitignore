@@ -15,3 +15,4 @@ project_audit_report.md
 
 # Generated static test dataset (real rows are vendor data; not for redistribution).
 static_data/
+synthetic_data/
