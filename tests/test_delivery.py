@@ -99,12 +99,14 @@ def test_resend_is_labelled_indexed_and_confirmed_once(tmp_path: Path) -> None:
     notifier, _, log, index, _ = _tracked(tmp_path, 2, requests.ConnectionError("reset"))
     with pytest.raises(TelegramError):
         notifier.notify_digest(AllocationReport(), {})
-    session = FakeSession(_ok({"message_id": 90}))
+    session = FakeSession(_ok({"message_id": 89}), _ok({"message_id": 90}))
     sender = TelegramNotifier(TelegramConfig(FAKE_TOKEN, "987654321"), session=session, sleep=lambda seconds: None,
                               index=index)
     assert delivery.resend(sender, log, 1, _later()) == 90
-    text = session.calls[0][1]["text"]
-    assert text.startswith(delivery.RESENT_HEADER) and "HIGH-VALUE BETS 1-2 of 2" in text
+    # The header goes on its own, so the copy is exactly the original text and still fits one message.
+    header, text = (call[1]["text"] for call in session.calls)
+    assert header == delivery.RESENT_HEADER and text == log.load(_later())[1].text
+    assert "HIGH-VALUE BETS 1-2 of 2" in text
     resolved = log.load(_later())[1]
     assert (resolved.state, resolved.resolution, resolved.message_id) == ("confirmed", "resent", 90)
     assert sorted(index.load()[90]) == [1, 2]  # a "placed 2 @..." reply to the copy records the bet

@@ -81,7 +81,9 @@ DEFAULT_INDEX_FILE: Final[Path] = DEFAULT_STATE_FILE.parent / "alert_messages.js
 DEFAULT_DELIVERY_FILE: Final[Path] = DEFAULT_STATE_FILE.parent / "alert_deliveries.jsonl"
 DELIVERY_KINDS: Final[frozenset[str]] = frozenset({"alert", "digest", "board"})
 DELIVERY_EVENTS: Final[frozenset[str]] = frozenset({"pending", "delivered", "resent", "confirmed_by_operator",
-                                                     "dismissed"})
+                                                     "confirmed_by_reply", "dismissed"})
+# Outcomes that carry the Telegram message id of the delivered message.
+DELIVERY_EVENTS_WITH_MESSAGE: Final[frozenset[str]] = frozenset({"delivered", "resent", "confirmed_by_reply"})
 DELIVERY_STATES: Final[frozenset[str]] = frozenset({"sending", "confirmed", "unknown", "dismissed"})
 # A send takes at most the 10 s request timeout plus one flood wait (MAX_TELEGRAM_RETRY_AFTER_S); a delivery still
 # pending this long after it began belongs to a send that failed or a process that stopped.
@@ -89,6 +91,8 @@ PENDING_GRACE: Final[timedelta] = timedelta(minutes=5)
 # How long an alerted stake counts as open exposure. Player props settle within a day or two of kickoff and
 # alerts go out before kickoff; 4 days over-counts rather than under-counts until the ledger records fills.
 OPEN_POSITION_WINDOW: Final[timedelta] = timedelta(days=4)
+# Telegram refuses a longer text (sendMessage). Never truncate: a cut message silently drops its last bets.
+TELEGRAM_MAX_TEXT: Final[int] = 4096
 # Telegram allows about one message per second per chat and answers 429 with parameters.retry_after.
 MIN_SEND_INTERVAL_S: Final[float] = 1.1
 MAX_TELEGRAM_RETRY_AFTER_S: Final[float] = 30.0
@@ -293,11 +297,12 @@ class DeliveryLog:
         return delivery_id
 
     def resolve(self, delivery_id: int, event: str, at: datetime, message_id: int | None = None) -> None:
-        """Record an outcome: "delivered" or "resent" (with Telegram's message id), or the operator's
+        """Record an outcome: "delivered" or "resent" (with Telegram's message id), "confirmed_by_reply" (the
+        maintainer replied to the message, so it is in the chat; with its id), or the operator's
         "confirmed_by_operator" or "dismissed"."""
         if event not in DELIVERY_EVENTS or event == "pending":
             raise ValueError(f"{event!r} is not a delivery outcome")
-        if (message_id is None) == (event in ("delivered", "resent")):
+        if (message_id is None) == (event in DELIVERY_EVENTS_WITH_MESSAGE):
             raise ValueError(f"a {event!r} outcome {'needs' if message_id is None else 'takes no'} message id")
         if at.tzinfo is None or at.utcoffset() != timedelta(0):
             raise ValueError("at must be a timezone-aware UTC datetime")
@@ -337,6 +342,15 @@ class DeliveryLog:
                 "" if last is None else str(last["event"]),
             )
         return deliveries
+
+    def recorded(self, kind: str, text: str, now: datetime) -> Delivery | None:
+        """The earliest delivery of exactly this message, whatever its state, or None."""
+        same = [d for d in self.load(now).values() if d.kind == kind and d.text == text]
+        return min(same, key=lambda d: d.delivery_id) if same else None
+
+    def unconfirmed_by_text(self, now: datetime) -> dict[str, Delivery]:
+        """Deliveries without a confirmed outcome, by their stripped text: a reply quoting one proves it arrived."""
+        return {d.text.strip(): d for d in self.load(now).values() if d.state != "confirmed"}
 
     def needs_review(self, now: datetime) -> list[Delivery]:
         """Deliveries whose outcome is unknown, oldest first."""
@@ -386,6 +400,30 @@ def item_from_directive(number: int, directive: StakingDirective, context: Alert
         player=context.player if context else f"player {directive.player_id}",
         book=directive.sportsbook,
     )
+
+
+def split_text(text: str, limit: int = TELEGRAM_MAX_TEXT) -> list[str]:
+    """`text` in pieces of at most `limit` characters, split at line breaks (a longer line is split inside)."""
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current.strip():
+        chunks.append(current)
+    return [chunk for chunk in chunks if chunk.strip()]
 
 
 def _flood_wait_seconds(body: Any) -> float | None:
@@ -570,17 +608,25 @@ class TelegramNotifier:
         return sorted(chats.items())
 
     def send_message(self, text: str, reply_to: int | None = None) -> int:
-        """Send `text` to the configured chat, as a reply to message `reply_to` when given."""
+        """Send `text` to the configured chat, as a reply to message `reply_to` when given. A text longer than
+        TELEGRAM_MAX_TEXT goes out as several messages split at line breaks, the first answering `reply_to`; the
+        last one's id is returned. (Until 2026-10-05 it was cut at 4096 characters, silently dropping its end.)"""
         if not text.strip():
             raise ValueError("message text must not be empty")
         if self._config.chat_id is None:
             raise ValueError(f"{CHAT_ID_ENV} is not set; run with --get-chat-id to find it")
+        message_id = 0
+        for number, chunk in enumerate(split_text(text)):
+            message_id = self._send_one(chunk, reply_to if number == 0 else None)
+        return message_id
+
+    def _send_one(self, text: str, reply_to: int | None) -> int:
         if self._last_send is not None:
             wait = MIN_SEND_INTERVAL_S - (self._clock() - self._last_send)
             if wait > 0.0:
                 self._sleep(wait)
         self._last_send = self._clock()
-        payload: dict[str, Any] = {"chat_id": self._config.chat_id, "text": text[:4096], "disable_web_page_preview": True}
+        payload: dict[str, Any] = {"chat_id": self._config.chat_id, "text": text, "disable_web_page_preview": True}
         if reply_to is not None:
             payload["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
         result = self._call("sendMessage", payload)
@@ -588,7 +634,8 @@ class TelegramNotifier:
 
     def get_updates(self, offset: int | None) -> list[Any]:
         """New messages to the bot from `offset` on (Telegram drops updates below the offset). Never blocks."""
-        payload: dict[str, Any] = {"timeout": 0, "allowed_updates": ["message"]}
+        # Edited messages too, so an edited bet reply is answered (edits are not applied) instead of ignored.
+        payload: dict[str, Any] = {"timeout": 0, "allowed_updates": ["message", "edited_message"]}
         if offset is not None:
             payload["offset"] = offset
         result = self._call("getUpdates", payload)
@@ -668,14 +715,25 @@ class TelegramNotifier:
             logger.info("digest message %d/%d sent with %d bets", part + 1, parts, len(chunk))
         return len(passing), message_ids
 
-    def send_tracked(self, text: str, kind: str, items: Sequence[AlertItem], valid_until: datetime) -> int:
+    def send_tracked(self, text: str, kind: str, items: Sequence[AlertItem], valid_until: datetime) -> int | None:
         """Send one alert-bearing message (a fair-price board) with its delivery tracked and its numbered items
-        indexed for replies. Returns Telegram's message id."""
+        indexed for replies. Returns Telegram's message id, or None when exactly this message was recorded before
+        (sent, unknown or dismissed): a retried run must not repeat it. (A board whose second part failed used to
+        be re-sent whole by the scheduled task's retry, duplicating its first part.)"""
+        if self.deliveries is not None:
+            earlier = self.deliveries.recorded(kind, text, datetime.now(timezone.utc))
+            if earlier is not None:
+                logger.info("%s already recorded as delivery #%d (%s); not sent again", kind, earlier.delivery_id,
+                            earlier.state)
+                return None
         delivery_id = self._begin_delivery(kind, text, items, valid_until)
         return self._send_and_confirm(text, delivery_id, items)
 
     def _begin_delivery(self, kind: str, text: str, items: Sequence[AlertItem], valid_until: datetime) -> int | None:
-        """Written before the alert store and the send, so a crash at any later point leaves a reviewable record."""
+        """Written before the alert store and the send, so a crash at any later point leaves a reviewable record.
+        An alert-bearing message must fit one Telegram message: split, its numbered bets would not match the index."""
+        if len(text) > TELEGRAM_MAX_TEXT:
+            raise ValueError(f"{kind} message is {len(text)} characters; Telegram takes {TELEGRAM_MAX_TEXT}")
         if self._config.chat_id is None:
             raise ValueError(f"{CHAT_ID_ENV} is not set; run with --get-chat-id to find it")
         if self.deliveries is None:

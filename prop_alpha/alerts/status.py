@@ -17,11 +17,21 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Final, Sequence
 
 from prop_alpha.alerts.fx import MAX_RATE_AGE, ExchangeRate, cached_rate, is_fresh
 from prop_alpha.alerts.closing import load_closing_quotes
-from prop_alpha.alerts.ledger import STALE_AFTER, PlacedBetStore, closing_values, results_summary
+from prop_alpha.alerts.ledger import (
+    DEFAULT_HEARTBEAT_FILE,
+    MAX_ANSWER_ATTEMPTS,
+    STALE_AFTER,
+    AnswerOutbox,
+    PlacedBetStore,
+    closing_values,
+    last_poll,
+    results_summary,
+)
 from prop_alpha.alerts.telegram import PAPER_LABEL, DeliveryLog, SentAlertStore, TelegramNotifier, load_config
 from prop_alpha.config import DEFAULT_DSN, DSN_ENV
 
@@ -32,6 +42,10 @@ STATUS_NOTE: Final[str] = (
     "prices are captured 0-15 min before kickoff; the database bet ledger is not built."
 )
 REPORT_INTERVAL: Final[timedelta] = timedelta(hours=4)
+# The bet-reply poll runs every 10 minutes; an hour without one means the task is not running.
+POLL_STALE_AFTER: Final[timedelta] = timedelta(hours=1)
+# Telegram keeps an update the bot has not read for 24 hours, then drops it: a reply older than that is lost.
+TELEGRAM_UPDATE_RETENTION: Final[timedelta] = timedelta(hours=24)
 # Sportmonks plan seen on 2026-10-02: "Starter - Trialing until 2026-10-16".
 SPORTMONKS_TRIAL_ENDS: Final[date] = date(2026, 10, 16)
 
@@ -125,6 +139,26 @@ def delivery_section(deliveries: DeliveryLog, now: datetime) -> list[str]:
             f"({', '.join(f'#{d.delivery_id}' for d in unknown)}): python -m prop_alpha.alerts.delivery"]
 
 
+def poll_section(heartbeat_file: Path, outbox: AnswerOutbox, now: datetime) -> list[str]:
+    """Whether bet replies are being read, and answers to them that could not be sent (delivery audit 2026-10-05)."""
+    lines: list[str] = []
+    last = last_poll(heartbeat_file)
+    if last is None:
+        lines.append("WARNING: no bet-reply poll has been recorded yet (task prop_alpha\\Bet ledger poll)")
+    elif now - last > POLL_STALE_AFTER:
+        line = (f"WARNING: bet replies last read {(now - last).total_seconds() / 3600:.1f}h ago "
+                f"({last:%d %b %H:%M} UTC); the poll should run every 10 minutes")
+        if now - last > TELEGRAM_UPDATE_RETENTION:
+            line += (". Telegram drops a reply it has kept unread for 24 hours: re-send any placed reply sent "
+                     f"before {now - TELEGRAM_UPDATE_RETENTION:%d %b %H:%M} UTC")
+        lines.append(line)
+    abandoned = outbox.abandoned()
+    if abandoned:
+        lines.append(f"WARNING: {len(abandoned)} answer(s) to your bet replies failed {MAX_ANSWER_ATTEMPTS} sends "
+                     "and were not delivered: python -m prop_alpha.alerts.ledger --list shows them")
+    return lines
+
+
 def fx_section(rate: ExchangeRate | None, now: datetime) -> list[str]:
     """The cached book-currency rate, flagged when the scan would refuse it as too old."""
     if rate is None:
@@ -155,11 +189,13 @@ def format_report(now: datetime, database_lines: list[str], alerts_in_window: in
 
 
 def build_report(now: datetime, dsn: str, store: SentAlertStore, bets: PlacedBetStore | None = None,
-                 rate: ExchangeRate | None = None, deliveries: DeliveryLog | None = None) -> str:
+                 rate: ExchangeRate | None = None, deliveries: DeliveryLog | None = None,
+                 poll_state: tuple[Path, AnswerOutbox] | None = None) -> str:
     alerts = [alert for alert in store.load() if alert.sent_at > now - REPORT_INTERVAL]
     return format_report(now, database_section(dsn), len(alerts), store.exposure(now).total,
                          [*(bet_section(bets, now) if bets is not None else ()),
                           *(delivery_section(deliveries, now) if deliveries is not None else ()),
+                          *(poll_section(*poll_state, now) if poll_state is not None else ()),
                           *fx_section(rate, now)])
 
 
@@ -169,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--send", action="store_true", help="send the report (default: print only)")
     args = parser.parse_args(argv)
     report = build_report(datetime.now(timezone.utc), os.environ.get(DSN_ENV, DEFAULT_DSN), SentAlertStore(),
-                          PlacedBetStore(), cached_rate(), DeliveryLog())
+                          PlacedBetStore(), cached_rate(), DeliveryLog(), (DEFAULT_HEARTBEAT_FILE, AnswerOutbox()))
     print(report)
     if args.send:
         message_id = TelegramNotifier(load_config()).send_message(report)

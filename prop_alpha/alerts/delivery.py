@@ -12,7 +12,8 @@ double a bet. This tool lets the operator settle each one:
     python -m prop_alpha.alerts.delivery --dismiss 12          # leave it unsent (e.g. its bets have expired)
     python -m prop_alpha.alerts.delivery --mock ...            # the same for mock-odds runs
 
-A re-sent copy is headed RESENT_HEADER and indexed like the original, so a bet-recording reply to it works. Only an
+A re-sent copy follows a separate RESENT_HEADER message (sent on its own, so the copy keeps the original's length
+and still fits one Telegram message) and is indexed like the original, so a bet-recording reply to it works. Only an
 unknown delivery can be re-sent, and only until its valid_until (the last bet's expiry, or a board's kickoff).
 Re-sending never changes exposure: the alert store already counts every alerted stake, sent or not.
 
@@ -39,8 +40,8 @@ from prop_alpha.alerts.telegram import (
 logger = logging.getLogger("prop_alpha.delivery")
 
 RESENT_HEADER: Final[str] = (
-    "RESENT - the first send of this message was not confirmed. If you already have it, this is the same message "
-    "with the same bet numbers: do not bet twice."
+    "RESENT - the next message repeats one whose first send was not confirmed. If you already have it, it is the "
+    "same message with the same bet numbers: do not bet twice."
 )
 
 
@@ -92,7 +93,8 @@ def resend(notifier: TelegramNotifier, log: DeliveryLog, delivery_id: int, now: 
     if now >= delivery.valid_until:
         raise ValueError(f"delivery #{delivery_id} expired at {delivery.valid_until:%d %b %H:%M} UTC; "
                          "use --dismiss instead")
-    message_id = notifier.send_message(f"{RESENT_HEADER}\n\n{delivery.text}")
+    notifier.send_message(RESENT_HEADER)
+    message_id = notifier.send_message(delivery.text)
     log.resolve(delivery_id, "resent", datetime.now(timezone.utc), message_id)
     if notifier.index is not None and delivery.items:
         notifier.index.record(message_id, delivery.items, datetime.now(timezone.utc))

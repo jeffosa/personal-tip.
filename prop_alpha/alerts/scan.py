@@ -46,6 +46,7 @@ from prop_alpha.alerts.replies import USAGE, AlertItem
 from prop_alpha.alerts.telegram import (
     DEFAULT_CRITERIA,
     PAPER_LABEL,
+    TELEGRAM_MAX_TEXT,
     AlertContext,
     DeliveryLog,
     MessageIndex,
@@ -371,13 +372,24 @@ def format_board(
                       market=key[1], line=key[2], min_odds=tuple((side, entry.min_odds) for side, entry in listed),
                       match=title, player=who),
         ))
-    chunks = [numbered[i:i + BOARD_ROWS_PER_MESSAGE] for i in range(0, len(numbered), BOARD_ROWS_PER_MESSAGE)]
-    return [
-        ("\n".join([PAPER_LABEL, *((BOARD_HEADER,) if i == 0 else ()), title + (" (continued)" if i else ""),
-                    *(line for line, _ in chunk), "", USAGE]),
-         [item for _, item in chunk])
-        for i, chunk in enumerate(chunks)
-    ]
+    def message(part: int, rows: Sequence[tuple[str, AlertItem]]) -> str:
+        return "\n".join([PAPER_LABEL, *((BOARD_HEADER,) if part == 0 else ()),
+                          title + (" (continued)" if part else ""), *(line for line, _ in rows), "", USAGE])
+
+    # A message closes at BOARD_ROWS_PER_MESSAGE rows or before it would pass Telegram's limit, whichever comes
+    # first: 25 rows of long names reached 4,095 of 4,096 characters, and a longer board was cut silently.
+    chunks: list[list[tuple[str, AlertItem]]] = []
+    for row in numbered:
+        if chunks and len(chunks[-1]) < BOARD_ROWS_PER_MESSAGE \
+                and len(message(len(chunks) - 1, [*chunks[-1], row])) <= TELEGRAM_MAX_TEXT:
+            chunks[-1].append(row)
+        else:
+            chunks.append([row])
+    messages = [(message(part, rows), [item for _, item in rows]) for part, rows in enumerate(chunks)]
+    too_long = [len(text) for text, _ in messages if len(text) > TELEGRAM_MAX_TEXT]
+    if too_long:
+        raise ValueError(f"board row too long for one Telegram message ({max(too_long)} characters)")
+    return messages
 
 
 def send_boards(

@@ -56,6 +56,7 @@ from prop_alpha.alerts.replies import (
 )
 from prop_alpha.alerts.telegram import (
     DEFAULT_INDEX_FILE,
+    DeliveryLog,
     MessageIndex,
     SentAlertStore,
     TelegramNotifier,
@@ -70,6 +71,17 @@ logger = logging.getLogger("prop_alpha.ledger")
 STATE_DIR: Final[Path] = DEFAULT_INDEX_FILE.parent
 DEFAULT_BETS_FILE: Final[Path] = STATE_DIR / "placed_bets.jsonl"
 DEFAULT_OFFSET_FILE: Final[Path] = STATE_DIR / "telegram_offset.json"
+# The bot's answers to bet replies, queued before they are sent (AnswerOutbox), and the time of the last poll that
+# read Telegram (status report: Telegram keeps an unread reply for 24 hours only).
+DEFAULT_ANSWERS_FILE: Final[Path] = STATE_DIR / "ledger_answers.jsonl"
+DEFAULT_HEARTBEAT_FILE: Final[Path] = STATE_DIR / "ledger_last_poll.json"
+# An answer that failed this many sends is left for the status report instead of being retried for ever.
+MAX_ANSWER_ATTEMPTS: Final[int] = 3
+DELAYED_PREFIX: Final[str] = "(Delayed answer - this was not delivered when you sent your reply.) "
+EDIT_NOTICE: Final[str] = (
+    "Edits are not applied. If the original reply recorded a bet, send undo <bet id>, then send the corrected reply "
+    "as a new reply to the alert."
+)
 COMMAND_WORDS: Final[tuple[str, ...]] = ("placed", "undo", "settle")
 # A bet still open this long after it was placed is flagged for settling by hand (postponed, abandoned, or a
 # player row missing from the stored match).
@@ -227,6 +239,83 @@ def combined_exposure(alerts: SentAlertStore, bets: PlacedBetStore, now: datetim
     return ExposureBook({key: max(alerted.get(key, 0.0), placed.get(key, 0.0)) for key in {*alerted, *placed}})
 
 
+class AnswerOutbox:
+    """Append-only record of the bot's answers to bet replies (delivery audit 2026-10-05). The offset is saved before
+    answers are sent, so a reply is never recorded twice; an answer that then failed to send used to be lost, and a
+    maintainer who saw no "Recorded bet #N" could send the reply again and record the bet twice. Each answer is now
+    queued ("pending", with its text) before the offset is saved, each send attempt is logged, and a sent answer is
+    marked "sent"; the next poll re-sends what is still unsent, up to MAX_ANSWER_ATTEMPTS. A corrupt line raises."""
+
+    def __init__(self, path: Path = DEFAULT_ANSWERS_FILE) -> None:
+        self.path = path
+
+    def _append(self, record: Mapping[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(record)) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def _events(self) -> list[dict[str, Any]]:
+        if not self.path.is_file():
+            return []
+        events: list[dict[str, Any]] = []
+        for number, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            record: Any = json.loads(line)
+            if not (isinstance(record, dict) and isinstance(record.get("answer_id"), int)
+                    and record.get("event") in ("pending", "attempt", "sent")):
+                raise ValueError(f"{self.path.name} line {number} is not an answer event")
+            if record["event"] == "pending" and not (isinstance(record.get("reply_to"), int)
+                                                     and isinstance(record.get("text"), str)):
+                raise ValueError(f"{self.path.name} line {number}: a pending answer needs reply_to and text")
+            events.append(record)
+        return events
+
+    def queue(self, reply_to: int, text: str, at: datetime) -> int:
+        """Queue one answer; returns its id."""
+        answer_id = max((event["answer_id"] for event in self._events()), default=0) + 1
+        self._append({"answer_id": answer_id, "event": "pending", "reply_to": reply_to, "text": text,
+                      "at": at.isoformat()})
+        return answer_id
+
+    def attempt(self, answer_id: int, at: datetime) -> None:
+        self._append({"answer_id": answer_id, "event": "attempt", "at": at.isoformat()})
+
+    def mark_sent(self, answer_id: int, message_id: int, at: datetime) -> None:
+        self._append({"answer_id": answer_id, "event": "sent", "message_id": message_id, "at": at.isoformat()})
+
+    def unsent(self) -> list[tuple[int, int, str, int]]:
+        """(answer id, message it answers, text, send attempts so far) of every answer not yet sent, oldest first."""
+        pending: dict[int, tuple[int, str]] = {}
+        attempts: dict[int, int] = defaultdict(int)
+        sent: set[int] = set()
+        for event in self._events():
+            if event["event"] == "pending":
+                pending[event["answer_id"]] = (int(event["reply_to"]), str(event["text"]))
+            elif event["event"] == "attempt":
+                attempts[event["answer_id"]] += 1
+            else:
+                sent.add(event["answer_id"])
+        return [(answer_id, reply_to, text, attempts[answer_id])
+                for answer_id, (reply_to, text) in sorted(pending.items()) if answer_id not in sent]
+
+    def abandoned(self) -> list[tuple[int, int, str, int]]:
+        """Unsent answers that reached MAX_ANSWER_ATTEMPTS: reported, no longer retried."""
+        return [entry for entry in self.unsent() if entry[3] >= MAX_ANSWER_ATTEMPTS]
+
+
+def last_poll(heartbeat_file: Path = DEFAULT_HEARTBEAT_FILE) -> datetime | None:
+    """When a poll last read Telegram's updates, or None if never (or not since this was added)."""
+    if not heartbeat_file.is_file():
+        return None
+    raw: Any = json.loads(heartbeat_file.read_text(encoding="utf-8"))
+    if not (isinstance(raw, dict) and isinstance(raw.get("at"), str)):
+        raise ValueError(f"{heartbeat_file.name} is not a poll heartbeat")
+    return datetime.fromisoformat(raw["at"])
+
+
 def _message_time(message: Mapping[str, Any], fallback: datetime) -> datetime:
     date = message.get("date")
     return datetime.fromtimestamp(date, timezone.utc) if isinstance(date, int) and not isinstance(date, bool) else fallback
@@ -253,6 +342,16 @@ def process_updates(
         if not isinstance(update_id, int):
             continue
         next_offset = max(next_offset or 0, update_id + 1)
+        edited = update.get("edited_message")
+        if isinstance(edited, dict) and update_id not in seen:
+            # Until 2026-10-05 edits were not even fetched: a corrected stake or price was silently ignored.
+            edited_chat: Any = edited.get("chat")
+            edited_text: Any = edited.get("text")
+            if (isinstance(edited_chat, dict) and str(edited_chat.get("id")) == chat_id
+                    and isinstance(edited_text, str) and edited_text.strip().lower().startswith(COMMAND_WORDS)
+                    and isinstance(edited.get("message_id"), int)):
+                replies.append((int(edited["message_id"]), EDIT_NOTICE))
+            continue
         message = update.get("message")
         if not isinstance(message, dict) or update_id in seen:
             continue
@@ -286,9 +385,11 @@ def process_updates(
                 replies.append((own_id, "Recorded " + settlement_text(bets[command.bet_id], settlement)))
         else:
             answer, recorded = _record_place(command, message, messages, store, update_id, next_id, now, currency,
-                                             book_rate)
+                                             book_rate, open_bets=[b for b in bets.values() if b.bet_id not in cancelled])
             replies.append((own_id, answer))
-            next_id += 1 if recorded else 0
+            if recorded is not None:
+                bets[recorded.bet_id] = recorded
+                next_id += 1
         seen.add(update_id)
     return replies, next_offset
 
@@ -296,34 +397,80 @@ def process_updates(
 def _record_place(
     command: PlaceCommand, message: Mapping[str, Any], messages: Mapping[int, Mapping[int, AlertItem]],
     store: PlacedBetStore, update_id: int, bet_id: int, now: datetime, currency: str = "",
-    book_rate: ExchangeRate | None = None,
-) -> tuple[str, bool]:
-    """(answer for the chat, whether a bet was recorded)."""
+    book_rate: ExchangeRate | None = None, open_bets: Sequence[PlacedBet] = (),
+) -> tuple[str, PlacedBet | None]:
+    """(answer for the chat, the bet recorded or None). A bet identical to an open one (same message, number,
+    side, odds and stake) is still recorded, since two identical bets can be real, but the answer says so: a
+    repeat sent because an answer never arrived would otherwise double the position unnoticed."""
     replied: Any = message.get("reply_to_message")
     replied_id = replied.get("message_id") if isinstance(replied, dict) else None
     if not isinstance(replied_id, int):
-        return NOT_A_REPLY, False
+        return NOT_A_REPLY, None
     items = messages.get(replied_id)
     if items is None:
-        return "That message is not an alert or board I sent, so no bet was recorded. " + NOT_A_REPLY, False
+        return "That message is not an alert or board I sent, so no bet was recorded. " + NOT_A_REPLY, None
     stake = stake_in_bankroll(command, currency, book_rate)
     if isinstance(stake, ReplyError):
-        return stake.message, False
+        return stake.message, None
     result = resolve_bet(command, items, bet_id=bet_id, update_id=update_id, message_id=replied_id,
                          placed_at=_message_time(message, now), stake=stake[0], entered=stake[1])
     if isinstance(result, ReplyError):
-        return result.message, False
+        return result.message, None
+    twins = [bet.bet_id for bet in open_bets
+             if (bet.message_id, bet.number, bet.side, bet.odds, bet.stake)
+             == (result.message_id, result.number, result.side, result.odds, result.stake)]
     store.record_bet(result)
     logger.info("recorded bet #%d: %s %s %s %g @ %.2f stake %g", result.bet_id, result.player, result.market,
                 result.side, result.line, result.odds, result.stake)
-    return confirmation(result), True
+    warning = ("" if not twins else
+               f"\nPOSSIBLE DUPLICATE of open bet #{twins[0]} (same bet, odds and stake). If you placed it only once, "
+               f"reply undo {result.bet_id}.")
+    return confirmation(result) + warning, result
+
+
+def confirm_quoted_deliveries(
+    updates: Sequence[Any], chat_id: str, messages: Mapping[int, Mapping[int, AlertItem]], deliveries: DeliveryLog,
+    index: MessageIndex, now: datetime,
+) -> dict[int, dict[int, AlertItem]]:
+    """Message id -> numbered bets for replies to an alert or board whose send was never confirmed (delivery audit
+    2026-10-05). A send that timed out after Telegram had delivered it left the message unindexed, so a "placed"
+    reply to it was refused as "not an alert I sent". Telegram quotes the replied-to text: when it equals an
+    unconfirmed delivery's text, the reply proves the message arrived, so the message is indexed and the delivery
+    confirmed ("confirmed_by_reply"). Only replies from `chat_id` count."""
+    unconfirmed = deliveries.unconfirmed_by_text(now)
+    found: dict[int, dict[int, AlertItem]] = {}
+    for update in updates:
+        message: Any = update.get("message") if isinstance(update, dict) else None
+        chat: Any = message.get("chat") if isinstance(message, dict) else None
+        if not isinstance(chat, dict) or str(chat.get("id")) != chat_id:
+            continue
+        replied: Any = message.get("reply_to_message")
+        replied_id = replied.get("message_id") if isinstance(replied, dict) else None
+        quoted = replied.get("text") if isinstance(replied, dict) else None
+        if not isinstance(replied_id, int) or replied_id in messages or replied_id in found \
+                or not isinstance(quoted, str):
+            continue
+        delivery = unconfirmed.get(quoted.strip())
+        if delivery is None or not delivery.items:
+            continue
+        index.record(replied_id, delivery.items, now)
+        deliveries.resolve(delivery.delivery_id, "confirmed_by_reply", now, replied_id)
+        found[replied_id] = {item.number: item for item in delivery.items}
+        logger.warning("delivery #%d confirmed by a reply to message %d", delivery.delivery_id, replied_id)
+    return found
 
 
 def poll(
     notifier: TelegramNotifier, index: MessageIndex, store: PlacedBetStore, offset_file: Path, now: datetime,
-    currency: str = "", book_rate: ExchangeRate | None = None,
+    currency: str = "", book_rate: ExchangeRate | None = None, *, outbox: AnswerOutbox | None = None,
+    deliveries: DeliveryLog | None = None, heartbeat_file: Path | None = None,
 ) -> int:
-    """Read new replies, record bets, answer each in the chat. Returns the number of replies sent."""
+    """Read new replies, record bets, answer each in the chat. Returns the number of answers sent.
+
+    With an `outbox`, every answer is queued before the offset is saved and an unsent one is re-sent by the next
+    poll; with `deliveries`, a reply to an alert whose send was never confirmed still records its bet
+    (confirm_quoted_deliveries); with a `heartbeat_file`, the time Telegram was read is saved for the status report.
+    New answers go out before re-sent ones, so one answer Telegram keeps refusing cannot hold back the rest."""
     if notifier.chat_id is None:
         raise ValueError("TELEGRAM_CHAT_ID is not set; run python -m prop_alpha.alerts.telegram --get-chat-id")
     offset: int | None = None
@@ -332,15 +479,30 @@ def poll(
         if not (isinstance(raw, dict) and isinstance(raw.get("offset"), int)):
             raise ValueError(f"{offset_file.name} is not an offset record")
         offset = int(raw["offset"])
-    replies, next_offset = process_updates(notifier.get_updates(offset), notifier.chat_id, index.load(), store, now,
-                                           currency, book_rate)
+    earlier = outbox.unsent() if outbox is not None else []
+    updates = notifier.get_updates(offset)
+    messages: dict[int, Mapping[int, AlertItem]] = dict(index.load())
+    if deliveries is not None:
+        messages.update(confirm_quoted_deliveries(updates, notifier.chat_id, messages, deliveries, index, now))
+    replies, next_offset = process_updates(updates, notifier.chat_id, messages, store, now, currency, book_rate)
+    queued = [(outbox.queue(reply_to, text, now) if outbox is not None else 0, reply_to, text)
+              for reply_to, text in replies]
     if next_offset is not None:
         # Saved before answering: the bets are already recorded, and a failed answer must not re-read them.
         offset_file.parent.mkdir(parents=True, exist_ok=True)
         offset_file.write_text(json.dumps({"offset": next_offset}), encoding="utf-8")
-    for reply_to, text in replies:
-        notifier.send_message(text, reply_to=reply_to)
-    return len(replies)
+    if heartbeat_file is not None:
+        heartbeat_file.parent.mkdir(parents=True, exist_ok=True)
+        heartbeat_file.write_text(json.dumps({"at": now.isoformat()}), encoding="utf-8")
+    retries = [(answer_id, reply_to, DELAYED_PREFIX + text)
+               for answer_id, reply_to, text, attempts in earlier if attempts < MAX_ANSWER_ATTEMPTS]
+    for answer_id, reply_to, text in [*queued, *retries]:
+        if outbox is not None:
+            outbox.attempt(answer_id, now)
+        message_id = notifier.send_message(text, reply_to=reply_to)
+        if outbox is not None:
+            outbox.mark_sent(answer_id, message_id, now)
+    return len(queued) + len(retries)
 
 
 def settle_open_bets(
@@ -468,6 +630,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         for bet, settlement in settled:
             print(settlement_text(bet, settlement, closing.get(bet.bet_id)))
         print(results_summary(settled, closing))
+        for answer_id, reply_to, text, attempts in AnswerOutbox().abandoned():
+            print(f"UNDELIVERED answer #{answer_id} to your message {reply_to} ({attempts} failed sends): {text}")
         return 0
     if args.settle:
         settled = settle(store, os.environ.get(DSN_ENV, DEFAULT_DSN), now)
@@ -483,7 +647,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     currency = bankroll_currency()
     rate = None if currency == BOOK_CURRENCY else cached_rate()
     fresh = rate if rate is not None and is_fresh(rate, now.date()) else None
-    sent = poll(TelegramNotifier(load_config()), MessageIndex(), store, DEFAULT_OFFSET_FILE, now, currency, fresh)
+    sent = poll(TelegramNotifier(load_config()), MessageIndex(), store, DEFAULT_OFFSET_FILE, now, currency, fresh,
+                outbox=AnswerOutbox(), deliveries=DeliveryLog(), heartbeat_file=DEFAULT_HEARTBEAT_FILE)
     print(f"answered {sent} message(s)")
     return 0
 
