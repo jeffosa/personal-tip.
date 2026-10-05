@@ -19,8 +19,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Final, Mapping
 
-FROZEN_ON: Final[date] = date(2026, 10, 4)
-LOCKBOX_START: Final[datetime] = datetime(2026, 10, 5, tzinfo=timezone.utc)
+FROZEN_ON: Final[date] = date(2026, 10, 5)
+LOCKBOX_START: Final[datetime] = datetime(2026, 10, 6, tzinfo=timezone.utc)
 # Lines scored per market: the lines the selection backtests reported, fixed before any lockbox match.
 GATE2_LINES: Final[Mapping[str, tuple[float, ...]]] = {"tackles": (0.5, 1.5, 2.5), "fouls": (0.5, 1.5)}
 # Every top-level definition that decides a price ("*" = the whole module). Odds matching, alerts, mock prices and
@@ -39,7 +39,7 @@ PRICING_CODE: Final[Mapping[str, tuple[str, ...]]] = {
         "load_slate_inputs", "scan_engines", "price_fixture",
     ),
 }
-FROZEN_DIGEST: Final[str] = "001b17a17d21188788e39e93b65e10d7ce9a08c2f3649f84534ec2076012e58b"
+FROZEN_DIGEST: Final[str] = "839e97ce504eaecd29a7b435fea9980e0a3d3401e648d4cee70a39b1ca63275f"
 REPOSITORY_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 
 

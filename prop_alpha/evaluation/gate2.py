@@ -156,3 +156,56 @@ def score_line(fixtures: Sequence[int], probabilities: Sequence[float], outcomes
         log_loss=log_loss(p, y), calibration_intercept=fit.intercept, calibration_slope=fit.slope,
         worst_bin_gap=worst_bin_gap(p, y), calibration_note=fit.note,
     )
+
+
+# Gate 2 criterion 4 is not judged on fewer predictions with a two-way closing price than this (a three-parameter
+# fit; the PRD sets no number, so this floor is the project's own and is stated in every report).
+MIN_BENCHMARK_PREDICTIONS: Final[int] = 200
+BENCHMARK_ALPHA: Final[float] = 0.05
+
+
+@dataclass(frozen=True)
+class MarketBenchmark:
+    """PRD Gate 2 criterion 4: logit P(y = 1) = a + b1 logit p_market + b2 logit p_model on predictions with a
+    devigged closing price. The model carries information beyond the market only if b2 > 0 with Wald p < 0.05."""
+
+    n: int
+    b_market: float
+    b_model: float
+    b_model_se: float
+    p_value: float
+    converged: bool
+    note: str = ""
+
+    @property
+    def passed(self) -> bool:
+        return (self.converged and self.n >= MIN_BENCHMARK_PREDICTIONS and self.b_model > 0.0
+                and self.p_value < BENCHMARK_ALPHA)
+
+
+def market_benchmark(market_probabilities: Sequence[float], probabilities: Sequence[float],
+                     outcomes: Sequence[int]) -> MarketBenchmark:
+    """The criterion-4 fit by Newton's method with the same conditioning check as calibration_fit."""
+    q, y = _arrays(market_probabilities, outcomes)
+    p, _ = _arrays(probabilities, outcomes)
+    x = np.column_stack([np.ones_like(p), np.log(q / (1.0 - q)), np.log(p / (1.0 - p))])
+    w = np.zeros(3)
+    for _ in range(NEWTON_STEPS):
+        prob = 1.0 / (1.0 + np.exp(-(x @ w)))
+        hess = (x * (prob * (1.0 - prob))[:, None]).T @ x
+        condition = np.linalg.cond(hess)
+        if not np.isfinite(condition) or condition > MAX_HESSIAN_CONDITION:
+            return MarketBenchmark(len(p), math.nan, math.nan, math.nan, math.nan, False,
+                                   "singular fit (model and market prices nearly identical, or separated outcomes)")
+        step = np.linalg.solve(hess, x.T @ (y - prob))
+        w += step
+        if not np.isfinite(w).all():
+            return MarketBenchmark(len(p), math.nan, math.nan, math.nan, math.nan, False, "fit diverged")
+        if np.abs(step).max() < NEWTON_TOLERANCE:
+            prob = 1.0 / (1.0 + np.exp(-(x @ w)))
+            covariance = np.linalg.inv((x * (prob * (1.0 - prob))[:, None]).T @ x)
+            se = math.sqrt(float(covariance[2, 2]))
+            p_value = math.erfc(abs(float(w[2]) / se) / math.sqrt(2.0))
+            return MarketBenchmark(len(p), float(w[1]), float(w[2]), se, p_value, True)
+    return MarketBenchmark(len(p), math.nan, math.nan, math.nan, math.nan, False,
+                           f"no convergence in {NEWTON_STEPS} steps")

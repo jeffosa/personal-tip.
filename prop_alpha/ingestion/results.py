@@ -106,7 +106,10 @@ def read_stored(dsn: str) -> tuple[datetime | None, frozenset[str]]:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(LATEST_FINAL_SQL)
-                latest = cur.fetchone()[0]
+                found = cur.fetchone()
+                if found is None:
+                    raise ValueError("latest-final query returned no row")
+                latest = found[0]
                 stored: frozenset[str] = frozenset()
                 if latest is not None:
                     cur.execute(STORED_FINAL_SQL, (latest, LOOKBACK))

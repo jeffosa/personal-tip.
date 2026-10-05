@@ -27,8 +27,8 @@ from prop_alpha.config import DEFAULT_DSN, DSN_ENV
 logger = logging.getLogger("prop_alpha.status")
 
 STATUS_NOTE: Final[str] = (
-    "No PRD go-live gate passed. Bets are settled from Sportmonks under assumed market rules; closing-line capture "
-    "and the database bet ledger are not built."
+    "No PRD go-live gate passed. Bets are settled from Sportmonks under assumed market rules (provisional); closing "
+    "prices are captured 0-15 min before kickoff; the database bet ledger is not built."
 )
 REPORT_INTERVAL: Final[timedelta] = timedelta(hours=4)
 # Sportmonks plan seen on 2026-10-02: "Starter - Trialing until 2026-10-16".
@@ -68,6 +68,8 @@ def read_snapshot(dsn: str) -> DatabaseSnapshot:
             with conn.cursor() as cur:
                 cur.execute(SNAPSHOT_SQL)
                 row = cur.fetchone()
+                if row is None:
+                    raise ValueError("status snapshot query returned no row")
     finally:
         conn.close()
     if row is None:
