@@ -12,3 +12,6 @@ htmlcov/
 .prop_alpha_state/
 # Generated audit output (pyright, bandit, pytest); kept out of the repository.
 project_audit_report.md
+
+# Generated static test dataset (real rows are vendor data; not for redistribution).
+static_data/
