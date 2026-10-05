@@ -19,7 +19,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Final, Sequence
 
 from prop_alpha.alerts.fx import MAX_RATE_AGE, ExchangeRate, cached_rate, is_fresh
-from prop_alpha.alerts.ledger import STALE_AFTER, PlacedBetStore, results_summary
+from prop_alpha.alerts.closing import load_closing_quotes
+from prop_alpha.alerts.ledger import STALE_AFTER, PlacedBetStore, closing_values, results_summary
 from prop_alpha.alerts.telegram import PAPER_LABEL, SentAlertStore, TelegramNotifier, load_config
 from prop_alpha.config import DEFAULT_DSN, DSN_ENV
 
@@ -40,7 +41,8 @@ SNAPSHOT_SQL: Final[str] = """
            (SELECT count(*) FROM prop_alpha.player_match_stats),
            (SELECT count(*) FROM prop_alpha.staging_player_feed),
            (SELECT count(*) FROM prop_alpha.staging_rejects WHERE rejected_at > now() - interval '24 hours'),
-           (SELECT count(*) FROM prop_alpha.raw_payloads)
+           (SELECT count(*) FROM prop_alpha.raw_payloads),
+           (SELECT count(*) FROM prop_alpha.incomplete_team_matches)
 """
 
 
@@ -53,6 +55,7 @@ class DatabaseSnapshot:
     staged_rows: int
     rejects_24h: int
     raw_payloads: int
+    incomplete_team_matches: int = 0
 
 
 def read_snapshot(dsn: str) -> DatabaseSnapshot:
@@ -67,9 +70,11 @@ def read_snapshot(dsn: str) -> DatabaseSnapshot:
                 row = cur.fetchone()
     finally:
         conn.close()
-    fixtures, final_fixtures, last_merge, player_rows, staged, rejects, raw = row
+    if row is None:
+        raise ValueError("status snapshot query returned no row")
+    fixtures, final_fixtures, last_merge, player_rows, staged, rejects, raw, incomplete = row
     return DatabaseSnapshot(int(fixtures), int(final_fixtures), last_merge, int(player_rows), int(staged),
-                            int(rejects), int(raw))
+                            int(rejects), int(raw), int(incomplete))
 
 
 def database_section(dsn: str) -> list[str]:
@@ -84,6 +89,8 @@ def database_section(dsn: str) -> list[str]:
     lines = [
         f"Database: {snapshot.fixtures} fixtures ({snapshot.final_fixtures} final), {snapshot.player_rows} player rows",
         f"Last merge: {last}; raw payloads stored: {snapshot.raw_payloads}",
+        f"Incomplete club-matches (a player without an ID played; left out of pricing): "
+        f"{snapshot.incomplete_team_matches}",
     ]
     if snapshot.staged_rows:
         lines.append(f"WARNING: {snapshot.staged_rows} rows waiting in staging (merge failed or not run)")
@@ -102,7 +109,7 @@ def bet_section(bets: PlacedBetStore, now: datetime) -> list[str]:
                      f"({', '.join(f'#{bet.bet_id}' for bet in stale)}): reply settled <bet id> won|lost|void")
     settled = bets.settled_bets()
     if settled:
-        lines.append(results_summary(settled))
+        lines.append(results_summary(settled, closing_values(settled, load_closing_quotes(bets.path.parent))))
     return lines
 
 

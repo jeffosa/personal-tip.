@@ -575,3 +575,23 @@ def test_merge_stores_each_matchs_own_position() -> None:
     assert "x.player_position" in function
     assert "match_position           VARCHAR(16)" in SCHEMA
     assert "ADD COLUMN IF NOT EXISTS match_position" in MIGRATION_007 and "SET lock_timeout" in MIGRATION_007
+
+
+MIGRATION_008 = (ROOT / "migrations" / "008_incomplete_team_matches.sql").read_text(encoding="utf-8")
+
+
+def _function(sql: str, name: str) -> str:
+    start = sql.index(f"CREATE OR REPLACE FUNCTION prop_alpha.{name}(")
+    return sql[start:sql.index("$$;", start) + 3]
+
+
+def test_incomplete_team_matches_is_mirrored_in_schema_and_read_by_pricing() -> None:
+    """Migration 008 (maintainer decision 2026-10-05): club-matches with an unidentified player who played are left
+    out of the scan's lineup estimates and league levels."""
+    assert _function(SCHEMA, "refresh_incomplete_team_matches") == _function(MIGRATION_008,
+                                                                            "refresh_incomplete_team_matches")
+    assert "CREATE TABLE IF NOT EXISTS prop_alpha.incomplete_team_matches" in SCHEMA
+    assert "SET lock_timeout" in MIGRATION_008 and "TRUNCATE" not in MIGRATION_008
+    from prop_alpha.alerts import scan
+    for sql in (scan.TEAM_RECENT_SQL, scan.LEVEL_SQL):
+        assert "prop_alpha.incomplete_team_matches" in sql and "NOT EXISTS" in sql

@@ -486,4 +486,49 @@ BEGIN
 END;
 $$;
 
+
+-- Club-matches in which a player without a Sportmonks identity played (migration 008): left out of the scan's
+-- lineup estimates and league levels. Recomputed from raw_payloads by refresh_incomplete_team_matches(since),
+-- which the results job calls after every run.
+CREATE TABLE IF NOT EXISTS prop_alpha.incomplete_team_matches (
+    fixture_id          BIGINT   NOT NULL REFERENCES prop_alpha.fixtures(fixture_id) ON DELETE CASCADE,
+    team_id             INTEGER  NOT NULL REFERENCES prop_alpha.teams(team_id),
+    unidentified_played SMALLINT NOT NULL CHECK (unidentified_played > 0),
+    PRIMARY KEY (fixture_id, team_id)
+);
+
+CREATE OR REPLACE FUNCTION prop_alpha.refresh_incomplete_team_matches(p_since timestamptz DEFAULT '-infinity')
+RETURNS integer
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_rows integer;
+BEGIN
+    DELETE FROM prop_alpha.incomplete_team_matches AS i
+    USING prop_alpha.fixtures AS f
+    WHERE f.fixture_id = i.fixture_id AND f.kickoff_at >= p_since;
+
+    INSERT INTO prop_alpha.incomplete_team_matches (fixture_id, team_id, unidentified_played)
+    SELECT f.fixture_id, t.team_id, count(*)
+    FROM (
+        SELECT DISTINCT ON (vendor_fixture_uid) vendor_fixture_uid, payload
+        FROM prop_alpha.raw_payloads
+        ORDER BY vendor_fixture_uid, fetched_at DESC, payload_id DESC
+    ) r
+    JOIN prop_alpha.fixtures f ON f.vendor_fixture_uid = r.vendor_fixture_uid AND f.kickoff_at >= p_since
+    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(r.payload->'vendor_response'->'lineups', '[]'::jsonb)) AS e
+    JOIN prop_alpha.teams t ON t.vendor_team_uid = e->>'team_id'
+    WHERE COALESCE(e->'player_id', 'null'::jsonb) = 'null'::jsonb
+      AND (e->>'type_id' = '11'
+           OR COALESCE((SELECT (d->'data'->>'value')::numeric
+                        FROM jsonb_array_elements(COALESCE(e->'details', '[]'::jsonb)) AS d
+                        WHERE d->'type'->>'developer_name' = 'MINUTES_PLAYED'
+                        LIMIT 1), 0) > 0)
+    GROUP BY f.fixture_id, t.team_id
+    ORDER BY f.fixture_id, t.team_id;
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    RETURN v_rows;
+END;
+$$;
+
 RESET search_path;

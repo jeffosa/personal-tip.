@@ -45,6 +45,9 @@ SANCTIONED_HANDLERS: frozenset[tuple[str, str, str]] = frozenset({
     # H11, added on 2026-10-03 after the audit rerun: an OddsPapi failure (403, outage, quota) becomes a line
     # in the scan summary instead of ending the run silently.
     ("prop_alpha/alerts/scan.py", "run_scan", "(requests.RequestException, QuotaExhaustedError, ValueError)"),
+    # H12, approved by the maintainer on 2026-10-05: one failing bookmaker is recorded and skipped, the others' prices
+    # are kept.
+    ("prop_alpha/alerts/scan.py", "collect_odds", "(requests.RequestException, VendorError)"),
 })
 
 PURE_MODULES: tuple[str, ...] = (
@@ -428,6 +431,10 @@ _TOKEN_SHAPED = "1234567890" + ":" + "A" * 35
         (_secret_hits, f"TELEGRAM_BOT_TOKEN={_TOKEN_SHAPED}\n"),
         (_secret_hits, "dsn = 'postgresql://admin:" + "hunter2@db.internal/prod'\n"),
     ],
+    # Named cases: the default ids would print the fake token and placeholder in `pytest -v` output, which then
+    # trips the secrets and placeholder scans in any report that captures it.
+    ids=["bare-pass-handler", "bare-except", "io-import", "cursor-parameter", "clock-read", "raw-moment",
+         "outer-moment", "pass-body", "sql-placeholder", "telegram-token", "dsn-password"],
 )
 def test_contract_detectors_flag_deliberate_violations(detector: Callable[[str], object], violation: str) -> None:
     assert detector(violation)

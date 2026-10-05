@@ -38,6 +38,7 @@ from typing import Any, Callable, Final, Mapping, Sequence
 import numpy as np
 import requests
 
+from prop_alpha.alerts.closing import save_scan_fixtures
 from prop_alpha.alerts.fx import BOOK_CURRENCY, SUPPORTED_CURRENCIES, ExchangeRate, bankroll_currency, book_to_bankroll
 from prop_alpha.alerts.fx import identity as fx_identity
 from prop_alpha.alerts.ledger import PlacedBetStore, combined_exposure
@@ -53,7 +54,7 @@ from prop_alpha.alerts.telegram import (
 )
 from prop_alpha.config import DEFAULT_DSN, DEFAULT_ENV_FILE, DSN_ENV
 from prop_alpha.ingestion import oddspapi, sportmonks
-from prop_alpha.ingestion.pipeline import QuotaExhaustedError
+from prop_alpha.ingestion.pipeline import QuotaExhaustedError, VendorError
 from prop_alpha.modeling.engine import FactorProjection, ProjectionError, QuantEngine
 from prop_alpha.modeling.league_level import SEASON_START_MONTH, SeasonTotals, season_of, season_rates
 from prop_alpha.scanner.market_scanner import (
@@ -96,6 +97,8 @@ MAX_ALERTS_ENV: Final[str] = "PROP_ALPHA_MAX_ALERTS"
 DEFAULT_MAX_ALERTS: Final[int] = 10
 MAX_LISTING_PAGES: Final[int] = 5
 STATE_DIR: Final[Path] = DEFAULT_ENV_FILE.parent / ".prop_alpha_state"
+# Exit code of a real-odds run that had no usable bookmaker prices (the summary and boards were still sent).
+ODDS_UNAVAILABLE_EXIT: Final[int] = 3
 BOOKMAKERS_ENV: Final[str] = "ODDS_BOOKMAKERS"
 DEFAULT_BOOKMAKERS: Final[tuple[str, ...]] = ("bet365", "skybet", "williamhill")
 ODDS_QUOTA_RESERVE: Final[int] = 20
@@ -104,6 +107,11 @@ QuoteSource = Callable[[UpcomingFixture, Mapping[ProjectionKey, FactorProjection
 BOARD_STATE_NAME: Final[str] = "fair_boards_sent.json"
 # Rows (player, market) per Telegram message, keeping each board message well under the 4,096-character limit.
 BOARD_ROWS_PER_MESSAGE: Final[int] = 25
+# Markets whose bookmaker quotes may be staked and alerted. Fouls fails PRD Gate 2 calibration on the selection
+# window (slope 0.79/0.84 v the required 0.9-1.1), so by maintainer decision (2026-10-05) it is priced (boards,
+# the Gate 2 lockbox) but never alerted or staked until it passes.
+ALERT_MARKETS: Final[frozenset[str]] = frozenset({"tackles"})
+UNCALIBRATED_TAG: Final[str] = "[UNCALIBRATED - do not bet]"
 BOARD_HEADER: Final[str] = (
     "FAIR-PRICE BOARD - no bookmaker line found for this match. Check any bookmaker yourself and bet a side "
     "only at or above its price. Valid until kickoff. Prices assume the bet is void if the player does not "
@@ -111,11 +119,15 @@ BOARD_HEADER: Final[str] = (
     "model is validated."
 )
 
+# The club's last complete matches: a club-match in which a player without a Sportmonks identity played
+# (incomplete_team_matches, migration 008) is skipped, because that player's start would be missing from it.
 TEAM_RECENT_SQL: Final[str] = """
     SELECT f.fixture_id
     FROM prop_alpha.fixtures f
     JOIN prop_alpha.teams t ON t.team_id IN (f.home_team_id, f.away_team_id)
     WHERE t.vendor_team_uid = %s AND f.status = 'final' AND f.kickoff_at < %s
+      AND NOT EXISTS (SELECT 1 FROM prop_alpha.incomplete_team_matches i
+                      WHERE i.fixture_id = f.fixture_id AND i.team_id = t.team_id)
     ORDER BY f.kickoff_at DESC
     LIMIT %s
 """
@@ -150,6 +162,8 @@ LEVEL_SQL: Final[str] = """
     JOIN prop_alpha.leagues l USING (league_id)
     WHERE l.name = %s AND f.kickoff_at < %s AND f.kickoff_at >= %s AND s.minutes_played > 0
       AND s.match_position IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM prop_alpha.incomplete_team_matches i
+                      WHERE i.fixture_id = s.fixture_id AND i.team_id = s.team_id)
     GROUP BY s.match_position, f.kickoff_at
 """
 LEVEL_SEASONS: Final[int] = 3
@@ -180,6 +194,9 @@ class ScanSummary:
     boards_sent: int = 0
     alert_cap: int | None = None
     bankroll: str = ""
+    # True when a real-odds run had no usable bookmaker prices (outage, quota reserve, every book failed): main()
+    # then exits ODDS_UNAVAILABLE_EXIT so the scheduled task records the run as failed.
+    odds_unavailable: bool = False
     failures: list[str] = field(default_factory=list)
     odds_notes: list[str] = field(default_factory=list)
 
@@ -201,6 +218,9 @@ class ScanSummary:
             if self.boards_sent:
                 lines.append(f"Fair-price boards sent (matches with no bookmaker line): {self.boards_sent}")
         lines += self.odds_notes
+        if self.fixtures:
+            lines.append(f"Alerted markets: {', '.join(sorted(ALERT_MARKETS))}; other markets are priced for "
+                         f"evaluation only (they fail Gate 2 calibration) and marked {UNCALIBRATED_TAG} on boards")
         lines += [f"Could not price {failure}" for failure in self.failures]
         lines.append(PAPER_LABEL)
         return "\n".join(lines)
@@ -343,7 +363,8 @@ def format_board(
         prices = " | ".join(f"{side.title()} >= {entry.min_odds:.2f}" for side, entry in listed)
         who = f"{player.name} ({team_names[player.team_uid]})"
         numbered.append((
-            f"{number}. {who} {key[1]} {key[2]:g}: {prices} (model: over {p_over:.0%})",
+            f"{number}. {who} {key[1]} {key[2]:g}: {prices} (model: over {p_over:.0%})"
+            + ("" if key[1] in ALERT_MARKETS else f" {UNCALIBRATED_TAG}"),
             AlertItem(number=number, kind="board", fixture_id=fixture.fixture_id, player_id=player.player_id,
                       market=key[1], line=key[2], min_odds=tuple((side, entry.min_odds) for side, entry in listed),
                       match=title, player=who),
@@ -412,8 +433,11 @@ def _requests_left(account: Any) -> int:
 def collect_odds(
     client: Any, fixtures: Sequence[UpcomingFixture], squads: Mapping[int, Sequence[SquadPlayer]],
     now: datetime, window_end: datetime, books: Sequence[str], state_dir: Path,
-) -> tuple[OddsCoverage, list[str]]:
-    """Real player-prop quotes for `fixtures` from OddsPapi, plus summary lines on coverage and quota."""
+) -> tuple[OddsCoverage, list[str], bool]:
+    """Real player-prop quotes for `fixtures` from OddsPapi, summary lines on coverage and quota, and whether real
+    odds were available: False when the quota reserve stopped the fetch or every bookmaker failed (a bookmaker that
+    reports no fixtures is not a failure). One failing bookmaker is recorded and skipped (handler H12); the others'
+    prices are kept (audit 2026-10-04: a William Hill 404 had discarded bet365's prices)."""
     empty = OddsCoverage((), 0, 0, (), ())
     cache = state_dir / "oddspapi"
     catalogue_file, names_file = cache / "line_markets.json", cache / "participants.json"
@@ -425,7 +449,7 @@ def collect_odds(
     needed = len(books) + (0 if catalogue_fresh else 1) + (0 if names_file.is_file() else 1)
     if left - needed < ODDS_QUOTA_RESERVE:
         return empty, [f"Odds NOT fetched: OddsPapi has {left} requests left; this run needs {needed} and "
-                       f"{ODDS_QUOTA_RESERVE} are kept in reserve"]
+                       f"{ODDS_QUOTA_RESERVE} are kept in reserve"], False
     if catalogue_fresh:
         catalogue = _load_catalogue(catalogue_file)
     else:
@@ -437,9 +461,16 @@ def collect_odds(
     window_start = (fixtures[0].kickoff_at if fixtures else now) - FIXTURE_KICKOFF_TOLERANCE
     prices: list[oddspapi.PropPrice] = []
     no_odds: list[str] = []
+    failed: dict[str, str] = {}
+    answered = 0
     for book in books:
-        body = client.get_json_value(oddspapi.odds_path(book, tournaments), empty_on=oddspapi.NO_FIXTURES_STATUS,
-                                     empty_marker=oddspapi.NO_FIXTURES_MESSAGE)
+        try:
+            body = client.get_json_value(oddspapi.odds_path(book, tournaments), empty_on=oddspapi.NO_FIXTURES_REPLIES)
+        except (requests.RequestException, VendorError) as exc:
+            failed[book] = f"{type(exc).__name__}: {exc}"
+            logger.error("odds: %s failed: %s", book, failed[book])
+            continue
+        answered += 1
         if body is None:
             no_odds.append(book)
             continue
@@ -462,6 +493,8 @@ def collect_odds(
     ]
     if no_odds:
         notes.append(f"No odds for these leagues from: {', '.join(no_odds)}")
+    for book, error in failed.items():
+        notes.append(f"Odds FAILED from {book}, its prices left out: {error}")
     if coverage.unmatched_fixtures:
         notes.append(f"Odds for matches we could not match: {'; '.join(coverage.unmatched_fixtures)}")
     if coverage.unmatched_players:
@@ -469,7 +502,7 @@ def collect_odds(
                      f"(e.g. {'; '.join(coverage.unmatched_players[:3])})")
     for name in coverage.unmatched_players:
         logger.info("odds: unmatched player %s", name)
-    return coverage, notes
+    return coverage, notes, answered > 0 or not failed
 
 
 def run_scan(
@@ -513,22 +546,31 @@ def run_scan(
             raise ValueError("--odds oddspapi needs an OddsPapi client")
         squads = {fixture.fixture_id: inputs.squad for fixture, inputs in slate}
         try:
-            coverage, summary.odds_notes = collect_odds(odds_client, fixtures, squads, now, end, books, state_dir)
+            coverage, summary.odds_notes, available = collect_odds(odds_client, fixtures, squads, now, end, books,
+                                                                   state_dir)
+            summary.odds_unavailable = not available
+            # Closing-price capture (alerts/closing.py) asks only the bookmakers that returned fixtures here.
+            answered = [book for book in books
+                        if (state_dir / "odds_archive" / f"{now:%Y%m%dT%H%M%SZ}_{book}.json.gz").is_file()]
+            save_scan_fixtures(state_dir, fixtures, answered, now)
         except (requests.RequestException, QuotaExhaustedError, ValueError) as exc:
             # An odds outage must show up in the chat, not silence the run: the summary still goes out.
             summary.odds_notes = [f"Odds unavailable this run, nothing priced: {type(exc).__name__}: {exc}"]
+            summary.odds_unavailable = True
             logger.error("scan: odds unavailable: %s: %s", type(exc).__name__, exc)
             coverage = OddsCoverage((), 0, 0, (), ())
         real_quotes = coverage.quotes
 
         def quotes_for(fixture: UpcomingFixture, projections: Mapping[ProjectionKey, FactorProjection]) -> list[LiveOddsQuote]:
-            return in_bankroll_currency([quote for quote in real_quotes if quote.fixture_id == fixture.fixture_id], rate)
+            return in_bankroll_currency([quote for quote in real_quotes if quote.fixture_id == fixture.fixture_id
+                                         and quote.market_type in ALERT_MARKETS], rate)
     elif odds == "mock":
         seed = int.from_bytes(hashlib.sha256(start.isoformat().encode("utf-8")).digest()[:8], "big")
         rng = np.random.default_rng(seed)
 
         def quotes_for(fixture: UpcomingFixture, projections: Mapping[ProjectionKey, FactorProjection]) -> list[LiveOddsQuote]:
-            return in_bankroll_currency(mock_quotes(projections, now, rng), rate)
+            return in_bankroll_currency([quote for quote in mock_quotes(projections, now, rng)
+                                         if quote.market_type in ALERT_MARKETS], rate)
     else:
         raise ValueError(f"unknown odds source {odds!r}")
     manager = InstitutionalAssetManager(bankroll, model_risk_loss_floor=MODEL_RISK_LOSS_FLOOR)
@@ -602,6 +644,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(text)
     if notifier is not None:
         print(f"summary sent (message_id {notifier.send_message(text)})")
+    if real and summary.odds_unavailable:
+        logger.error("scan finished without real odds; exiting %d", ODDS_UNAVAILABLE_EXIT)
+        return ODDS_UNAVAILABLE_EXIT
     return 0
 
 

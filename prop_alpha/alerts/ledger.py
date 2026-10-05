@@ -33,12 +33,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
 
+from prop_alpha.alerts.closing import load_closing_quotes
 from prop_alpha.alerts.fx import BOOK_CURRENCY, CURRENCY_SYMBOLS, ExchangeRate, bankroll_currency, cached_rate, is_fresh
 from prop_alpha.alerts.replies import (
     RESULTS,
     SETTLEMENT_COLUMNS,
     SETTLEMENT_SOURCES,
     AlertItem,
+    ClosingValue,
     PlaceCommand,
     PlacedBet,
     ReplyError,
@@ -60,6 +62,7 @@ from prop_alpha.alerts.telegram import (
     load_config,
 )
 from prop_alpha.config import DEFAULT_DSN, DSN_ENV
+from prop_alpha.evaluation.backtest import closing_line_value
 from prop_alpha.scanner.market_scanner import ExposureBook, ProjectionKey
 
 logger = logging.getLogger("prop_alpha.ledger")
@@ -395,8 +398,30 @@ def settle(store: PlacedBetStore, dsn: str, now: datetime) -> list[tuple[PlacedB
     return settled
 
 
-def results_summary(settled: Sequence[tuple[PlacedBet, Settlement]]) -> str:
-    """Count, stakes, profit and return on stake of the settled bets."""
+def closing_values(settled: Sequence[tuple[PlacedBet, Settlement]],
+                   quotes: Sequence[Mapping[str, Any]]) -> dict[int, ClosingValue]:
+    values = {bet.bet_id: closing_value(bet, quotes) for bet, _ in settled}
+    return {bet_id: value for bet_id, value in values.items() if value is not None}
+
+
+def closing_value(bet: PlacedBet, quotes: Sequence[Mapping[str, Any]]) -> ClosingValue | None:
+    """Pure: the bet's closing-line value from the captured closing quotes (alerts/closing.py) for its fixture,
+    player, market and line, preferring the book it was placed with, then the latest capture. None when no two-way
+    closing price was captured (CLV needs both sides to devig)."""
+    candidates = [q for q in quotes
+                  if (q["fixture_id"], q["player_id"], q["market"], float(q["line"]))
+                  == (bet.fixture_id, bet.player_id, bet.market, bet.line)
+                  and q["over"] is not None and q["under"] is not None]
+    if not candidates:
+        return None
+    quote = max(candidates, key=lambda q: (str(q["book"]).lower() == bet.book.lower(), str(q["captured_at"])))
+    taken, other = (quote["over"], quote["under"]) if bet.side == "over" else (quote["under"], quote["over"])
+    return ClosingValue(closing_line_value(bet.odds, float(taken), float(other)), float(taken), str(quote["book"]))
+
+
+def results_summary(settled: Sequence[tuple[PlacedBet, Settlement]],
+                    closing: Mapping[int, ClosingValue] | None = None) -> str:
+    """Count, stakes, profit and return on stake of the settled bets, and their mean closing-line value."""
     staked = sum(bet.stake for bet, _ in settled)
     total = sum(profit(bet, settlement) for bet, settlement in settled)
     by_result = {result: sum(1 for _, s in settled if s.result == result) for result in RESULTS}
@@ -404,8 +429,11 @@ def results_summary(settled: Sequence[tuple[PlacedBet, Settlement]]) -> str:
     provisional = sum(1 for _, s in settled if s.source == "auto")
     caveat = (f"; {provisional} provisional (automatic, assumed market rules; not validated results)"
               if provisional else "")
+    values = [closing[bet.bet_id].clv for bet, _ in settled if closing and bet.bet_id in closing]
+    clv = (f"; mean CLV {sum(values) / len(values):+.1%} over {len(values)} bet(s) with a closing price" if values
+           else "; no closing price captured yet")
     return (f"{len(settled)} settled bet(s) ({by_result['won']} won, {by_result['lost']} lost, {by_result['void']} "
-            f"void): staked {staked:.2f}, profit {total:+.2f}{roi}{caveat}")
+            f"void): staked {staked:.2f}, profit {total:+.2f}{roi}{caveat}{clv}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -428,18 +456,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                   f"{bet.line:g} {bet.market} @ {bet.odds:.2f} stake {bet.stake:g} ({bet.book}){flag}")
         print(f"{len(open_bets)} open bet(s), total stake {sum(b.stake for b in open_bets):g}")
         settled = store.settled_bets()
+        closing = closing_values(settled, load_closing_quotes(STATE_DIR))
         for bet, settlement in settled:
-            print(settlement_text(bet, settlement))
-        print(results_summary(settled))
+            print(settlement_text(bet, settlement, closing.get(bet.bet_id)))
+        print(results_summary(settled, closing))
         return 0
     if args.settle:
         settled = settle(store, os.environ.get(DSN_ENV, DEFAULT_DSN), now)
-        lines = [settlement_text(bet, settlement) for bet, settlement in settled]
+        closing = closing_values(settled, load_closing_quotes(STATE_DIR))
+        lines = [settlement_text(bet, settlement, closing.get(bet.bet_id)) for bet, settlement in settled]
         print("\n".join(lines) if lines else "no open bet has a final match in the database")
         if args.send and lines:
             TelegramNotifier(load_config()).send_message("\n".join(
                 ["BETS SETTLED (reply settled <bet id> won|lost|void to correct one)", *lines,
-                 results_summary(store.settled_bets())]))
+                 results_summary(store.settled_bets(), closing_values(store.settled_bets(),
+                                                                     load_closing_quotes(STATE_DIR)))]))
         return 0
     currency = bankroll_currency()
     rate = None if currency == BOOK_CURRENCY else cached_rate()

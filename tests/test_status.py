@@ -26,6 +26,7 @@ def test_report_states_database_alerts_trial_and_paper_label(tmp_path: Path, mon
     report = status.build_report(NOW, "postgresql://unused", store)
     assert "Database: 120 fixtures (110 final), 4300 player rows" in report
     assert "Last merge: 2026-10-03 06:00 UTC" in report
+    assert "Incomplete club-matches (a player without an ID played; left out of pricing): 0" in report
     assert "Alerts in the last 4h: 1; open alerted exposure: 200.00" in report
     assert "Sportmonks trial: 13 days left" in report
     assert report.endswith(PAPER_LABEL) and "WARNING" not in report

@@ -36,6 +36,7 @@ DEFAULT_WORKERS: Final[int] = 4
 
 LATEST_FINAL_SQL: Final[str] = "SELECT max(kickoff_at) FROM prop_alpha.fixtures WHERE status = 'final'"
 # Final fixtures from a day before the listing window starts (kickoff dates are listed in UTC).
+REFRESH_INCOMPLETE_SQL: Final[str] = "SELECT prop_alpha.refresh_incomplete_team_matches(%s)"
 STORED_FINAL_SQL: Final[str] = """
     SELECT vendor_fixture_uid FROM prop_alpha.fixtures
     WHERE status = 'final' AND kickoff_at >= %s - %s - interval '1 day'
@@ -51,6 +52,7 @@ class ResultsReport:
     ingested: int = 0
     failed: dict[str, str] = field(default_factory=dict)
     rejected_rows: int = 0
+    incomplete: int = 0
 
     @property
     def ok(self) -> bool:
@@ -63,6 +65,8 @@ class ResultsReport:
             line += f", {len(self.failed)} FAILED ({', '.join(sorted(self.failed))})"
         if self.rejected_rows:
             line += f", {self.rejected_rows} rows REJECTED (see staging_rejects)"
+        if self.incomplete:
+            line += f"; {self.incomplete} club-matches in the window have a player without an ID (left out of pricing)"
         return line
 
 
@@ -124,6 +128,22 @@ def ingest(client: Any, dsn: str, fixture_uids: Sequence[str], workers: int) -> 
         pool.closeall()
 
 
+def refresh_incomplete(dsn: str, since: date) -> int:
+    """Recompute incomplete_team_matches (migration 008) for fixtures from `since`, in one short transaction; returns
+    the rows written. Run after every ingest, so newly loaded matches with an unidentified player are quarantined
+    before the next scan prices from them."""
+    import psycopg2
+
+    conn = psycopg2.connect(dsn, options="-c statement_timeout=60000", connect_timeout=10)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(REFRESH_INCOMPLETE_SQL, (datetime(since.year, since.month, since.day, tzinfo=timezone.utc),))
+                return int(cur.fetchone()[0])
+    finally:
+        conn.close()
+
+
 def run(now: datetime, client: Any, dsn: str, *, dry_run: bool = False, workers: int = DEFAULT_WORKERS) -> ResultsReport:
     latest, stored = read_stored(dsn)
     start, end = listing_window(latest, now)
@@ -132,6 +152,7 @@ def run(now: datetime, client: Any, dsn: str, *, dry_run: bool = False, workers:
     if dry_run or not report.missing:
         return report
     slate = ingest(client, dsn, report.missing, workers)
+    report.incomplete = refresh_incomplete(dsn, start - timedelta(days=1))
     report.failed = {str(uid): str(error) for uid, error in slate.failed.items()}
     report.failed.update({str(uid): "timed out" for uid in slate.timed_out})
     if slate.merge_error:

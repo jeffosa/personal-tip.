@@ -106,4 +106,23 @@ SELECT pg_temp.expect(pg_temp.match_position_of('f00', 'p1') = 'GK', 'the old ma
 SELECT pg_temp.expect(pg_temp.match_position_of('f2', 'p1') = 'DM', 'a re-ingested match keeps its own position');
 SELECT pg_temp.expect(pg_temp.match_position_of('f3', 'p1') = 'AM', 'the latest match keeps its own position');
 
+-- 6. A club-match in which a player without an identity played is recorded (migration 008): a starter with no
+-- player_id counts, a substitute with no player_id who did not play does not, and an identified row never counts.
+INSERT INTO prop_alpha.raw_payloads (source, vendor_fixture_uid, payload, payload_sha256)
+VALUES ('ci', 'f3', jsonb_build_object('vendor_response', jsonb_build_object('lineups', jsonb_build_array(
+        jsonb_build_object('team_id', 'tB', 'type_id', 11, 'player_id', NULL, 'player_name', 'No Id Starter'),
+        jsonb_build_object('team_id', 'tC', 'type_id', 12, 'player_id', NULL, 'player_name', 'Unused Sub',
+                           'details', jsonb_build_array(jsonb_build_object(
+                               'type', jsonb_build_object('developer_name', 'MINUTES_PLAYED'),
+                               'data', jsonb_build_object('value', 0)))),
+        jsonb_build_object('team_id', 'tC', 'type_id', 11, 'player_id', 99, 'player_name', 'Known')))),
+        repeat('a', 64));
+SELECT pg_temp.expect(prop_alpha.refresh_incomplete_team_matches() = 1, 'one incomplete club-match is found');
+SELECT pg_temp.expect(
+    (SELECT t.vendor_team_uid FROM prop_alpha.incomplete_team_matches i JOIN prop_alpha.teams t USING (team_id)) = 'tB',
+    'the club with the unidentified starter is the one recorded'
+);
+SELECT pg_temp.expect(prop_alpha.refresh_incomplete_team_matches() = 1, 'refreshing again rewrites the same row');
+SELECT pg_temp.expect((SELECT count(*) FROM prop_alpha.incomplete_team_matches) = 1, 'no duplicate after refresh');
+
 ROLLBACK;

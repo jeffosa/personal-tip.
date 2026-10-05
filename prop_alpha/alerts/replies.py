@@ -300,9 +300,21 @@ def grade(bet: PlacedBet, fixture_status: str, minutes: int | None, count: int |
     return Settlement(bet.bet_id, result, "auto", detail, settled_at, count, minutes)
 
 
-def settlement_text(bet: PlacedBet, settlement: Settlement) -> str:
+@dataclass(frozen=True)
+class ClosingValue:
+    """Closing-line value of one bet (PRD Gate 3): CLV = odds taken x devigged closing probability of the side - 1,
+    from `book`'s two-way closing price, which may differ from the book the bet was placed with."""
+
+    clv: float
+    closing_price: float
+    book: str
+
+
+def settlement_text(bet: PlacedBet, settlement: Settlement, closing: ClosingValue | None = None) -> str:
     """One line for the chat or the ledger listing."""
     # Automatic results rest on assumed market rules until a bookmaker's settlement confirms them (audit 2026-10-04).
     outcome = settlement.result.upper() + (" (provisional)" if settlement.source == "auto" else "")
+    clv = ("" if closing is None else
+           f" | close {closing.closing_price:.2f} at {closing.book}, CLV {closing.clv:+.1%}")
     return (f"#{bet.bet_id} {outcome} {profit(bet, settlement):+.2f}: {bet.player}, {bet.side.upper()} {bet.line:g} "
-            f"{bet.market} @ {bet.odds:.2f}, stake {bet.stake:g} ({bet.match}) - {settlement.detail}")
+            f"{bet.market} @ {bet.odds:.2f}, stake {bet.stake:g} ({bet.match}){clv} - {settlement.detail}")
