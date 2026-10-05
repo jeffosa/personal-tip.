@@ -137,7 +137,11 @@ Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not e
   4. abandoned or postponed matches;
   5. how a whole-number line settles.
 
-  Then reconcile real settled examples against `alerts/ledger.py --list`.
+  Then reconcile real settled examples with `python -m prop_alpha.alerts.ledger --reconcile` (built 2026-10-05,
+  [T]). It compares every `settled` reply with what automatic settlement gives from the stored statistics. Each bet
+  is reported as AGREE, DISCREPANCY (the command exits 1), NOT CHECKED (match not final or no stored row) or
+  UNCONFIRMED (an automatic result with no reply yet). A reply that changed a recorded automatic result is counted as
+  an override. On the real ledger on 2026-10-05: no bet recorded yet, so "nothing verified yet".
 - **PRD Gate 3, criterion 4:** 100% of paper bets must reconcile to the realised outcome and the book's void rule
   with **no manual overrides**. A `settled` reply that disagrees with the automatic result is therefore a recorded
   discrepancy to investigate, not a pass.
@@ -156,6 +160,39 @@ Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not e
   - The PRD also requires per-player `bench_sub_probability` before Gate 3 results are accepted **[N]**.
 - **Keep the lockbox intact** while collecting this evidence. Paper bets must come from the frozen model.
 
+## Second pass (later on 2026-10-05)
+
+- **Release gate on GitHub:** the first run failed in stage 5. Two causes: a test read the maintainer's `.env`, and
+  pyright checked 3.14 stdlib files as 3.12. Fixed in 13add6f. Whether the next GitHub run is green has not been
+  seen **[U]**: `gh` is not installed here.
+- **Alert and bet-reply delivery:** ten gaps closed, each pinned by a test in `tests/test_delivery_gaps.py` that
+  fails on the earlier code. Seven are in 355b47f: answers re-sent after a failed send, replies to unconfirmed
+  alerts, edited replies, repeated replies, the 24-hour unread limit, messages over 4,096 characters, and repeated
+  board parts. Three are in a97234b:
+  - a message is indexed for replies before its delivery is confirmed;
+  - an OS lock stops two ledger writers recording one reply twice;
+  - `scan --at` is refused with real odds.
+- **Third delivery pass (afternoon 2026-10-05):**
+  - The BETS SETTLED message is now queued before it is sent. Before, a failed send was lost for good, because the
+    next run finds nothing new to settle; the next ledger poll now re-sends it. Pinned by 3 tests in
+    `tests/test_delivery_gaps.py` that fail on the earlier code.
+  - **Open, needs a scheduler decision:** since about 10:51 BST every scheduled run has been killed with exit code
+    0xC000013A (console closed or Ctrl+C) before it wrote a log line. No scan, status report or ledger poll has run
+    since then, and nothing reported it: `task_health` runs inside the killed script, and is not wired in yet. By
+    hand the ledger script completes in 7.5 s with exit 0.
+- **Gate 1 criterion 7 (lineups):** passes on 50 archived line-ups (f55bb65): 50/50 succeeded, 0 problems in 2,574
+  rows. These are post-match line-ups as Sportmonks recorded them, not team sheets captured 60 minutes before
+  kickoff, so the live pre-kickoff path is **[U]**.
+- **Unknown positions (migration 009):** a missing Sportmonks `position_id` had been stored as the position 'PNone'.
+  It is now stored as NULL. 009 was applied to the working database after a backup: 14 match rows and 3 players were
+  repaired. The pricing code and its frozen digest are unchanged, and 009 was applied before the first lockbox
+  kickoff.
+- **Built, not yet scheduled [U]:**
+  - `alerts/task_health.py`: Telegram alerts for failing scheduled tasks, plus a cross-check for a task that stops
+    running.
+  - `scripts/backup.py`: a verified `pg_dump` plus the ledger and alert state files, keeping the newest 14. First
+    run 2026-10-05.
+
 ## Decisions needed from the maintainer
 
 1. **Formally approve the sanctioned handlers:** H12 as widened to `ValueError` here, and H6 and H8–H11, which are
@@ -163,11 +200,21 @@ Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not e
 2. **Sportmonks after 2026-10-16:** subscribe, or name the replacement. Results, settlement and lockbox scoring stop
    without it.
 3. **Gate 2 scope:** build card markets, or formally scope Gate 2 to tackles (and fouls).
-4. **Exposure of alerts that were never delivered:**
+4. **Gate 2 bin criterion:** keep the PRD's fixed 0.03 bin gap, or adopt the proposed max(0.03, 2.5 × SE) per bin
+   plus a Spiegelhalter test. This must be fixed before any lockbox result is scored.
+5. **Exposure of alerts that were never delivered:**
    - Every alerted stake counts as open exposure for 4 days, whether or not the message arrived. This is
      conservative and unchanged.
    - Releasing the stake of a delivery the operator dismisses would change staking, so it was not done without a
      decision (AGENT.md A7).
+6. **Scheduling the failure alerts and backups:** approve adding `task_health` to the two `.cmd` scripts and a daily
+   backup task. Choose an off-machine backup folder (`PROP_ALPHA_BACKUP_DIR`); the default folder is on the same
+   disk.
+7. **Both tasks stopped:** nothing on this machine can detect that the machine is off, asleep or logged out. An
+   outside "dead man's switch" monitor would be a new external service.
+8. **Bogus player row 954** (`vendor_player_uid` 'None', created before 2026-10-04): repair or leave it. Its 3 rows
+   with minutes are quarantined, and no price has used it.
+9. **Merge the branch** into main by PR.
 
 ## Verification (2026-10-05)
 

@@ -155,7 +155,8 @@ def poll_section(heartbeat_file: Path, outbox: AnswerOutbox, now: datetime) -> l
     abandoned = outbox.abandoned()
     if abandoned:
         lines.append(f"WARNING: {len(abandoned)} answer(s) to your bet replies failed {MAX_ANSWER_ATTEMPTS} sends "
-                     "and were not delivered: python -m prop_alpha.alerts.ledger --list shows them")
+                     "and were not delivered (settlement notices included): python -m prop_alpha.alerts.ledger --list "
+                     "shows them")
     return lines
 
 

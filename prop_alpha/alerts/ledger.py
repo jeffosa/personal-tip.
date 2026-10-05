@@ -86,6 +86,9 @@ DEFAULT_LOCK_FILE: Final[Path] = STATE_DIR / "ledger.lock"
 # An answer that failed this many sends is left for the status report instead of being retried for ever.
 MAX_ANSWER_ATTEMPTS: Final[int] = 3
 DELAYED_PREFIX: Final[str] = "(Delayed answer - this was not delivered when you sent your reply.) "
+# A queued notice that answers no message (the BETS SETTLED message of --settle --send), re-sent by the next poll.
+DELAYED_NOTICE_PREFIX: Final[str] = "(Delayed - this message failed to send earlier.) "
+SETTLED_HEADER: Final[str] = "BETS SETTLED (reply settled <bet id> won|lost|void to correct one)"
 EDIT_NOTICE: Final[str] = (
     "Edits are not applied. If the original reply recorded a bet, send undo <bet id>, then send the corrected reply "
     "as a new reply to the alert."
@@ -288,14 +291,15 @@ class AnswerOutbox:
             if not (isinstance(record, dict) and isinstance(record.get("answer_id"), int)
                     and record.get("event") in ("pending", "attempt", "sent")):
                 raise ValueError(f"{self.path.name} line {number} is not an answer event")
-            if record["event"] == "pending" and not (isinstance(record.get("reply_to"), int)
+            reply_to: Any = record.get("reply_to")
+            if record["event"] == "pending" and not ((reply_to is None or isinstance(reply_to, int))
                                                      and isinstance(record.get("text"), str)):
                 raise ValueError(f"{self.path.name} line {number}: a pending answer needs reply_to and text")
             events.append(record)
         return events
 
-    def queue(self, reply_to: int, text: str, at: datetime) -> int:
-        """Queue one answer; returns its id."""
+    def queue(self, reply_to: int | None, text: str, at: datetime) -> int:
+        """Queue one answer (reply_to None: a notice that answers no message, such as BETS SETTLED); returns its id."""
         answer_id = max((event["answer_id"] for event in self._events()), default=0) + 1
         self._append({"answer_id": answer_id, "event": "pending", "reply_to": reply_to, "text": text,
                       "at": at.isoformat()})
@@ -307,14 +311,16 @@ class AnswerOutbox:
     def mark_sent(self, answer_id: int, message_id: int, at: datetime) -> None:
         self._append({"answer_id": answer_id, "event": "sent", "message_id": message_id, "at": at.isoformat()})
 
-    def unsent(self) -> list[tuple[int, int, str, int]]:
-        """(answer id, message it answers, text, send attempts so far) of every answer not yet sent, oldest first."""
-        pending: dict[int, tuple[int, str]] = {}
+    def unsent(self) -> list[tuple[int, int | None, str, int]]:
+        """(answer id, message it answers or None, text, send attempts so far) of every answer not yet sent, oldest
+        first."""
+        pending: dict[int, tuple[int | None, str]] = {}
         attempts: dict[int, int] = defaultdict(int)
         sent: set[int] = set()
         for event in self._events():
             if event["event"] == "pending":
-                pending[event["answer_id"]] = (int(event["reply_to"]), str(event["text"]))
+                raw_reply_to: Any = event.get("reply_to")
+                pending[event["answer_id"]] = (None if raw_reply_to is None else int(raw_reply_to), str(event["text"]))
             elif event["event"] == "attempt":
                 attempts[event["answer_id"]] += 1
             else:
@@ -322,7 +328,7 @@ class AnswerOutbox:
         return [(answer_id, reply_to, text, attempts[answer_id])
                 for answer_id, (reply_to, text) in sorted(pending.items()) if answer_id not in sent]
 
-    def abandoned(self) -> list[tuple[int, int, str, int]]:
+    def abandoned(self) -> list[tuple[int, int | None, str, int]]:
         """Unsent answers that reached MAX_ANSWER_ATTEMPTS: reported, no longer retried."""
         return [entry for entry in self.unsent() if entry[3] >= MAX_ANSWER_ATTEMPTS]
 
@@ -515,7 +521,7 @@ def poll(
     if heartbeat_file is not None:
         heartbeat_file.parent.mkdir(parents=True, exist_ok=True)
         heartbeat_file.write_text(json.dumps({"at": now.isoformat()}), encoding="utf-8")
-    retries = [(answer_id, reply_to, DELAYED_PREFIX + text)
+    retries = [(answer_id, reply_to, (DELAYED_PREFIX if reply_to is not None else DELAYED_NOTICE_PREFIX) + text)
                for answer_id, reply_to, text, attempts in earlier if attempts < MAX_ANSWER_ATTEMPTS]
     for answer_id, reply_to, text in [*queued, *retries]:
         if outbox is not None:
@@ -524,6 +530,19 @@ def poll(
         if outbox is not None:
             outbox.mark_sent(answer_id, message_id, now)
     return len(queued) + len(retries)
+
+
+def send_queued_notice(notifier: TelegramNotifier, outbox: AnswerOutbox, text: str, at: datetime) -> int:
+    """Queue a notice that answers no message, then send it; returns Telegram's message id. Delivery audit 2026-10-05
+    (third pass): --settle --send recorded each settlement and only then sent BETS SETTLED. A failed send was never
+    repeated, because the next run finds nothing new to settle, so the maintainer never saw those automatic results
+    to check against the bookmaker. Queued first, a failed notice is re-sent by the next poll (DELAYED_NOTICE_PREFIX)
+    up to MAX_ANSWER_ATTEMPTS, then reported by the status report and --list."""
+    answer_id = outbox.queue(None, text, at)
+    outbox.attempt(answer_id, at)
+    message_id = notifier.send_message(text)
+    outbox.mark_sent(answer_id, message_id, at)
+    return message_id
 
 
 def settle_open_bets(
@@ -694,19 +713,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(settlement_text(bet, settlement, closing.get(bet.bet_id)))
         print(results_summary(settled, closing))
         for answer_id, reply_to, text, attempts in AnswerOutbox().abandoned():
-            print(f"UNDELIVERED answer #{answer_id} to your message {reply_to} ({attempts} failed sends): {text}")
+            target = f"to your message {reply_to}" if reply_to is not None else "(a notice)"
+            print(f"UNDELIVERED answer #{answer_id} {target} ({attempts} failed sends): {text}")
         return 0
     if args.settle:
         with ledger_lock():
             settled = settle(store, os.environ.get(DSN_ENV, DEFAULT_DSN), now)
-        closing = closing_values(settled, load_closing_quotes(STATE_DIR))
-        lines = [settlement_text(bet, settlement, closing.get(bet.bet_id)) for bet, settlement in settled]
-        print("\n".join(lines) if lines else "no open bet has a final match in the database")
-        if args.send and lines:
-            TelegramNotifier(load_config()).send_message("\n".join(
-                ["BETS SETTLED (reply settled <bet id> won|lost|void to correct one)", *lines,
-                 results_summary(store.settled_bets(), closing_values(store.settled_bets(),
-                                                                     load_closing_quotes(STATE_DIR)))]))
+            closing = closing_values(settled, load_closing_quotes(STATE_DIR))
+            lines = [settlement_text(bet, settlement, closing.get(bet.bet_id)) for bet, settlement in settled]
+            print("\n".join(lines) if lines else "no open bet has a final match in the database")
+            if args.send and lines:
+                notice = "\n".join(
+                    [SETTLED_HEADER, *lines,
+                     results_summary(store.settled_bets(), closing_values(store.settled_bets(),
+                                                                         load_closing_quotes(STATE_DIR)))])
+                send_queued_notice(TelegramNotifier(load_config()), AnswerOutbox(), notice, now)
         return 0
     if args.reconcile:
         items = reconcile_settlements(store, os.environ.get(DSN_ENV, DEFAULT_DSN), now)

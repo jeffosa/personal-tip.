@@ -232,3 +232,49 @@ def test_a_simulated_run_time_is_refused_with_real_odds(capsys: pytest.CaptureFi
     with pytest.raises(SystemExit) as refused:
         scan.main(["--odds", "oddspapi", "--at", "2026-10-10T12:00:00+00:00"])
     assert refused.value.code == 2 and "works only with --odds mock" in capsys.readouterr().err
+
+
+# ---------------- third pass: a settlement notice lost after the bets were settled ----------------
+def test_a_settlement_notice_that_failed_to_send_is_queued_and_resent_by_the_next_poll(tmp_path: Path) -> None:
+    """--settle --send records each settlement, then sends BETS SETTLED. Before this, a failed send was never repeated:
+    the next run finds nothing new to settle, so the maintainer never saw those automatic results to check."""
+    from prop_alpha.alerts.ledger import DELAYED_NOTICE_PREFIX, SETTLED_HEADER, send_queued_notice
+
+    index, store, offset_file, outbox = _state(tmp_path)
+    flaky = _FlakyTelegram([], failures=1)
+    notice = f"{SETTLED_HEADER}\n#1 WON (provisional) +5.25: A Player"
+    with pytest.raises(TelegramError):
+        send_queued_notice(flaky, outbox, notice, NOW)
+    assert [(reply_to, text, attempts) for _, reply_to, text, attempts in outbox.unsent()] == [(None, notice, 1)]
+    assert poll(flaky, index, store, offset_file, NOW, outbox=outbox) == 1
+    assert flaky.sent == [(DELAYED_NOTICE_PREFIX + notice, None)]  # a notice, not a reply to any message
+    assert outbox.unsent() == []
+    assert send_queued_notice(flaky, outbox, notice, NOW) > 0 and outbox.unsent() == []  # sent at once: nothing queued
+
+
+def test_a_settlement_notice_telegram_keeps_refusing_is_reported_not_retried_forever(tmp_path: Path) -> None:
+    from prop_alpha.alerts.ledger import send_queued_notice
+
+    index, store, offset_file, outbox = _state(tmp_path)
+    flaky = _FlakyTelegram([], failures=MAX_ANSWER_ATTEMPTS)
+    with pytest.raises(TelegramError):
+        send_queued_notice(flaky, outbox, "BETS SETTLED\n#1 LOST", NOW)
+    for _ in range(MAX_ANSWER_ATTEMPTS - 1):
+        with pytest.raises(TelegramError):
+            poll(flaky, index, store, offset_file, NOW, outbox=outbox)
+    assert poll(flaky, index, store, offset_file, NOW, outbox=outbox) == 0 and flaky.sent == []
+    [(_, reply_to, _, attempts)] = outbox.abandoned()
+    assert reply_to is None and attempts == MAX_ANSWER_ATTEMPTS
+    heartbeat = tmp_path / "beat.json"
+    heartbeat.write_text(json.dumps({"at": NOW.isoformat()}), encoding="utf-8")
+    assert any("settlement notices included" in line for line in status.poll_section(heartbeat, outbox, NOW))
+
+
+def test_the_settle_command_queues_its_notice_before_sending() -> None:
+    import inspect
+
+    from prop_alpha.alerts import ledger
+
+    source = inspect.getsource(ledger.main)
+    settle_branch = source[source.index("if args.settle:"):source.index("if args.reconcile:")]
+    assert "send_queued_notice(" in settle_branch and ".send_message(" not in settle_branch
