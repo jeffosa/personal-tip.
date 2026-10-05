@@ -1,0 +1,156 @@
+"""Daily backup of the working database and the state files (maintainer task 4, 2026-10-05).
+
+    python scripts/backup.py                    # into PROP_ALPHA_BACKUP_DIR, default .prop_alpha_state/backups/daily
+    python scripts/backup.py --keep 14          # keep the newest 14 backups (default)
+
+Each run makes one folder `prop_alpha_<UTC stamp>/` holding:
+- `prop_alpha.dump`: `pg_dump -Fc` of the working `prop_alpha` database (read-only for the database), checked with
+  `pg_restore --list`, which must list the table data of every table in REQUIRED_TABLES;
+- `state/`: a copy of every file in STATE_FILES that exists, above all `placed_bets.jsonl`, the only record of the bets
+  placed by hand; each copy is re-read and compared by SHA-256 with its source;
+- `manifest.json`: sizes and SHA-256 of everything above, written last, so a folder without a manifest is incomplete.
+
+A run that fails any check exits 1 and leaves its folder named `*.incomplete`; pruning removes only complete backup
+folders (never anything else in the directory), oldest first, and never the one just made.
+
+The default folder is on this machine's disk: it protects against a bad migration or a corrupt file, not against
+losing the disk. Point PROP_ALPHA_BACKUP_DIR at a synced folder (e.g. Google Drive) for an off-machine copy.
+The password comes from pgpass (never from this script, its arguments or the repository).
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Final, Sequence
+
+ROOT: Final[Path] = Path(__file__).resolve().parents[1]
+STATE_DIR: Final[Path] = ROOT / ".prop_alpha_state"
+BACKUP_DIR_ENV: Final[str] = "PROP_ALPHA_BACKUP_DIR"
+DEFAULT_BACKUP_DIR: Final[Path] = STATE_DIR / "backups" / "daily"
+DEFAULT_KEEP: Final[int] = 14
+SOURCE_DB: Final[str] = "prop_alpha"
+PG_BIN: Final[Path] = Path(r"C:\Program Files\PostgreSQL\18\bin")
+# The ledger and alert state: losing any of these loses bets, exposure or the reply-to-bet mapping.
+STATE_FILES: Final[tuple[str, ...]] = (
+    "placed_bets.jsonl", "sent_alerts.jsonl", "alert_messages.jsonl", "alert_deliveries.jsonl", "ledger_answers.jsonl",
+    "telegram_offset.json", "ledger_last_poll.json", "closing_quotes.jsonl", "closing_captured.json",
+    "scan_fixtures.json", "fair_boards_sent.json", "task_health.json", "fx_rate.json",
+)
+# Folders copied whole: the raw bookmaker responses are the evidence for closing-line analysis (PRD Gate 3).
+STATE_DIRS: Final[tuple[str, ...]] = ("odds_archive",)
+REQUIRED_TABLES: Final[tuple[str, ...]] = (
+    "fixtures", "player_match_stats", "players", "teams", "leagues", "raw_payloads", "incomplete_team_matches",
+)
+BACKUP_NAME: Final[re.Pattern[str]] = re.compile(r"^prop_alpha_\d{8}T\d{6}Z$")
+Runner = Callable[[Sequence[str]], str]
+
+
+def run(command: Sequence[str]) -> str:
+    """Run a PostgreSQL client tool; a non-zero exit raises (CalledProcessError) with its stderr."""
+    return subprocess.run(list(command), check=True, capture_output=True, text=True).stdout
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def dump_commands(target: Path) -> tuple[list[str], list[str]]:
+    """The pg_dump and pg_restore --list commands; -w never prompts, so a missing pgpass entry fails instead."""
+    return ([str(PG_BIN / "pg_dump"), "-w", "-h", "localhost", "-U", "postgres", "-d", SOURCE_DB, "-Fc", "-f",
+             str(target)], [str(PG_BIN / "pg_restore"), "--list", str(target)])
+
+
+def check_dump_listing(listing: str) -> None:
+    """Every required table's data must be in the dump's table of contents."""
+    present = set(re.findall(r"TABLE DATA prop_alpha (\w+) ", listing))
+    missing = [table for table in REQUIRED_TABLES if table not in present]
+    if missing:
+        raise ValueError(f"dump is missing table data for: {', '.join(missing)}")
+
+
+def copy_state(state_dir: Path, target: Path) -> dict[str, dict[str, object]]:
+    """Copy the existing STATE_FILES and every file under STATE_DIRS, verify each copy by SHA-256, and return
+    relative name -> {bytes, sha256}."""
+    target.mkdir(parents=True, exist_ok=True)
+    names = [name for name in STATE_FILES if (state_dir / name).is_file()]
+    for folder in STATE_DIRS:
+        if (state_dir / folder).is_dir():
+            names += sorted(path.relative_to(state_dir).as_posix() for path in (state_dir / folder).rglob("*")
+                            if path.is_file())
+    copied: dict[str, dict[str, object]] = {}
+    for name in names:
+        source, copy = state_dir / name, target / name
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        expected = sha256(source)
+        shutil.copy2(source, copy)
+        if sha256(copy) != expected:
+            raise ValueError(f"copy of {name} does not match its source (was it written during the backup?)")
+        copied[name] = {"bytes": source.stat().st_size, "sha256": expected}
+    return copied
+
+
+def prune(backup_dir: Path, keep: int, current: Path) -> list[Path]:
+    """Remove complete backup folders beyond the newest `keep`; never `current`, an incomplete folder, or anything
+    whose name is not a backup folder name. Returns what was removed."""
+    if keep < 1:
+        raise ValueError("keep must be at least 1")
+    complete = sorted(path for path in backup_dir.iterdir()
+                      if path.is_dir() and BACKUP_NAME.match(path.name) and (path / "manifest.json").is_file())
+    removable = [path for path in complete[:-keep] if path != current]
+    for path in removable:
+        shutil.rmtree(path)
+    return removable
+
+
+def backup(backup_dir: Path, state_dir: Path, now: datetime, keep: int = DEFAULT_KEEP,
+           runner: Runner = run) -> Path:
+    """Make one verified backup and prune old ones; returns the backup folder."""
+    stamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    final = backup_dir / f"prop_alpha_{stamp}"
+    work = backup_dir / f"prop_alpha_{stamp}.incomplete"
+    if final.exists() or work.exists():
+        raise ValueError(f"{final.name} already exists")
+    work.mkdir(parents=True)
+    dump = work / "prop_alpha.dump"
+    dump_command, list_command = dump_commands(dump)
+    runner(dump_command)
+    check_dump_listing(runner(list_command))
+    state = copy_state(state_dir, work / "state")
+    if not (state_dir / "placed_bets.jsonl").is_file():
+        print("note: placed_bets.jsonl does not exist yet (no bet recorded); nothing to copy for it")
+    manifest = {"created_at": now.astimezone(timezone.utc).isoformat(), "database": SOURCE_DB,
+                "dump": {"bytes": dump.stat().st_size, "sha256": sha256(dump)}, "state": state}
+    (work / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+    work.rename(final)
+    for removed in prune(backup_dir, keep, final):
+        print(f"pruned {removed.name}")
+    return final
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Back up the working database and the ledger/alert state files.")
+    parser.add_argument("--keep", type=int, default=DEFAULT_KEEP, help="complete backups to keep (default 14)")
+    args = parser.parse_args(argv)
+    backup_dir = Path(os.environ.get(BACKUP_DIR_ENV) or DEFAULT_BACKUP_DIR)
+    folder = backup(backup_dir, STATE_DIR, datetime.now(timezone.utc), args.keep)
+    manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    print(f"backup complete: {folder} (dump {manifest['dump']['bytes']:,} bytes; state files: "
+          f"{', '.join(manifest['state']) or 'none'})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
