@@ -34,7 +34,7 @@ readonly CI_DATABASE_NAME="prop_alpha_ci"
 readonly CI_DATABASE_MARKER="prop_alpha disposable CI database"
 # pyright is not a Python wheel: it runs from npm at this exact version (needs node/npx and the npm registry).
 readonly PYRIGHT_VERSION="1.1.406"
-readonly EXPECTED_TESTS=603
+readonly EXPECTED_TESTS=610
 
 log() { printf '%s [ci] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { log "FATAL: $*" >&2; exit 1; }
@@ -70,7 +70,8 @@ log "interpreter: $("${PYTHON_BIN}" -V 2>&1)"
 for required in \
   requirements.txt schema.sql migrations/003_integrity_constraints.sql migrations/004_merge_hardening.sql \
   migrations/005_player_current_team.sql migrations/006_player_attributes_by_kickoff.sql \
-  migrations/007_match_position.sql migrations/008_incomplete_team_matches.sql prop_alpha/__init__.py tests/test_merge_postgres.sql \
+  migrations/007_match_position.sql migrations/008_incomplete_team_matches.sql migrations/009_unknown_position.sql \
+  prop_alpha/__init__.py tests/test_merge_postgres.sql \
   tests/test_core.py tests/test_integrity.py tests/test_pipeline_concurrency.py tests/test_typing_contract.py \
   mypy.ini pyrightconfig.json; do
   [[ -f "${required}" ]] || die "repository is missing ${required}"
@@ -176,11 +177,12 @@ if [[ -n "${PROP_ALPHA_CI_DATABASE_URL:-}" ]]; then
   psql_ci -c 'SELECT * FROM prop_alpha.merge_staging_player_feed()'
   # Behaviour on real rows (transfer, backfill, reject); the script rolls itself back.
   psql_ci -At -f tests/test_merge_postgres.sql >/dev/null
-  # 005, 006 and 007 on the current schema must leave it current (006 reinstalls its body; 007 restores this one).
+  # 005-009 on the current schema must leave it current (006 and 007 reinstall older bodies; 009 restores this one).
   psql_ci -f migrations/005_player_current_team.sql
   psql_ci -f migrations/006_player_attributes_by_kickoff.sql
   psql_ci -f migrations/007_match_position.sql
   psql_ci -f migrations/008_incomplete_team_matches.sql
+  psql_ci -f migrations/009_unknown_position.sql
   psql_ci -c 'SELECT * FROM prop_alpha.merge_staging_player_feed()'
   # Upgrade path: 003 reinstalls the v3.2 zero-argument body (an overload of the v3.3 function); 004 must
   # drop it, so the zero-argument call in pipeline.MERGE_SQL resolves to the batched function again. 005
@@ -191,6 +193,7 @@ if [[ -n "${PROP_ALPHA_CI_DATABASE_URL:-}" ]]; then
   psql_ci -f migrations/006_player_attributes_by_kickoff.sql
   psql_ci -f migrations/007_match_position.sql
   psql_ci -f migrations/008_incomplete_team_matches.sql
+  psql_ci -f migrations/009_unknown_position.sql
   psql_ci -c 'SELECT * FROM prop_alpha.merge_staging_player_feed()'
   psql_ci -c 'SELECT * FROM prop_alpha.merge_staging_player_feed(1)'
   psql_ci -At -f tests/test_merge_postgres.sql >/dev/null

@@ -206,6 +206,32 @@ def test_lineup_payload_maps_starting_eleven_and_bench() -> None:
     assert {e.vendor_player_uid for e in entries if e.p_sub_appearance == 0.35} == {"111", "112", "113"}
 
 
+def test_a_missing_position_is_none_never_a_made_up_code_and_an_unknown_one_is_refused() -> None:
+    """2026-10-05: a missing position_id was stored as the position 'PNone' (14 player-matches of fixture 19727778),
+    which pricing treated as a position of its own; migration 009 stores NULL and repairs the stored rows."""
+    from prop_alpha.ingestion.transform import DEFAULT_KAPPAS, STAGING_COLUMNS, build_staging_rows
+
+    body = _fixture()
+    substitute = next(row for row in body["data"]["lineups"] if row["player_id"] == 111)
+    substitute["position_id"] = None
+    players = _by_uid(body)
+    assert players["111"].position is None and players["110"].position == "MID"
+    rows = build_staging_rows(parse_fixture_payload(sportmonks.fixture_payload(body)), DEFAULT_KAPPAS, "batch")
+    uid, position = STAGING_COLUMNS.index("vendor_player_uid"), STAGING_COLUMNS.index("player_position")
+    staged = {row[uid]: row[position] for row in rows if row[uid] is not None}
+    assert staged["111"] is None and staged["110"] == "MID"  # staged NULL; the merge stores NULL (migration 009)
+    substitute["position_id"] = 99
+    with pytest.raises(ValueError, match="unknown position_id 99"):
+        sportmonks.fixture_payload(body)
+
+
+def test_transform_rejects_an_empty_position_code() -> None:
+    payload = sportmonks.fixture_payload(_fixture())
+    payload["players"][0]["position"] = "  "
+    with pytest.raises(ValueError, match="position must be None or a non-empty code"):
+        parse_fixture_payload(payload)
+
+
 def test_lineup_rows_without_a_player_id_never_become_player_none() -> None:
     """Gate 1 criterion 7 (2026-10-05): a sheet row without a player_id became uid "None", which matched the bogus
     players row 954 in the working database, so every unidentified player was filed as one player."""

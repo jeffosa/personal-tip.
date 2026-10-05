@@ -276,8 +276,9 @@ MIGRATION_004 = (ROOT / "migrations" / "004_merge_hardening.sql").read_text(enco
 MIGRATION_005 = (ROOT / "migrations" / "005_player_current_team.sql").read_text(encoding="utf-8")
 MIGRATION_006 = (ROOT / "migrations" / "006_player_attributes_by_kickoff.sql").read_text(encoding="utf-8")
 MIGRATION_007 = (ROOT / "migrations" / "007_match_position.sql").read_text(encoding="utf-8")
+MIGRATION_009 = (ROOT / "migrations" / "009_unknown_position.sql").read_text(encoding="utf-8")
 MERGE_SOURCES = {"schema.sql": SCHEMA, "003": MIGRATION_003, "004": MIGRATION_004, "005": MIGRATION_005,
-                 "006": MIGRATION_006, "007": MIGRATION_007}
+                 "006": MIGRATION_006, "007": MIGRATION_007, "009": MIGRATION_009}
 CORE_CONSTRAINTS = (
     "chk_possession_bounds", "chk_minute_logic", "chk_tackles_won_le_attempted", "chk_duels_won_le_total",
 )
@@ -337,7 +338,7 @@ def _merge_stats_insert_columns(function: str) -> list[str]:
     return [column.strip() for column in match.group(1).replace("\n", " ").split(",")]
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "003", "004", "005", "006", "007"])
+@pytest.mark.parametrize("source", ["schema.sql", "003", "004", "005", "006", "007", "009"])
 def test_merge_rejects_every_row_a_core_constraint_would_refuse(source: str) -> None:
     block = _player_reject_block(_merge_function(MERGE_SOURCES[source]))
     for constraint, fragments in REJECT_PREDICATES.items():
@@ -347,7 +348,7 @@ def test_merge_rejects_every_row_a_core_constraint_would_refuse(source: str) -> 
         assert f"CONSTRAINT {constraint}" in SCHEMA
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "004", "005", "006", "007"])
+@pytest.mark.parametrize("source", ["schema.sql", "004", "005", "006", "007", "009"])
 def test_merge_rejects_null_market_metrics(source: str) -> None:
     block = _player_reject_block(_merge_function(MERGE_SOURCES[source]))
     for fragment in NULL_METRIC_PREDICATES:
@@ -356,7 +357,8 @@ def test_merge_rejects_null_market_metrics(source: str) -> None:
 
 
 def test_merge_function_identical_in_schema_and_latest_migration() -> None:
-    assert _merge_function(SCHEMA) == _merge_function(MIGRATION_007)
+    assert _merge_function(SCHEMA) == _merge_function(MIGRATION_009)
+    assert _merge_function(MIGRATION_007) != _merge_function(MIGRATION_009)
     assert _merge_function(MIGRATION_006) != _merge_function(MIGRATION_007)
     assert _merge_function(MIGRATION_005) != _merge_function(MIGRATION_006)
     assert _merge_function(MIGRATION_004) != _merge_function(MIGRATION_005)
@@ -370,7 +372,7 @@ CURRENT_TEAM_FROM_LATEST_KICKOFF = (
 )
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "005", "006", "007"])
+@pytest.mark.parametrize("source", ["schema.sql", "005", "006", "007", "009"])
 def test_merge_moves_player_to_team_of_latest_fixture(source: str) -> None:
     function = _merge_function(MERGE_SOURCES[source])
     for fragment in CURRENT_TEAM_FROM_LATEST_KICKOFF:
@@ -544,7 +546,7 @@ PLAYER_ATTRIBUTES_FROM_LATEST_KICKOFF = (
 )
 
 
-@pytest.mark.parametrize("source", ["schema.sql", "006"])
+@pytest.mark.parametrize("source", ["schema.sql", "006", "009"])
 def test_player_attributes_follow_the_latest_match_not_the_last_row_staged(source: str) -> None:
     """Gate 1 idempotency (2026-10-04): name and position followed the last row staged, so re-ingesting an old
     match rewrote them and concurrent workers made the winner arbitrary."""
@@ -580,6 +582,31 @@ def test_merge_stores_each_matchs_own_position() -> None:
     assert "x.player_position" in function
     assert "match_position           VARCHAR(16)" in SCHEMA
     assert "ADD COLUMN IF NOT EXISTS match_position" in MIGRATION_007 and "SET lock_timeout" in MIGRATION_007
+
+
+def test_migration_009_stores_an_unknown_position_as_null_and_repairs_the_sentinels() -> None:
+    """2026-10-05: a missing Sportmonks position_id was stored as the position 'PNone', a pricing bucket of its own.
+    The merge now accepts a NULL position, never lets it erase a known one, and 009 repairs the stored sentinels."""
+    function = _merge_function(MIGRATION_009)
+    assert "c.player_position IS NULL" not in _player_reject_block(function)
+    assert "c.player_position IS NULL" in _player_reject_block(_merge_function(MIGRATION_007))
+    assert "primary_position = COALESCE(EXCLUDED.primary_position, pl.primary_position)," in function
+    assert "match_position           = EXCLUDED.match_position" in function
+    body = _strip_comments(MIGRATION_009)
+    statements = [line.strip() for line in body.splitlines() if line.strip()]
+    assert statements[:5] == [
+        "SET lock_timeout = '5s';", "BEGIN;",
+        "ALTER TABLE prop_alpha.players ALTER COLUMN primary_position DROP NOT NULL;",
+        "DROP FUNCTION IF EXISTS prop_alpha.merge_staging_player_feed();",
+        "CREATE OR REPLACE FUNCTION prop_alpha.merge_staging_player_feed(p_max_batches integer DEFAULT 200)",
+    ]
+    assert statements[-2:] == ["COMMIT;", "RESET lock_timeout;"]
+    repair = body[body.index("$$;"):]
+    assert repair.index("pg_advisory_xact_lock") < repair.index("UPDATE prop_alpha.player_match_stats")
+    assert repair.count("~ '^P(None|[0-9]+)$'") == 3  # only the adapter's old sentinel format is touched
+    for statement in ("TRUNCATE", "VACUUM FULL", "CLUSTER", " TYPE ", "SET DEFAULT"):
+        assert statement not in body
+    assert "primary_position  VARCHAR(16),\n" in SCHEMA and "primary_position  VARCHAR(16)  NOT NULL" not in SCHEMA
 
 
 MIGRATION_008 = (ROOT / "migrations" / "008_incomplete_team_matches.sql").read_text(encoding="utf-8")

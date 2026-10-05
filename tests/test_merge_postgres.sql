@@ -16,7 +16,7 @@ $$;
 CREATE FUNCTION pg_temp.stage(
     p_batch uuid, p_fixture text, p_home text, p_away text, p_kickoff timestamptz,
     p_player text, p_team text, p_tackles_won integer DEFAULT 1, p_position text DEFAULT 'DM'
-) RETURNS void LANGUAGE sql AS $$
+) RETURNS void LANGUAGE sql CALLED ON NULL INPUT AS $$
     INSERT INTO prop_alpha.staging_player_feed (
         batch_id, vendor_fixture_uid, home_team_uid, away_team_uid, kickoff_at, fixture_status,
         vendor_player_uid, player_name, player_position, team_uid, is_home, started,
@@ -124,5 +124,21 @@ SELECT pg_temp.expect(
 );
 SELECT pg_temp.expect(prop_alpha.refresh_incomplete_team_matches() = 1, 'refreshing again rewrites the same row');
 SELECT pg_temp.expect((SELECT count(*) FROM prop_alpha.incomplete_team_matches) = 1, 'no duplicate after refresh');
+
+-- 7. An unknown position is stored as NULL (migration 009): the row merges, the match keeps NULL, the player's known
+-- position stays, and a new player whose only match has no position gets a NULL primary_position.
+SELECT pg_temp.stage('00000000-0000-0000-0000-000000000007', 'f4', 'tB', 'tC', '2026-10-08T15:00Z', 'p1', 'tB', 1, NULL);
+SELECT pg_temp.stage('00000000-0000-0000-0000-000000000007', 'f4', 'tB', 'tC', '2026-10-08T15:00Z', 'p9', 'tC', 1, NULL);
+SELECT pg_temp.expect(
+    player_rows_merged = 2 AND rows_rejected = 0,
+    format('unknown-position merge counts: %s player rows, %s rejected', player_rows_merged, rows_rejected)
+) FROM prop_alpha.merge_staging_player_feed();
+SELECT pg_temp.expect(pg_temp.match_position_of('f4', 'p1') IS NULL, 'a match with no position stores NULL');
+SELECT pg_temp.expect(pg_temp.position_of('p1') = 'AM', 'an unknown position never erases a known one');
+SELECT pg_temp.expect(
+    (SELECT attributes_as_of FROM prop_alpha.players WHERE vendor_player_uid = 'p1') = '2026-10-08T15:00Z',
+    'the newer match still sets the name and attributes_as_of'
+);
+SELECT pg_temp.expect(pg_temp.position_of('p9') IS NULL, 'a new player with no known position stores NULL');
 
 ROLLBACK;

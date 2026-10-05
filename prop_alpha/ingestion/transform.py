@@ -94,7 +94,8 @@ class RefereeRecord:
 class PlayerMatchRecord:
     player_uid: str
     name: str
-    position: str
+    # None when the vendor gives no position for this match (migration 009); never a made-up code.
+    position: str | None
     team_uid: str
     is_home: bool
     started: bool
@@ -137,6 +138,8 @@ class PlayerMatchRecord:
             raise ValueError(f"player {self.player_uid}: duels_won exceeds duels_total")
         if not 0 <= self.yellow_cards <= 2 or not 0 <= self.red_cards <= 1:
             raise ValueError(f"player {self.player_uid}: card counts out of range")
+        if self.position is not None and not self.position.strip():
+            raise ValueError(f"player {self.player_uid}: position must be None or a non-empty code")
         if self.team_possession_pct is not None and not 0.0 <= self.team_possession_pct <= 100.0:
             raise ValueError(f"player {self.player_uid}: possession out of range")
 
@@ -279,7 +282,7 @@ def parse_fixture_payload(payload: Mapping[str, Any], match_length: int = 90) ->
         players.append(PlayerMatchRecord(
             player_uid=uid,
             name=str(p["name"]),
-            position=str(p["position"]),
+            position=None if p["position"] is None else str(p["position"]),
             team_uid=team_uid,
             is_home=team_uid == fixture.home_team_uid,
             started=started,

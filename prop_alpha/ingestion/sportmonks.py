@@ -216,7 +216,7 @@ def fixture_payload(body: Mapping[str, Any]) -> dict[str, Any]:
         player: dict[str, Any] = {
             "uid": uid,
             "name": " ".join(str(row.get("player_name") or uid).split()),
-            "position": POSITIONS.get(row.get("position_id") or 0, f"P{row.get('position_id')}"),
+            "position": _position(fixture.get("id"), uid, row.get("position_id")),
             "team_uid": str(row["team_id"]),
             "started": started,
             "stats": stats,
@@ -259,6 +259,17 @@ def fixture_payload(body: Mapping[str, Any]) -> dict[str, Any]:
         # parse_fixture_payload ignores this key.
         "vendor_response": dict(fixture),
     }
+
+
+def _position(fixture_id: Any, uid: str, position_id: Any) -> str | None:
+    """The player's position code, or None when Sportmonks gives no position_id. Until 2026-10-05 a missing id became
+    the code "PNone" (and an unknown one "P<id>"), which pricing treated as a position of its own (14 player-matches
+    in fixture 19727778). An unknown id is refused: it is schema drift, not a position."""
+    if position_id is None:
+        return None
+    if position_id not in POSITIONS:
+        raise ValueError(f"fixture {fixture_id}: player {uid} has an unknown position_id {position_id!r}")
+    return POSITIONS[position_id]
 
 
 def lineup_payload(body: Mapping[str, Any]) -> dict[str, Any]:

@@ -30,7 +30,8 @@ CREATE TABLE teams (
 CREATE TABLE players (
     player_id         SERIAL       PRIMARY KEY,
     full_name         VARCHAR(128) NOT NULL,
-    primary_position  VARCHAR(16)  NOT NULL,
+    -- NULL when no match of the player has a known position (migration 009).
+    primary_position  VARCHAR(16),
     current_team_id   INTEGER      REFERENCES teams(team_id),
     vendor_player_uid VARCHAR(64)  NOT NULL UNIQUE,
     updated_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
@@ -323,7 +324,6 @@ BEGIN
           AND (   c.team_uid IS NULL
                OR c.team_uid NOT IN (c.home_team_uid, c.away_team_uid)
                OR c.player_name IS NULL
-               OR c.player_position IS NULL
                OR c.tackles_won > c.tackles_attempted
                OR c.duels_won > c.duels_total
                OR c.yellow_cards NOT BETWEEN 0 AND 2
@@ -395,7 +395,8 @@ BEGIN
     ORDER BY c.vendor_player_uid, c.kickoff_at DESC, c.vendor_fixture_uid DESC, c.staged_at DESC
     ON CONFLICT (vendor_player_uid) DO UPDATE SET
         full_name        = EXCLUDED.full_name,
-        primary_position = EXCLUDED.primary_position,
+        -- A match with an unknown position (migration 009) never erases a known one.
+        primary_position = COALESCE(EXCLUDED.primary_position, pl.primary_position),
         attributes_as_of = EXCLUDED.attributes_as_of,
         updated_at       = now()
     WHERE pl.attributes_as_of IS NULL OR EXCLUDED.attributes_as_of >= pl.attributes_as_of;
