@@ -14,7 +14,9 @@ A run that fails any check exits 1 and leaves its folder named `*.incomplete`; p
 folders (never anything else in the directory), oldest first, and never the one just made.
 
 The default folder is on this machine's disk: it protects against a bad migration or a corrupt file, not against
-losing the disk. Point PROP_ALPHA_BACKUP_DIR at a synced folder (e.g. Google Drive) for an off-machine copy.
+losing the disk. Point PROP_ALPHA_BACKUP_DIR (process environment, then .env) at a synced folder (e.g. OneDrive) for
+an off-machine copy. A folder set there must already exist: a typo or an unmounted drive would otherwise create a new
+local folder and the backups would silently stop leaving the machine. Run daily by scripts/backup.cmd.
 The password comes from pgpass (never from this script, its arguments or the repository).
 """
 
@@ -30,9 +32,12 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Final, Sequence
+from typing import Callable, Final, Mapping, Sequence
 
 ROOT: Final[Path] = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from prop_alpha.config import DEFAULT_ENV_FILE, parse_env_file, read_env_file  # noqa: E402
+
 STATE_DIR: Final[Path] = ROOT / ".prop_alpha_state"
 BACKUP_DIR_ENV: Final[str] = "PROP_ALPHA_BACKUP_DIR"
 DEFAULT_BACKUP_DIR: Final[Path] = STATE_DIR / "backups" / "daily"
@@ -52,6 +57,20 @@ REQUIRED_TABLES: Final[tuple[str, ...]] = (
 )
 BACKUP_NAME: Final[re.Pattern[str]] = re.compile(r"^prop_alpha_\d{8}T\d{6}Z$")
 Runner = Callable[[Sequence[str]], str]
+
+
+def backup_dir_setting(environ: Mapping[str, str], env_file: Path = DEFAULT_ENV_FILE) -> Path:
+    """PROP_ALPHA_BACKUP_DIR from the process environment, then .env; the default folder when neither sets it. A folder
+    that is set must exist."""
+    text = read_env_file(env_file)
+    from_file = parse_env_file(text).get(BACKUP_DIR_ENV, "") if text is not None else ""
+    raw = (environ.get(BACKUP_DIR_ENV) or from_file).strip()
+    if not raw:
+        return DEFAULT_BACKUP_DIR
+    folder = Path(raw)
+    if not folder.is_dir():
+        raise ValueError(f"{BACKUP_DIR_ENV}={raw!r} is not an existing folder; create it, or fix the setting")
+    return folder
 
 
 def run(command: Sequence[str]) -> str:
@@ -144,7 +163,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Back up the working database and the ledger/alert state files.")
     parser.add_argument("--keep", type=int, default=DEFAULT_KEEP, help="complete backups to keep (default 14)")
     args = parser.parse_args(argv)
-    backup_dir = Path(os.environ.get(BACKUP_DIR_ENV) or DEFAULT_BACKUP_DIR)
+    backup_dir = backup_dir_setting(os.environ)
     folder = backup(backup_dir, STATE_DIR, datetime.now(timezone.utc), args.keep)
     manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
     print(f"backup complete: {folder} (dump {manifest['dump']['bytes']:,} bytes; state files: "

@@ -81,7 +81,7 @@ def test_a_task_that_stops_running_is_flagged_by_the_other_one() -> None:
 
 def test_inputs_and_states_are_validated() -> None:
     with pytest.raises(ValueError, match="unknown task"):
-        evaluate({}, "backup", [], NOW)
+        evaluate({}, "nightly", [], NOW)
     with pytest.raises(ValueError, match="UTC"):
         evaluate({}, "status", [], NOW.replace(tzinfo=None))
     with pytest.raises(ValueError):
@@ -127,6 +127,74 @@ def test_a_corrupt_health_file_fails_closed(tmp_path: Path) -> None:
         path.write_text(bad, encoding="utf-8")
         with pytest.raises(ValueError):
             task_health.load_states(path)
+
+
+def test_a_daily_backup_that_stops_running_is_flagged_after_26_hours() -> None:
+    states: dict[str, TaskState] = {}
+    _run(states, "backup", [], NOW)
+    assert _run(states, "ledger", [], NOW + timedelta(hours=26)) == []  # a day plus a catch-up margin
+    [overdue] = _run(states, "ledger", [], NOW + timedelta(hours=26, minutes=10))
+    assert overdue.startswith("TASK NOT RUNNING: prop_alpha\\Daily backup has not run since Tue 06 Oct 08:00 UTC")
+    assert "expected at least every 26 hours" in overdue
+    _run(states, "backup", ["backup"], NOW + timedelta(hours=27))
+    [failing] = _run(states, "backup", ["backup"], NOW + timedelta(hours=27, minutes=30))  # the scheduler's retry
+    assert failing.startswith("TASK FAILING: prop_alpha\\Daily backup failed 2 runs in a row")
+    assert ".prop_alpha_state\\backup.log" in failing
+
+
+# ---------------- the scheduled .cmd scripts report every run to task_health ----------------
+# Script -> (task_health task key, the failed-step names it can report). 2026-10-05: task_health was built but no
+# script called it, so a failing scheduled step still only wrote "STEP FAILED" into a log nobody reads.
+SCHEDULED_SCRIPTS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "telegram_status.cmd": ("status", ("results", "fx-refresh", "status-report", "scan-no-odds", "scan")),
+    "ledger_poll.cmd": ("ledger", ("poll", "closing-prices", "settle")),
+    "backup.cmd": ("backup", ("backup", "github-push")),
+}
+
+
+def _commands(script: str) -> list[str]:
+    raw = (ROOT / "scripts" / script).read_bytes()
+    assert b"\r\n" in raw and b"\n" not in raw.replace(b"\r\n", b""), f"{script} must keep CRLF line endings"
+    return [line for line in raw.decode("ascii").splitlines() if line.strip() and not line.lower().startswith("rem ")]
+
+
+@pytest.mark.parametrize("script", sorted(SCHEDULED_SCRIPTS))
+def test_each_scheduled_script_reports_its_failed_steps_to_task_health_last(script: str) -> None:
+    task, steps = SCHEDULED_SCRIPTS[script]
+    assert task in task_health.TASKS
+    lines = _commands(script)
+    assert lines[-1] == "exit /b %RC%"
+    report = lines[-2]
+    assert report.startswith('"%PY%" -m prop_alpha.alerts.task_health ')
+    assert f'--task {task} --failed "%FAILED%"' in report
+    assert "set RC=1" in report and "STEP FAILED: task health" in report  # a failed report still fails the run
+    assert 'set "FAILED="' in lines  # starts empty: a successful run reports no failed step
+    recorded = [part.split('"', 1)[0] for line in lines for part in line.split('set "FAILED=%FAILED% ')[1:]]
+    assert sorted(recorded) == sorted(steps)
+    assert all(step and " " not in step for step in recorded)  # task_health splits --failed on spaces
+    # Every step that can fail adds its name: no "STEP FAILED" line without one, except the report itself.
+    for line in lines:
+        for segment in line.split(" else "):
+            if "STEP FAILED" in segment and "task health" not in segment:
+                assert 'set "FAILED=%FAILED% ' in segment, segment
+
+
+def test_the_status_script_reports_a_scan_without_real_odds_as_its_own_step() -> None:
+    from prop_alpha.alerts.scan import ODDS_UNAVAILABLE_EXIT
+
+    lines = _commands("telegram_status.cmd")
+    scan_at = next(i for i, line in enumerate(lines) if "-m prop_alpha.alerts.scan " in line)
+    assert lines[scan_at + 1] == "set SCAN_RC=%ERRORLEVEL%"
+    branch = lines[scan_at + 2]
+    assert branch.startswith(f'if "%SCAN_RC%"=="{ODDS_UNAVAILABLE_EXIT}" (set RC=1& set "FAILED=%FAILED% scan-no-odds"')
+    assert 'else if not "%SCAN_RC%"=="0" (set RC=1& set "FAILED=%FAILED% scan"' in branch
+
+
+def test_the_backup_script_runs_the_backup_into_its_own_log() -> None:
+    lines = _commands("backup.cmd")
+    assert 'set "LOG=.prop_alpha_state\\backup.log"' in lines
+    assert task_health.TASKS["backup"][1] == ".prop_alpha_state\\backup.log"
+    assert any(line.startswith('"%PY%" scripts\\backup.py --keep 14 >> "%LOG%" 2>&1 ||') for line in lines)
 
 
 # ---------------- scripts/backup.py ----------------
@@ -242,3 +310,25 @@ def test_launcher_runs_only_an_existing_cmd_script_inside_the_repository(tmp_pat
     assert fake.calls == []
     for script in ("ledger_poll.cmd", "telegram_status.cmd"):
         assert launcher.resolve_script(f"scripts/{script}") == (ROOT / "scripts" / script).resolve()
+
+
+def test_the_backup_folder_comes_from_the_environment_then_env_and_must_exist(tmp_path: Path) -> None:
+    """2026-10-05: the folder was read from the process environment only, so a setting in .env (where every other
+    setting lives, and what a scheduled task sees) was ignored and backups stayed on this disk."""
+    backup = _backup_module()
+    env_file = tmp_path / ".env"
+    assert backup.backup_dir_setting({}, env_file) == backup.DEFAULT_BACKUP_DIR  # no .env at all
+    synced = tmp_path / "OneDrive" / "prop_alpha_backups"
+    synced.mkdir(parents=True)
+    env_file.write_text(f"TELEGRAM_CHAT_ID=1\nPROP_ALPHA_BACKUP_DIR={synced}\n", encoding="utf-8")
+    assert backup.backup_dir_setting({}, env_file) == synced
+    other = tmp_path / "other"
+    other.mkdir()
+    assert backup.backup_dir_setting({"PROP_ALPHA_BACKUP_DIR": str(other)}, env_file) == other  # environment first
+    env_file.write_text("PROP_ALPHA_BACKUP_DIR=\n", encoding="utf-8")
+    assert backup.backup_dir_setting({}, env_file) == backup.DEFAULT_BACKUP_DIR
+    # A typo or an unmounted drive must not quietly create a local folder that never leaves the machine.
+    env_file.write_text(f"PROP_ALPHA_BACKUP_DIR={tmp_path / 'OneDrive' / 'typo'}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="not an existing folder"):
+        backup.backup_dir_setting({}, env_file)
+    assert not (tmp_path / "OneDrive" / "typo").exists()

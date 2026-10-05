@@ -190,11 +190,15 @@ Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not e
   It is now stored as NULL. 009 was applied to the working database after a backup: 14 match rows and 3 players were
   repaired. The pricing code and its frozen digest are unchanged, and 009 was applied before the first lockbox
   kickoff.
-- **Built, not yet scheduled [U]:**
-  - `alerts/task_health.py`: Telegram alerts for failing scheduled tasks, plus a cross-check for a task that stops
-    running.
-  - `scripts/backup.py`: a verified `pg_dump` plus the ledger and alert state files, keeping the newest 14. First
-    run 2026-10-05.
+- **Wired and scheduled 2026-10-05 (maintainer approved):**
+  - `alerts/task_health.py` is called at the end of all three scheduled scripts with the names of their failed
+    steps. The ledger poll reported through it at 17:01 UTC ("ok"); the 4-hourly task's first report is **[U]**
+    until its next run.
+  - `scripts/backup.py` runs daily at 03:30 (task `prop_alpha\Daily backup`, `scripts/backup.cmd`), then
+    `scripts/backup_push.py` pushes the newest backup to a private GitHub repository (the maintainer's choice for the
+    off-machine copy). End-to-end run at 17:07 UTC: the backup succeeded (25 MB dump); the push failed as designed
+    because `PROP_ALPHA_BACKUP_GIT_REMOTE` is not set yet. **Backups are still on this disk only** until the
+    maintainer creates the repository and sets the remote; until then the backup task fails daily and alerts.
 
 ## Decisions needed from the maintainer
 
@@ -210,9 +214,9 @@ Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not e
      conservative and unchanged.
    - Releasing the stake of a delivery the operator dismisses would change staking, so it was not done without a
      decision (AGENT.md A7).
-6. **Scheduling the failure alerts and backups:** approve adding `task_health` to the two `.cmd` scripts and a daily
-   backup task. Choose an off-machine backup folder (`PROP_ALPHA_BACKUP_DIR`); the default folder is on the same
-   disk.
+6. **Off-machine backups (approved 2026-10-05: GitHub; one action left):** create an empty **private** repository
+   (e.g. `prop_alpha-backups`) and set `PROP_ALPHA_BACKUP_GIT_REMOTE=https://github.com/<owner>/<repo>.git` in
+   `.env`. The push refuses a public repository.
 7. **Both tasks stopped:** nothing on this machine can detect that the machine is off, asleep or logged out. An
    outside "dead man's switch" monitor would be a new external service.
 8. **Bogus player row 954** (`vendor_player_uid` 'None', created before 2026-10-04): repair or leave it. Its 3 rows

@@ -77,6 +77,8 @@ def export_tables(out: Path) -> tuple[dict[str, Any], dict[int, str], dict[int, 
         with conn, conn.cursor() as cur:
             for name, sql in TABLES:
                 cur.execute(sql)
+                if cur.description is None:
+                    raise ValueError(f"{name}: the query returned no result set")
                 header = [d[0] for d in cur.description]
                 files[f"{name}.csv"] = write_csv(out / f"{name}.csv", header, [list(r) for r in cur.fetchall()])
             cur.execute("SELECT fixture_id, vendor_fixture_uid FROM prop_alpha.fixtures")

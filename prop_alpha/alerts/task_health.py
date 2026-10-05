@@ -1,7 +1,7 @@
 """Failure alerts for the scheduled tasks (maintainer task 4, 2026-10-05). Sends text only; it never places a bet.
 
-Each scheduled script (scripts/telegram_status.cmd, scripts/ledger_poll.cmd) ends by reporting its run here, with the
-steps that failed (none when it succeeded):
+Each scheduled script (scripts/telegram_status.cmd, scripts/ledger_poll.cmd, scripts/backup.cmd) ends by reporting its
+run here, with the steps that failed (none when it succeeded); step names are single words separated by spaces:
 
     python -m prop_alpha.alerts.task_health --task status --failed "results scan"
     python -m prop_alpha.alerts.task_health --task ledger --failed ""
@@ -9,9 +9,9 @@ steps that failed (none when it succeeded):
 Until now a failed step only wrote "STEP FAILED" into a log nobody reads. This sends a Telegram message when a task has
 failed ALERT_AFTER_FAILURES runs in a row (the status task retries a failed run after 5 minutes, so one transient
 failure is not paged), again at most every REALERT_AFTER while it keeps failing or when the failing steps change, and
-once when it recovers. Each run also checks the OTHER task: one that has not reported for longer than its OVERDUE
-limit is flagged ("has not run since ..."), so a task that stops running altogether is noticed while the other runs.
-Neither check can notice that both tasks stopped (the machine is off, asleep or logged out); that needs a monitor
+once when it recovers. Each run also checks the OTHER tasks: one that has not reported for longer than its OVERDUE
+limit is flagged ("has not run since ..."), so a task that stops running altogether is noticed while another runs.
+Neither check can notice that all tasks stopped (the machine is off, asleep or logged out); that needs a monitor
 outside this machine.
 
 State: .prop_alpha_state/task_health.json, written only after the Telegram send succeeded, so an alert that could not be
@@ -36,10 +36,11 @@ logger = logging.getLogger("prop_alpha.task_health")
 
 DEFAULT_HEALTH_FILE: Final[Path] = DEFAULT_STATE_FILE.parent / "task_health.json"
 # Task key -> (scheduler name, log file, longest normal gap between two runs before it counts as overdue). The status
-# task runs every 4 hours (and catches up after sleep); the ledger poll every 10 minutes.
+# task runs every 4 hours (and catches up after sleep); the ledger poll every 10 minutes; the backup once a day.
 TASKS: Final[Mapping[str, tuple[str, str, timedelta]]] = {
     "status": ("prop_alpha\\Telegram status", ".prop_alpha_state\\status.log", timedelta(hours=5)),
     "ledger": ("prop_alpha\\Bet ledger poll", ".prop_alpha_state\\ledger.log", timedelta(minutes=40)),
+    "backup": ("prop_alpha\\Daily backup", ".prop_alpha_state\\backup.log", timedelta(hours=26)),
 }
 ALERT_AFTER_FAILURES: Final[int] = 2
 REALERT_AFTER: Final[timedelta] = timedelta(hours=6)
