@@ -1,3 +1,5 @@
 # Shell and SQL must keep LF endings: bash rejects CRLF, and psql files are compared byte-wise in tests.
 *.sh  text eol=lf
 *.sql text eol=lf
+# Windows batch scripts keep CRLF on every checkout (cmd.exe parses LF-only scripts unreliably; tests check it).
+*.cmd text eol=crlf
