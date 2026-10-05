@@ -4,6 +4,7 @@ messages. It never places a bet.
     python -m prop_alpha.alerts.ledger --poll    # read new replies, record bets, answer each in the chat
     python -m prop_alpha.alerts.ledger --list    # print the open (unsettled) bets and the settled results
     python -m prop_alpha.alerts.ledger --settle [--send]   # settle open bets whose match is final in the database
+    python -m prop_alpha.alerts.ledger --reconcile [--send]   # your settled replies v automatic settlement
 
 Replies are parsed by prop_alpha.alerts.replies (pure). Only messages from the configured TELEGRAM_CHAT_ID are
 read; anyone else who messages the bot is ignored. A `placed` reply must answer the alert or board message it
@@ -43,6 +44,7 @@ from prop_alpha.alerts.replies import (
     ClosingValue,
     PlaceCommand,
     PlacedBet,
+    Reconciliation,
     ReplyError,
     SettleCommand,
     Settlement,
@@ -51,6 +53,9 @@ from prop_alpha.alerts.replies import (
     grade,
     parse_reply,
     profit,
+    reconcile,
+    reconciliation_summary,
+    reconciliation_text,
     resolve_bet,
     settlement_text,
 )
@@ -217,6 +222,19 @@ class PlacedBetStore:
     def stale_bets(self, now: datetime, after: timedelta = STALE_AFTER) -> list[PlacedBet]:
         """Open bets placed more than `after` before `now`: settle them by hand."""
         return [bet for bet in self.open_bets(now) if bet.placed_at < now - after]
+
+    def automatic_settlements(self) -> dict[int, Settlement]:
+        """The latest automatic settlement recorded for each bet, even one a `settled` reply later overrode (the
+        effective settlement hides it): settlement reconciliation counts such overrides."""
+        automatic: dict[int, Settlement] = {}
+        if not self.path.is_file():
+            return automatic
+        for number, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), start=1):
+            record: Any = json.loads(line) if line.strip() else None
+            if isinstance(record, dict) and record.get("event") == "settled" and record.get("source") == "auto":
+                settlement = _settlement_from_record(record, f"{self.path.name} line {number}")
+                automatic[settlement.bet_id] = settlement
+        return automatic
 
     def settled_bets(self) -> list[tuple[PlacedBet, Settlement]]:
         """Every settled bet that was not undone, with its effective settlement, by bet id."""
@@ -564,6 +582,17 @@ def settle(store: PlacedBetStore, dsn: str, now: datetime) -> list[tuple[PlacedB
     return settled
 
 
+def reconcile_settlements(store: PlacedBetStore, dsn: str, now: datetime) -> list[tuple[PlacedBet, Reconciliation]]:
+    """Every settled bet compared with automatic settlement on the statistics stored now (replies.reconcile), from one
+    read-only transaction. Bets settled only automatically need no query."""
+    settled = store.settled_bets()
+    confirmed = [bet for bet, settlement in settled if settlement.source == "manual"]
+    rows = read_settlement_rows(dsn, confirmed)
+    automatic = store.automatic_settlements()
+    return [(bet, reconcile(bet, settlement, rows.get((bet.fixture_id, bet.player_id)), automatic.get(bet.bet_id), now))
+            for bet, settlement in settled]
+
+
 def closing_values(settled: Sequence[tuple[PlacedBet, Settlement]],
                    quotes: Sequence[Mapping[str, Any]]) -> dict[int, ClosingValue]:
     values = {bet.bet_id: closing_value(bet, quotes) for bet, _ in settled}
@@ -613,7 +642,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     action.add_argument("--poll", action="store_true", help="read new replies, record bets, answer in the chat")
     action.add_argument("--list", action="store_true", help="print the open bets and the settled results")
     action.add_argument("--settle", action="store_true", help="settle open bets whose match is final")
-    parser.add_argument("--send", action="store_true", help="with --settle: send the new results to Telegram")
+    action.add_argument("--reconcile", action="store_true",
+                        help="compare your settled replies with automatic settlement; exits 1 on any discrepancy")
+    parser.add_argument("--send", action="store_true",
+                        help="with --settle: send the new results; with --reconcile: send the report")
     args = parser.parse_args(argv)
     now = datetime.now(timezone.utc)
     store = PlacedBetStore()
@@ -644,6 +676,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                  results_summary(store.settled_bets(), closing_values(store.settled_bets(),
                                                                      load_closing_quotes(STATE_DIR)))]))
         return 0
+    if args.reconcile:
+        items = reconcile_settlements(store, os.environ.get(DSN_ENV, DEFAULT_DSN), now)
+        lines = [reconciliation_text(bet, item) for bet, item in items if item.outcome != "unconfirmed"]
+        report = "\n".join([*lines, reconciliation_summary([item for _, item in items])])
+        print(report)
+        if args.send:
+            TelegramNotifier(load_config()).send_message("SETTLEMENT CHECK\n" + report)
+        return 1 if any(item.outcome == "discrepancy" for _, item in items) else 0
     currency = bankroll_currency()
     rate = None if currency == BOOK_CURRENCY else cached_rate()
     fresh = rate if rate is not None and is_fresh(rate, now.date()) else None
