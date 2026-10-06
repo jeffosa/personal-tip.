@@ -109,14 +109,15 @@ def test_the_newest_backup_is_pushed_as_its_own_branch_after_a_readme_main(tmp_p
     assert _heads(bare) == ["backup/prop_alpha_20261006T033000Z", "main"]
     # main exists first, so GitHub makes it the default branch and a backup branch can always be deleted.
     readme = subprocess.run(["git", "show", "main:README.md"], cwd=str(bare), check=True, capture_output=True,
-                            text=True).stdout
+                            text=True, env=_git_env()).stdout
     assert "Private" in readme and "pg_restore" in readme
     files = subprocess.run(["git", "ls-tree", "-r", "--name-only", "backup/prop_alpha_20261006T033000Z"],
-                           cwd=str(bare), check=True, capture_output=True, text=True).stdout.split()
+                           cwd=str(bare), check=True, capture_output=True, text=True, env=_git_env()).stdout.split()
     assert sorted(files) == ["prop_alpha_20261006T033000Z/manifest.json", "prop_alpha_20261006T033000Z/prop_alpha.dump",
                              "prop_alpha_20261006T033000Z/state/placed_bets.jsonl"]
     ledger = subprocess.run(["git", "show", "backup/prop_alpha_20261006T033000Z:prop_alpha_20261006T033000Z/state/"
-                             "placed_bets.jsonl"], cwd=str(bare), check=True, capture_output=True, text=True).stdout
+                             "placed_bets.jsonl"], cwd=str(bare), check=True, capture_output=True, text=True,
+                            env=_git_env()).stdout
     assert ledger == '{"event": "placed", "bet_id": 1}\n'
 
 

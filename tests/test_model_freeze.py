@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import math
 import shutil
 from datetime import datetime, timezone
@@ -42,6 +43,17 @@ def test_digest_ignores_comments_but_not_logic(tmp_path: Path) -> None:
     slate.write_text(source.replace("def build_projections(", "def build_projections_renamed("), encoding="utf-8")
     with pytest.raises(ValueError, match="no longer defines build_projections"):
         model_freeze.pricing_digest(tmp_path)
+
+
+def test_the_digest_serialisation_is_the_same_on_every_python() -> None:
+    """Python 3.12's ast.dump adds posonlyargs=[] and type_params=[] here, so hashing it gave 3.12 (the runtime
+    floor) a different digest for the frozen code (audit 2026-10-06). The serialisation is pinned to 3.13+'s form."""
+    node = ast.parse("@cached\ndef f(x: int = 1, *, y=None) -> None:\n    return None\n").body[0]
+    assert model_freeze.canonical_dump(node) == (
+        "FunctionDef(name='f', args=arguments(args=[arg(arg='x', annotation=Name(id='int', ctx=Load()))], "
+        "kwonlyargs=[arg(arg='y')], kw_defaults=[Constant(value=None)], defaults=[Constant(value=1)]), "
+        "body=[Return(value=Constant(value=None))], decorator_list=[Name(id='cached', ctx=Load())], "
+        "returns=Constant(value=None))")
 
 
 def _calibrated_sample(n_fixtures: int, per_fixture: int, slope: float, seed: int) -> tuple[list[int], np.ndarray,

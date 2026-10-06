@@ -62,6 +62,26 @@ def _strip_docstrings(tree: ast.AST) -> None:
                 node.body = body[1:] or [ast.Pass()]
 
 
+def canonical_dump(node: object) -> str:
+    """ast.dump(node) as Python 3.13+ writes it (no attributes, None optional fields and empty lists left out), on any
+    interpreter. Python 3.12's ast.dump keeps those fields, so hashing ast.dump gave the same code two digests (audit
+    2026-10-06: 9d071ed9 on 3.12 v the frozen 839e97ce on 3.13+); this keeps the frozen value on every version."""
+    if isinstance(node, ast.AST):
+        cls = type(node)
+        fields: list[str] = []
+        for name in node._fields:
+            if not hasattr(node, name):
+                continue
+            value = getattr(node, name)
+            if (value is None and getattr(cls, name, ...) is None) or (isinstance(value, list) and not value):
+                continue
+            fields.append(f"{name}={canonical_dump(value)}")
+        return f"{cls.__name__}({', '.join(fields)})"
+    if isinstance(node, list):
+        return f"[{', '.join(canonical_dump(item) for item in node)}]"
+    return repr(node)
+
+
 def pricing_digest(root: Path = REPOSITORY_ROOT) -> str:
     """SHA-256 over the syntax trees of PRICING_CODE (no comments, docstrings or layout). Raises if a named
     definition is missing, so a rename cannot drop code from the fingerprint."""
@@ -79,5 +99,5 @@ def pricing_digest(root: Path = REPOSITORY_ROOT) -> str:
             selected = [by_name[name] for name in names]
         digest.update(module.encode("utf-8"))
         for node in selected:
-            digest.update(ast.dump(node, include_attributes=False).encode("utf-8"))
+            digest.update(canonical_dump(node).encode("utf-8"))
     return digest.hexdigest()
