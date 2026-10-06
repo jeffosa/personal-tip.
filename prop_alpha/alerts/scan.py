@@ -100,6 +100,11 @@ MAX_ALERTS_ENV: Final[str] = "PROP_ALPHA_MAX_ALERTS"
 DEFAULT_MAX_ALERTS: Final[int] = 10
 MAX_LISTING_PAGES: Final[int] = 5
 STATE_DIR: Final[Path] = DEFAULT_ENV_FILE.parent / ".prop_alpha_state"
+# Under STATE_DIR: every raw OddsPapi reply (<stamp>_<book>.json.gz, or .rejected.json.gz when malformed), and the
+# cached market catalogue.
+ODDS_ARCHIVE_DIR: Final[str] = "odds_archive"
+ODDS_CACHE_DIR: Final[str] = "oddspapi"
+CATALOGUE_FILE: Final[str] = "line_markets.json"
 # Exit code of a real-odds run that had no usable bookmaker prices (the summary and boards were still sent).
 ODDS_UNAVAILABLE_EXIT: Final[int] = 3
 BOOKMAKERS_ENV: Final[str] = "ODDS_BOOKMAKERS"
@@ -416,7 +421,7 @@ def send_boards(
     return boarded
 
 
-def _load_catalogue(path: Path) -> dict[int, oddspapi.LineMarket]:
+def load_catalogue(path: Path) -> dict[int, oddspapi.LineMarket]:
     """The cached catalogue. A damaged cache raises ValueError (handler H11 reports it); delete the file to refetch."""
     raw: Any = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict) or not all(
@@ -480,8 +485,8 @@ def collect_odds(
     Its name does not match <stamp>_<book>.json.gz, so closing capture never asks that bookmaker on this scan's
     behalf."""
     empty = OddsCoverage((), 0, 0, (), ())
-    cache = state_dir / "oddspapi"
-    catalogue_file, names_file = cache / "line_markets.json", cache / "participants.json"
+    cache = state_dir / ODDS_CACHE_DIR
+    catalogue_file, names_file = cache / CATALOGUE_FILE, cache / "participants.json"
     catalogue_fresh = catalogue_file.is_file() and (
         datetime.now(timezone.utc) - datetime.fromtimestamp(catalogue_file.stat().st_mtime, timezone.utc)
         < CATALOGUE_MAX_AGE
@@ -492,12 +497,12 @@ def collect_odds(
         return empty, [f"Odds NOT fetched: OddsPapi has {left} requests left; this run needs {needed} and "
                        f"{ODDS_QUOTA_RESERVE} are kept in reserve"], False
     if catalogue_fresh:
-        catalogue = _load_catalogue(catalogue_file)
+        catalogue = load_catalogue(catalogue_file)
     else:
         catalogue = oddspapi.line_catalogue(client.get_json_value(oddspapi.MARKETS_PATH))
         _save_catalogue(catalogue_file, catalogue)
     tournaments = sorted({oddspapi.TOURNAMENTS[f.league] for f in fixtures if f.league in oddspapi.TOURNAMENTS})
-    archive = state_dir / "odds_archive"
+    archive = state_dir / ODDS_ARCHIVE_DIR
     archive.mkdir(parents=True, exist_ok=True)
     window_start = (fixtures[0].kickoff_at if fixtures else now) - FIXTURE_KICKOFF_TOLERANCE
     prices: list[oddspapi.PropPrice] = []
@@ -593,7 +598,7 @@ def run_scan(
             summary.odds_unavailable = not available
             # Closing-price capture (alerts/closing.py) asks only the bookmakers that returned fixtures here.
             answered = [book for book in books
-                        if (state_dir / "odds_archive" / f"{now:%Y%m%dT%H%M%SZ}_{book}.json.gz").is_file()]
+                        if (state_dir / ODDS_ARCHIVE_DIR / f"{now:%Y%m%dT%H%M%SZ}_{book}.json.gz").is_file()]
             save_scan_fixtures(state_dir, fixtures, answered, now)
         except (requests.RequestException, QuotaExhaustedError, ValueError) as exc:
             # An odds outage must show up in the chat, not silence the run: the summary still goes out.

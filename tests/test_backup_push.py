@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -55,22 +56,41 @@ class _Git:
     def __init__(self, bare: Path) -> None:
         self.bare = bare
         self.calls: list[list[str]] = []
+        self.env = {
+            **os.environ,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GCM_INTERACTIVE": "never",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "safe.bareRepository",
+            "GIT_CONFIG_VALUE_0": "all",
+        }
 
     def __call__(self, arguments: Sequence[str], cwd: Path) -> str:
         self.calls.append(list(arguments))
         local = [str(self.bare) if argument == REMOTE else argument for argument in arguments]
-        return subprocess.run(["git", *local], cwd=str(cwd), check=True, capture_output=True, text=True).stdout
+        return subprocess.run(["git", *local], cwd=str(cwd), check=True, capture_output=True, text=True,
+                              env=self.env).stdout
+
+
+def _git_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env.update({
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.bareRepository",
+        "GIT_CONFIG_VALUE_0": "all",
+    })
+    return env
 
 
 def _bare(tmp_path: Path) -> Path:
     bare = tmp_path / "remote.git"
-    subprocess.run(["git", "init", "--quiet", "--bare", str(bare)], check=True)
+    subprocess.run(["git", "init", "--quiet", "--bare", str(bare)], check=True, env=_git_env())
     return bare
 
 
 def _heads(bare: Path) -> list[str]:
     out = subprocess.run(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd=str(bare),
-                         check=True, capture_output=True, text=True).stdout
+                         check=True, capture_output=True, text=True, env=_git_env()).stdout
     return sorted(out.split())
 
 
@@ -180,7 +200,8 @@ def test_git_never_prompts_for_credentials_in_a_scheduled_run(monkeypatch: pytes
 
     monkeypatch.setattr(push.subprocess, "run", fake_run)
     push.run_git(["ls-remote", "--heads", REMOTE], ROOT)
-    assert seen["command"] == ["git", "ls-remote", "--heads", REMOTE] and seen["check"] is True
+    assert seen["command"] == ["git", "-c", "safe.bareRepository=all", "ls-remote", "--heads", REMOTE]
+    assert seen["check"] is True
     assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0" and seen["env"]["GCM_INTERACTIVE"] == "never"
 
 

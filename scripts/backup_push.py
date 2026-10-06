@@ -61,9 +61,21 @@ README: Final[str] = (
     "database), `state/` (the bet ledger and alert state files) and `manifest.json` (SHA-256 of each). Only the "
     "newest 14 are kept.\n\nRestore: `git clone --single-branch --branch backup/prop_alpha_<stamp> <this repository> "
     "restore`, then `pg_restore -d <database> restore/prop_alpha_<stamp>/prop_alpha.dump`.\n")
-GIT_ENVIRONMENT: Final[Mapping[str, str]] = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
 GitRunner = Callable[[Sequence[str], Path], str]
 StatusProbe = Callable[[str], int]
+
+
+def git_environment() -> dict[str, str]:
+    """Allow local bare repositories without prompting for credentials."""
+    env = dict(os.environ)
+    env.update({
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.bareRepository",
+        "GIT_CONFIG_VALUE_0": "all",
+    })
+    return env
 
 
 def remote_setting(environ: Mapping[str, str], env_file: Path = DEFAULT_ENV_FILE) -> str:
@@ -142,9 +154,14 @@ def verify_backup(folder: Path) -> None:
 
 
 def run_git(arguments: Sequence[str], cwd: Path) -> str:
-    """Run git; a non-zero exit raises (CalledProcessError) with its stderr."""
-    return subprocess.run(["git", *arguments], cwd=str(cwd), check=True, capture_output=True, text=True,
-                          env={**os.environ, **GIT_ENVIRONMENT}).stdout
+    """Run git; a non-zero exit raises (CalledProcessError) with its stderr.
+
+    Some Git setups treat bare repositories as unsafe unless explicitly allowed. The backup-push workflow uses a local
+    bare repo in tests and may also be exercised against a local bare remote during maintenance, so allow this policy
+    when running the Git commands here.
+    """
+    return subprocess.run(["git", "-c", "safe.bareRepository=all", *arguments], cwd=str(cwd), check=True,
+                          capture_output=True, text=True, env=git_environment()).stdout
 
 
 def remote_heads(remote: str, cwd: Path, git: GitRunner) -> list[str]:
