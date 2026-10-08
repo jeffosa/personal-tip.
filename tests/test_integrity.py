@@ -639,6 +639,11 @@ def test_ci_resets_only_a_named_marked_and_empty_database_and_release_never_skip
                   '[[ "${ci_rows}" == "0" ]]'):
         assert 0 < script.index(guard) < drop, guard
     assert "shobj_description(oid, 'pg_database')" in script and "prop_alpha.player_match_stats" in script
+    # On a fresh database the tables do not exist: one statement that both tests for a table and reads it fails to
+    # parse even in the branch never taken (the first GitHub release-gate runs, 2026-10-08), so no line may do both.
+    for line in script.splitlines():
+        if "to_regclass(" in line:
+            assert "FROM prop_alpha" not in line and "FROM ${ci_table}" not in line, line
     release = script.index('if [[ "${RELEASE}" -eq 1 ]]; then')
     assert release < script.index('log "stage 2/6')  # refuses before building or installing anything
     assert "--release requires PROP_ALPHA_CI_DATABASE_URL" in script[release:script.index('log "stage 2/6')]

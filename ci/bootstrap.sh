@@ -167,7 +167,15 @@ if [[ -n "${PROP_ALPHA_CI_DATABASE_URL:-}" ]]; then
   [[ "${db_marker}" == "${CI_DATABASE_MARKER}" ]] \
     || die "refusing to reset database '${db_name}': it lacks the CI marker; only if it is disposable, run: COMMENT ON DATABASE ${CI_DATABASE_NAME} IS '${CI_DATABASE_MARKER}'"
   # (3) No real data: every CI run leaves fixtures and player_match_stats empty (the merge test rolls back).
-  ci_rows="$(psql_ci -At -c "SELECT (CASE WHEN to_regclass('prop_alpha.fixtures') IS NULL THEN 0 ELSE (SELECT count(*) FROM (SELECT 1 FROM prop_alpha.fixtures LIMIT 1) f) END) + (CASE WHEN to_regclass('prop_alpha.player_match_stats') IS NULL THEN 0 ELSE (SELECT count(*) FROM (SELECT 1 FROM prop_alpha.player_match_stats LIMIT 1) s) END)")"
+  # A table that is not there yet counts as empty. The existence test and the count are separate statements: one
+  # statement naming prop_alpha.fixtures fails to parse on a fresh database even in the CASE branch never taken
+  # (the first GitHub runs, 2026-10-08: 'relation "prop_alpha.fixtures" does not exist').
+  ci_rows=0
+  for ci_table in prop_alpha.fixtures prop_alpha.player_match_stats; do
+    if [[ "$(psql_ci -At -c "SELECT to_regclass('${ci_table}') IS NOT NULL")" == "t" ]]; then
+      ci_rows=$(( ci_rows + $(psql_ci -At -c "SELECT count(*) FROM (SELECT 1 FROM ${ci_table} LIMIT 1) t") ))
+    fi
+  done
   [[ "${ci_rows}" == "0" ]] \
     || die "refusing to reset database '${db_name}': prop_alpha.fixtures or player_match_stats holds rows, which a CI database never keeps"
   server_version_num="$(psql_ci -At -c 'SHOW server_version_num')"
