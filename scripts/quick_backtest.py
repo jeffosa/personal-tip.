@@ -47,7 +47,12 @@ from prop_alpha.evaluation.backtest import (  # noqa: E402
 from prop_alpha.modeling.engine import QuantEngine  # noqa: E402
 from prop_alpha.modeling.league_level import SeasonTotals, season_of, season_rates  # noqa: E402
 
-SEASON_SPLIT: Final[datetime] = datetime(2026, 7, 1, tzinfo=timezone.utc)
+# Fit before this date, score from it. BACKTEST_SPLIT (an ISO date) moves it, e.g. to widen the test window for the
+# Championship pilot; unset it is 2026-07-01 as always. BACKTEST_LEAGUE (a prop_alpha.leagues name) restricts the
+# rows to one league.
+SEASON_SPLIT: Final[datetime] = datetime.fromisoformat(os.environ.get("BACKTEST_SPLIT", "2026-07-01")).replace(
+    tzinfo=timezone.utc)
+LEAGUE_FILTER: Final[str | None] = os.environ.get("BACKTEST_LEAGUE") or None
 LINES: Final[dict[str, tuple[float, ...]]] = {"tackles": (0.5, 1.5, 2.5), "fouls": (0.5, 1.5)}
 COLUMN: Final[dict[str, str]] = {"tackles": "tackles_attempted", "fouls": "fouls_committed"}
 OUTFIELD: Final[tuple[str, ...]] = ("DEF", "MID", "ATT")
@@ -78,7 +83,11 @@ def load_rows() -> list[tuple[Any, ...]]:
                             options="-c default_transaction_read_only=on -c statement_timeout=120000")
     try:
         with conn, conn.cursor() as cur:
-            cur.execute(QUERY)
+            if LEAGUE_FILTER is None:
+                cur.execute(QUERY)
+            else:
+                cur.execute(QUERY + " AND f.league_id = (SELECT league_id FROM prop_alpha.leagues WHERE name = %s)",
+                            (LEAGUE_FILTER,))
             return list(cur.fetchall())
     finally:
         conn.close()
@@ -239,7 +248,8 @@ def main() -> int:
             levels = {pos: level_source(rows, market, pos) for pos in obs_by_position} if args.level else None
             results["markets"][market]["runs"][label] = score_market(
                 market, lines, k, obs_by_position, rates, started_of, all_obs, history_by_player, rng, levels)
-    suffix = "_level" if args.level else ""
+    suffix = ("_level" if args.level else "") + (f"_{LEAGUE_FILTER.replace(' ', '')}" if LEAGUE_FILTER else "") \
+        + (f"_from{SEASON_SPLIT:%Y%m%d}" if SEASON_SPLIT != datetime(2026, 7, 1, tzinfo=timezone.utc) else "")
     out = ROOT / ".prop_alpha_state" / f"quick_backtest_{datetime.now(timezone.utc):%Y-%m-%d}{suffix}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(results, indent=1, default=float), encoding="utf-8")
