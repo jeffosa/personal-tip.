@@ -226,6 +226,8 @@ Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not e
 
 ## Verification (2026-10-05)
 
+**Historical.** The results below are the 2026-10-05 baseline of 591 tests, kept as a record of that day. The current baseline is `EXPECTED_TESTS` in `ci/bootstrap.sh` (703 on 2026-10-08, release gate passed locally and reported green on GitHub); see CLAUDE.md for the current status.
+
 | Command | Result |
 |---|---|
 | `python -m pytest tests -q -p no:cacheprovider` | `591 passed`, 0 skipped |
