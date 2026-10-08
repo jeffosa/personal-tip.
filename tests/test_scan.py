@@ -472,3 +472,51 @@ def test_fouls_are_priced_but_never_staked_or_alerted(tmp_path: Path, monkeypatc
     fouls_row = next(line for line in text.splitlines() if " fouls " in line)
     tackles_row = next(line for line in text.splitlines() if " tackles " in line)
     assert fouls_row.endswith(scan.UNCALIBRATED_TAG) and scan.UNCALIBRATED_TAG not in tackles_row
+
+
+# ---------------- prediction log in the scan ----------------
+def test_a_real_odds_run_logs_its_predictions_before_it_sends_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from prop_alpha.alerts.predictions import PredictionLog
+
+    _patch_database(monkeypatch)
+    store = SentAlertStore(tmp_path / "sent.jsonl")
+    notifier = _RecordingNotifier(store)
+    log = PredictionLog(tmp_path / "predictions.jsonl")
+    now = KICKOFF - timedelta(hours=2)
+    scan.run_scan(now, _StubSportmonks(), "postgresql://unused", notifier, store, 1000.0, "", currency="GBP",
+                  odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path, predictions=log)
+    records = log.load()
+    assert records and {r["fixture_id"] for r in records} == {9001}
+    assert all(r["logged_at"] == now.isoformat() and r["window_start"] == scan_window(now)[0].isoformat()
+               for r in records)
+    assert notifier.texts  # the board still went out
+
+
+def test_a_prediction_that_cannot_be_logged_stops_the_run_before_any_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from prop_alpha.alerts.predictions import PredictionLog
+
+    _patch_database(monkeypatch)
+    store = SentAlertStore(tmp_path / "sent.jsonl")
+    notifier = _RecordingNotifier(store)
+
+    def refuse(self: PredictionLog, *args: Any, **kwargs: Any) -> int:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(PredictionLog, "record", refuse)
+    with pytest.raises(OSError, match="disk full"):
+        scan.run_scan(KICKOFF - timedelta(hours=2), _StubSportmonks(), "postgresql://unused", notifier, store, 1000.0,
+                      "", currency="GBP", odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path,
+                      predictions=PredictionLog(tmp_path / "predictions.jsonl"))
+    assert notifier.texts == []
+
+
+def test_a_mock_run_never_writes_the_prediction_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_database(monkeypatch)
+    store = SentAlertStore(tmp_path / "sent.jsonl")
+    scan.run_scan(KICKOFF - timedelta(hours=2), _StubSportmonks(), "postgresql://unused", _RecordingNotifier(store),
+                  store, 1000.0, scan.MOCK_LABEL, currency="GBP", odds="mock", state_dir=tmp_path)
+    assert not (tmp_path / "predictions.jsonl").exists()

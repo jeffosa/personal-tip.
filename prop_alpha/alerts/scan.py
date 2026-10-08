@@ -42,6 +42,7 @@ from prop_alpha.alerts.closing import save_scan_fixtures
 from prop_alpha.alerts.fx import BOOK_CURRENCY, SUPPORTED_CURRENCIES, ExchangeRate, bankroll_currency, book_to_bankroll
 from prop_alpha.alerts.fx import identity as fx_identity
 from prop_alpha.alerts.ledger import PlacedBetStore, combined_exposure
+from prop_alpha.alerts.predictions import PredictionLog
 from prop_alpha.alerts.replies import USAGE, AlertItem
 from prop_alpha.alerts.telegram import (
     DEFAULT_CRITERIA,
@@ -557,11 +558,12 @@ def run_scan(
     bankroll: float, label: str, max_alerts: int = DEFAULT_MAX_ALERTS, *,
     odds: str = "mock", odds_client: Any | None = None, books: Sequence[str] = DEFAULT_BOOKMAKERS,
     state_dir: Path = STATE_DIR, bets: PlacedBetStore | None = None, currency: str,
-    book_rate: ExchangeRate | None = None,
+    book_rate: ExchangeRate | None = None, predictions: PredictionLog | None = None,
 ) -> ScanSummary:
     """With `bets`, exposure per market is the larger of the stakes alerted and the stakes recorded as placed.
     `currency` (fx.bankroll_currency()) is the bankroll's; when it is not BOOK_CURRENCY, `book_rate`
-    (fx.book_to_bankroll()) converts every book limit into it, and every stake is shown in both."""
+    (fx.book_to_bankroll()) converts every book limit into it, and every stake is shown in both. With `predictions`,
+    each fixture's Gate 2 prices are logged (alerts/predictions.py) before anything is sent; a failed write raises."""
     import psycopg2
 
     if currency not in SUPPORTED_CURRENCIES:
@@ -634,6 +636,8 @@ def run_scan(
             continue
         if odds == "oddspapi" and not quotes and projections:
             unquoted.append((fixture, inputs, projections))
+        if predictions is not None and projections:
+            predictions.record(fixture, projections, now, start)
         summary.players_priced += len({key[1] for key in projections})
         summary.quotes += len(quotes)
         summary.directives += len(report.directives)
@@ -687,7 +691,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                            float(os.environ.get(BANKROLL_ENV, DEFAULT_BANKROLL)), label,
                            int(os.environ.get(MAX_ALERTS_ENV, DEFAULT_MAX_ALERTS)),
                            odds=args.odds, odds_client=odds_client, books=books,
-                           bets=PlacedBetStore() if real else None, currency=currency, book_rate=book_rate)
+                           bets=PlacedBetStore() if real else None, currency=currency, book_rate=book_rate,
+                           predictions=PredictionLog() if real and args.send else None)
     finally:
         client.close()
         if odds_client is not None:
