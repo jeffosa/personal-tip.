@@ -117,6 +117,10 @@ def test_env_file_parsing_handles_comments_quotes_and_export() -> None:
         parse_env_file("not a pair\n")
 
 
+def test_env_file_parsing_accepts_utf8_bom() -> None:
+    assert parse_env_file("\ufeffODDSPAPI_KEY=example\n") == {"ODDSPAPI_KEY": "example"}
+
+
 def test_config_prefers_environment_and_hides_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text(f"TELEGRAM_BOT_TOKEN={FAKE_TOKEN}\nTELEGRAM_CHAT_ID=111\n", encoding="utf-8")

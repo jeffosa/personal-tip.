@@ -15,9 +15,9 @@ DEFAULT_DSN: Final[str] = "postgresql://postgres@localhost:5432/prop_alpha"
 
 
 def parse_env_file(text: str) -> dict[str, str]:
-    """KEY=VALUE lines; blank lines and # comments ignored; optional `export` prefix and matching quotes."""
+    """Parse KEY=VALUE lines, including files saved with a UTF-8 BOM."""
     values: dict[str, str] = {}
-    for number, raw in enumerate(text.splitlines(), start=1):
+    for number, raw in enumerate(text.removeprefix("\ufeff").splitlines(), start=1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
