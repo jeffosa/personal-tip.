@@ -27,6 +27,8 @@ SOCCER_SPORT_ID: Final[int] = 10
 TOURNAMENTS: Final[Mapping[str, int]] = {"League One": 24, "League Two": 25}
 # OddsPapi marketType -> prop_alpha market. Card markets are not priced by the scan yet.
 MARKET_TYPES: Final[Mapping[str, str]] = {"playertotals-tackles": "tackles", "playertotals-foulscommitted": "fouls"}
+# Championship/Premier League ladders (pilot, 2026-10-08): "k+" is Over k - 0.5 and "0" is Under 0.5.
+LADDER_MARKET_TYPES: Final[Mapping[str, str]] = {"players-tackles": "tackles", "players-foulscommitted": "fouls"}
 # Lower-league prop limits are £50-£500 (PRD Gate 4); a quote without a published limit is assumed to take 50.
 UNKNOWN_LIMIT_STAKE: Final[float] = 50.0
 
@@ -188,6 +190,113 @@ def prop_prices(body: Any, catalogue: Mapping[int, LineMarket], bookmaker: str) 
                     stake_limit = None if limit is None else _finite(limit, f"player {player_ref} limit")
                     prices.append(PropPrice(
                         fixture, bookmaker, line_market.market, line_market.line, side, str(player_ref),
+                        str(quote.get("playerName") or ""), price,
+                        stake_limit if stake_limit is not None and stake_limit > 0 else None,
+                    ))
+    return prices
+
+
+_LADDER_OUTCOME: Final[re.Pattern[str]] = re.compile(r"([0-9]+)\+")
+_LADDER_ZERO: Final[str] = "0"
+_LADDER_YES: Final[str] = "Yes"  # "Player To Commit A Foul": at least one, Over 0.5
+
+
+@dataclass(frozen=True)
+class LadderMarket:
+    """`steps`: outcomeId -> (line, side, step name). "k+" (the player makes k or more) is Over k - 0.5; the outcome "0"
+    (no tackles/fouls at all) is Under 0.5, and "Yes" (to commit a foul) is Over 0.5."""
+
+    market: str
+    steps: Mapping[int, tuple[float, str, str]]
+
+
+@dataclass(frozen=True)
+class LadderPrice:
+    """One bookmaker's price on one ladder step for one player, as the equivalent over/under line and side."""
+
+    fixture: OddsFixture
+    bookmaker: str
+    market: str
+    line: float
+    side: str
+    step: str
+    player_ref: str
+    player_name: str
+    price: float
+    limit: float | None
+
+
+def ladder_catalogue(markets: Any) -> dict[int, LadderMarket]:
+    """marketId -> LadderMarket for the player ladder markets in LADDER_MARKET_TYPES. An outcome that is not "k+" with
+    k >= 1, "0" or "Yes", raises ValueError: a ladder this parser does not understand is refused, not guessed."""
+    if not isinstance(markets, list):
+        raise ValueError("malformed OddsPapi response: the market catalogue is not a list")
+    catalogue: dict[int, LadderMarket] = {}
+    for raw in markets:
+        market = _object(raw, "a catalogue market")
+        kind = LADDER_MARKET_TYPES.get(str(market.get("marketType")))
+        if kind is None or not market.get("playerProp"):
+            continue
+        market_id = _identifier(market.get("marketId"), "catalogue marketId")
+        outcomes = market.get("outcomes") or []
+        if not isinstance(outcomes, list):
+            raise ValueError(f"malformed OddsPapi response: market {market_id} outcomes are not a list")
+        steps: dict[int, tuple[float, str, str]] = {}
+        for outcome in (_object(o, f"market {market_id} outcome") for o in outcomes):
+            name = str(outcome.get("outcomeName"))
+            matched = _LADDER_OUTCOME.fullmatch(name)
+            if name == _LADDER_ZERO:
+                step = (0.5, "under", name)
+            elif name == _LADDER_YES:
+                step = (0.5, "over", name)
+            elif matched is not None and int(matched.group(1)) >= 1:
+                step = (int(matched.group(1)) - 0.5, "over", name)
+            else:
+                raise ValueError(f"market {market_id}: outcome {name!r} is not a k+ ladder step, 0 or Yes")
+            steps[_identifier(outcome.get("outcomeId"), f"market {market_id} outcomeId")] = step
+        catalogue[market_id] = LadderMarket(kind, steps)
+    return catalogue
+
+
+def ladder_prices(body: Any, catalogue: Mapping[int, LadderMarket], bookmaker: str) -> list[LadderPrice]:
+    """Every active player ladder price in `body` (an odds-by-tournaments response). Same rules as prop_prices: a
+    malformed body raises ValueError; an inactive quote, or a price of 1.0 or less, is skipped."""
+    if not isinstance(body, list):
+        raise ValueError("malformed OddsPapi response: the odds response is not a list")
+    prices: list[LadderPrice] = []
+    for raw_fixture in body:
+        raw = _object(raw_fixture, "a fixture")
+        if raw.get("fixtureId") in (None, ""):
+            raise ValueError("malformed OddsPapi response: a fixture has no fixtureId")
+        fixture = OddsFixture(str(raw["fixtureId"]), _identifier(raw.get("participant1Id"), "participant1Id"),
+                              _identifier(raw.get("participant2Id"), "participant2Id"), _kickoff(raw.get("startTime")))
+        book = _object(raw.get("bookmakerOdds") or {}, f"fixture {fixture.odds_fixture_id} bookmakerOdds").get(bookmaker)
+        if not book:
+            continue
+        book = _object(book, f"fixture {fixture.odds_fixture_id} {bookmaker} odds")
+        if not book.get("bookmakerIsActive", True) or book.get("suspended"):
+            continue
+        for market_id, raw_market in _object(book.get("markets") or {}, "markets").items():
+            market = _object(raw_market, f"market {market_id}")
+            ladder = catalogue.get(_identifier(market_id, "marketId"))
+            if ladder is None or not market.get("marketActive", True):
+                continue
+            for outcome_id, raw_outcome in _object(market.get("outcomes") or {}, f"market {market_id} outcomes").items():
+                step = ladder.steps.get(_identifier(outcome_id, f"market {market_id} outcomeId"))
+                if step is None:
+                    continue
+                outcome = _object(raw_outcome, f"market {market_id} outcome {outcome_id}")
+                for player_ref, raw_quote in _object(outcome.get("players") or {}, f"outcome {outcome_id} players").items():
+                    quote = _object(raw_quote, f"player {player_ref} quote")
+                    if not quote.get("active", True) or quote.get("price") is None:
+                        continue
+                    price = _finite(quote.get("price"), f"player {player_ref} price")
+                    if price <= 1.0:
+                        continue
+                    limit = quote.get("limit")
+                    stake_limit = None if limit is None else _finite(limit, f"player {player_ref} limit")
+                    prices.append(LadderPrice(
+                        fixture, bookmaker, ladder.market, step[0], step[1], step[2], str(player_ref),
                         str(quote.get("playerName") or ""), price,
                         stake_limit if stake_limit is not None and stake_limit > 0 else None,
                     ))
