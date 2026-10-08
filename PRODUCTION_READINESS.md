@@ -37,8 +37,8 @@ Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not e
   counts. The local `prop_alpha_ci` was marked once with `COMMENT ON DATABASE`.
 - `.github/workflows/ci.yml` runs the release gate on every push and pull request against a throwaway `postgres:18`
   service (trust authentication, reachable only from the runner, so no password exists to leak). The first 11 GitHub
-  runs failed (the last cause: the emptiness check failed on a fresh database, fixed 2026-10-08 in `a1322e6`); the maintainer
-  reported the run for `a1322e6` green (not seen by Claude). The suite now also runs on Linux with Python 3.14.7.
+  runs failed (the last cause: the emptiness check failed on a fresh database, fixed 2026-10-08 in `a1322e6`); runs #12 (`a1322e6`) and #13
+  (`636625e`) are green in the maintainer's screenshot of the Actions page (Claude has no GitHub access). The suite now also runs on Linux with Python 3.14.7.
 - Structural test: `test_ci_resets_only_a_named_marked_and_empty_database_and_release_never_skips_it`.
 
 ### 4. Type diagnostics
