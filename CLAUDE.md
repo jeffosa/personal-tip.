@@ -43,8 +43,7 @@ bash ci/bootstrap.sh --preflight
 PROP_ALPHA_CI_DATABASE_URL="postgresql://postgres@localhost:5432/prop_alpha_ci" bash ci/bootstrap.sh --release
 ```
 
-`.github/workflows/ci.yml` runs the release gate on every push against a throwaway PostgreSQL 18 service; it has not
-run on GitHub yet **[U]**.
+`.github/workflows/ci.yml` runs the release gate on every push against a throwaway PostgreSQL 18 service. The first 11 runs (2026-10-05 to 2026-10-08) all failed; the last cause was stage 6's emptiness check naming a table that does not exist on a fresh database (fixed in `a1322e6`). The maintainer reported on 2026-10-08 that the run for `a1322e6` is green (not seen by Claude: no GitHub access from here). GitHub's runner uses Python 3.14.7 and a PostgreSQL 16 client against the postgres:18 service.
 
 Static types (both run in CI stage 5; any error fails it):
 
