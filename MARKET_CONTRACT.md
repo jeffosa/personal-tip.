@@ -29,6 +29,22 @@ bet365/Opta wording above says interceptions are not tackles. So **no combinatio
 target (`tackles_attempted`, `fouls_committed`) is not shown to be what the book settles. Do not infer the rules from odds
 ratios or one match's outcomes.
 
+### 2a. Team-level totals and the margin caveat (added 2026-10-10)
+
+- Sportmonks' team totals for West Ham v QPR: West Ham tackles attempted 13, won 8, interceptions 5, fouls committed 9;
+  QPR tackles attempted 14, won 10, interceptions 9, fouls committed 9.
+- Two third-party sites (search summaries, provider not stated, one a live snapshot at 92+4') show team fouls 9-9 (FootyStats),
+  8-8 (WinDrawWin) and team tackles 13-11 (FootyStats). Sportmonks matches the fouls 9-9 and West Ham's 13 tackles
+  attempted but not QPR's 11 (it has 14 attempted, 10 won). These sites are **not** attributed to Opta here, so this
+  neither confirms nor refutes the settlement statistic; it only shows Sportmonks' plain counts are in line with some other feed
+  at team level.
+- Earlier notes read the gap between bet365's implied probabilities and Sportmonks' frequencies as a definition mismatch,
+  assuming a margin of about 5-10%. **That margin was never measured.** The "0" step that would let it be measured (with
+  "1+" it covers every outcome) is not quoted next to "1+" in the archived replies. Player-prop ladders can carry much larger
+  margins, and larger on long odds, which would also make the gap grow with the step. So a definition mismatch is
+  **possible, not established**, and a large margin plus longshot shading is an equally live explanation.
+- The 2026-10-08 13:33 UTC archive shows ladders on 3 Championship fixtures (the first archive had 1 of 12).
+
 ## 3. Evidence table to fill (West Ham United v Queens Park Rangers, 2026-10-09, final 1-1)
 
 Sportmonks counts are filled in from `.prop_alpha_state/pilot/counts_19729059.json`. The last three columns need an
