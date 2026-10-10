@@ -245,6 +245,23 @@ def test_backup_dumps_copies_and_verifies_the_ledger_and_writes_a_manifest(tmp_p
     assert manifest["dump"]["bytes"] == len(b"PGDMP fake dump")
 
 
+def test_the_backup_covers_the_prediction_log_and_the_t60_team_sheets(tmp_path: Path) -> None:
+    """Audit 2026-10-10: predictions.py and lineup_capture.py say their files are in the daily backup, but the file
+    list omitted them, so a successful backup did not protect the Gate 2 lockbox evidence."""
+    from prop_alpha.alerts import lineup_capture, predictions
+
+    backup = _backup_module()
+    names = (predictions.PREDICTIONS_NAME, lineup_capture.LINEUPS_NAME, lineup_capture.HANDLED_NAME)
+    assert set(names) <= set(backup.STATE_FILES)
+    state = _state(tmp_path)
+    for name in names:
+        (state / name).write_text(f"evidence {name}\n", encoding="utf-8")
+    folder = backup.backup(tmp_path / "backups", state, NOW, runner=_fake_runner(LISTING, []))
+    manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    assert set(names) <= set(manifest["state"])
+    assert all((folder / "state" / name).read_text(encoding="utf-8") == f"evidence {name}\n" for name in names)
+
+
 def test_a_dump_missing_table_data_fails_and_is_left_incomplete(tmp_path: Path) -> None:
     backup = _backup_module()
     partial = "\n".join(line for line in LISTING.splitlines() if "player_match_stats" not in line)

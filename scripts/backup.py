@@ -49,6 +49,9 @@ STATE_FILES: Final[tuple[str, ...]] = (
     "placed_bets.jsonl", "sent_alerts.jsonl", "alert_messages.jsonl", "alert_deliveries.jsonl", "ledger_answers.jsonl",
     "telegram_offset.json", "ledger_last_poll.json", "closing_quotes.jsonl", "closing_captured.json",
     "scan_fixtures.json", "fair_boards_sent.json", "task_health.json", "fx_rate.json",
+    # The evaluation evidence (audit 2026-10-10: both were documented as backed up, and neither was): the model's
+    # logged prospective predictions (Gate 2 lockbox) and the T-60 team sheets.
+    "predictions.jsonl", "lineups_t60.jsonl", "lineups_t60_handled.json",
 )
 # Folders copied whole: the raw bookmaker responses are the evidence for closing-line analysis (PRD Gate 3).
 STATE_DIRS: Final[tuple[str, ...]] = ("odds_archive",)
