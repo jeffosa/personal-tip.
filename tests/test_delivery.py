@@ -75,7 +75,7 @@ def test_a_failed_send_leaves_an_unknown_outcome_for_review_and_is_never_resent(
     assert log.load(datetime.now(timezone.utc))[2].state == "sending"  # within PENDING_GRACE: may still be in flight
     unknown = log.needs_review(_later())
     assert [(d.delivery_id, d.state, d.message_id) for d in unknown] == [(2, "unknown", None)]
-    assert "HIGH-VALUE BETS 6-7 of 7" in unknown[0].text and len(unknown[0].items) == 2
+    assert unknown[0].text.startswith("TACKLE (message 2 of 2)") and len(unknown[0].items) == 2
     assert len(store.load()) == 7  # still counted as exposure, as before
     restarted = TelegramNotifier(TelegramConfig(FAKE_TOKEN, "987654321"), session=FakeSession(), store=store,
                                  sleep=lambda seconds: None, deliveries=log)
@@ -106,7 +106,7 @@ def test_resend_is_labelled_indexed_and_confirmed_once(tmp_path: Path) -> None:
     # The header goes on its own, so the copy is exactly the original text and still fits one message.
     header, text = (call[1]["text"] for call in session.calls)
     assert header == delivery.RESENT_HEADER and text == log.load(_later())[1].text
-    assert "HIGH-VALUE BETS 1-2 of 2" in text
+    assert text.startswith("TACKLE\n") and "1a)" in text and "1b)" in text
     resolved = log.load(_later())[1]
     assert (resolved.state, resolved.resolution, resolved.message_id) == ("confirmed", "resent", 90)
     assert sorted(index.load()[90]) == [1, 2]  # a "placed 2 @..." reply to the copy records the bet

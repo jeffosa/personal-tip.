@@ -193,7 +193,7 @@ def test_alerts_carry_the_mock_label_names_and_respect_the_cap(tmp_path: Path) -
     assert summary.alerts_sent == len(notifier.texts) == 1
     for text in notifier.texts:
         assert text.startswith(scan.MOCK_LABEL)
-        assert "Walsall v Port Vale" in text and ("Regular Starter" in text or "Away Starter" in text)
+        assert "Walsall vs Port Vale" in text and ("Regular Starter" in text or "Away Starter" in text)
     assert scan.MOCK_LABEL in summary.text(scan.MOCK_LABEL)
 
 
@@ -281,8 +281,8 @@ def test_odds_outage_is_reported_in_the_summary_not_fatal(
     assert "Bankroll: GBP 1,000.00" in text
     assert summary.odds_unavailable  # main() exits ODDS_UNAVAILABLE_EXIT, so the scheduled task shows a failure
     assert "Odds unavailable this run, nothing priced: HTTPError" in text and "HTTP 403" in text
-    assert "Matches kicking off in this window: 1" in text
-    assert "Priced matches with no bookmaker quote (nothing sent: no price to qualify against): 1" in text
+    assert "Matches in this window: 1" in text
+    assert "Matches with no bookmaker quote (no price to qualify against): 1" in text
     assert "Fair-price boards sent" not in text
 
 
@@ -481,7 +481,7 @@ def test_fouls_are_priced_but_never_staked_or_alerted(tmp_path: Path, monkeypatc
                             _RecordingNotifier(store), store, 1000.0, scan.MOCK_LABEL, currency="GBP", odds="mock",
                             state_dir=tmp_path)
     assert seen and set(seen) == {"tackles"}
-    assert "Alerted markets: tackles" in summary.text("")
+    assert "Tipped markets: tackles" in summary.text("")
     entries = [FairPrice(9001, 1, "fouls", 1.5, "over", 0.5, 2.0, 2.12),
                FairPrice(9001, 1, "tackles", 1.5, "over", 0.5, 2.0, 2.12)]
     squad = (SquadPlayer(1, "Player 01", "MID", "76"),)

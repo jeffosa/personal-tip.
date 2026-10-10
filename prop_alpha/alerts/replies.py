@@ -25,8 +25,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Final, Mapping, Sequence
 
+# A tip message numbers its matches and letters the bets under each ("1a", "2c"). The letters leave out o and u,
+# which a reply may use as the over/under shorthand right after the number ("placed 3 u @1.9 5").
+BET_LETTERS: Final[str] = "abcdefghijklmnpqrstvwxyz"
 PLACED_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"^\s*placed\s+#?(?P<number>\d{1,3})\s*(?P<side>over|under|o|u)?\s*@\s*(?P<odds>\d{1,4}(?:\.\d{1,3})?)\s+"
+    r"^\s*placed\s+#?(?P<number>\d{1,3}[a-npq-tv-z]?)\s*(?P<side>over|under|o|u)?\s*@\s*(?P<odds>\d{1,4}(?:\.\d{1,3})?)\s+"
     r"(?P<symbol>[£$€])?\s*(?P<stake>\d{1,7}(?:\.\d{1,2})?)\s*(?P<book>[A-Za-z0-9][A-Za-z0-9 ._-]{0,39})?\s*$",
     re.IGNORECASE,
 )
@@ -35,9 +38,11 @@ SETTLE_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^\s*settled?\s+#?(?P<bet_id>\d{1,7})\s+(?P<result>won|win|lost|lose|void)\s*$", re.IGNORECASE
 )
 USAGE: Final[str] = (
-    "To record a bet, reply to the alert or board message with: placed <number> [over|under] @<odds> <stake> [book]"
-    " - e.g. placed 3 @1.95 5. To cancel one: undo <bet id>. To record a result: settled <bet id> won|lost|void."
+    "To record a bet, reply to the tip or board message with: placed <number> [over|under] @<odds> <stake> [book]"
+    " - e.g. placed 1a @1.95 5 (the number is the one shown beside the bet). To cancel one: undo <bet id>. "
+    "To record a result: settled <bet id> won|lost|void."
 )
+REF_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\d{1,3}[a-npq-tv-z]?$")
 RESULTS: Final[tuple[str, ...]] = ("won", "lost", "void")
 SETTLEMENT_SOURCES: Final[frozenset[str]] = frozenset({"auto", "manual"})
 # The stored count each market settles on (ingestion/oddspapi.py market contract, assumed until checked).
@@ -61,7 +66,8 @@ def _valid_line(line: float) -> bool:
 class AlertItem:
     """One numbered bet of a sent alert or board message. `min_odds` holds (side, minimum acceptable odds) for
     each side offered: one side on an alert, one or two on a board row. `book` is the alert's bookmaker; a board
-    names none."""
+    names none. `number` is unique within its message; `label` is the reference a reply uses when the message shows
+    one ("1a": match 1, bet a), otherwise the reply uses the number."""
 
     number: int
     kind: str
@@ -73,12 +79,15 @@ class AlertItem:
     match: str
     player: str
     book: str | None = None
+    label: str = ""
 
     def __post_init__(self) -> None:
         if self.kind not in ITEM_KINDS:
             raise ValueError(f"item kind must be one of {sorted(ITEM_KINDS)}")
         if self.number < 1:
             raise ValueError("item number must be at least 1")
+        if self.label and (REF_PATTERN.match(self.label) is None or self.label[-1].isdigit()):
+            raise ValueError(f"item label {self.label!r} must be a match number and a bet letter, e.g. 1a")
         if not self.market or not _valid_line(self.line):
             raise ValueError("item needs a market and a whole or half line")
         sides = [side for side, _ in self.min_odds]
@@ -91,13 +100,19 @@ class AlertItem:
     def sides(self) -> dict[str, float]:
         return dict(self.min_odds)
 
+    @property
+    def ref(self) -> str:
+        """What a reply calls this bet: its label ("1a") or, without one, its number ("3")."""
+        return self.label or str(self.number)
+
 
 @dataclass(frozen=True)
 class PlaceCommand:
-    """`stake_symbol` is the currency sign typed before the stake (£, $ or €), or None: then the stake is in the
-    bankroll currency. The ledger converts a book-currency stake (£ with a USD bankroll) at the cached rate."""
+    """`number` is the reference typed after `placed` ("3" or "1a", lower-case). `stake_symbol` is the currency
+    sign typed before the stake (£, $ or €), or None: then the stake is in the bankroll currency. The ledger
+    converts a book-currency stake (£ with a USD bankroll) at the cached rate."""
 
-    number: int
+    number: str
     side: str | None
     odds: float
     stake: float
@@ -133,7 +148,7 @@ def parse_reply(text: str) -> PlaceCommand | UndoCommand | SettleCommand | Reply
             return ReplyError(f"Stake must be positive. {USAGE}")
         book = (placed.group("book") or "").strip() or None
         return PlaceCommand(
-            int(placed.group("number")),
+            placed.group("number").lower(),
             None if side is None else ("over" if side.lower().startswith("o") else "under"),
             odds, stake, book, placed.group("symbol"),
         )
@@ -205,9 +220,10 @@ def resolve_bet(
 ) -> PlacedBet | ReplyError:
     """The bet `command` describes on the message whose numbered items are `items`, or why it cannot be recorded.
     `stake` replaces command.stake when the ledger converted it from `entered` (amount, currency)."""
-    item = items.get(command.number)
+    by_ref = {item.ref: item for item in items.values()}
+    item = by_ref.get(command.number)
     if item is None:
-        listed = ", ".join(str(n) for n in sorted(items)) or "none"
+        listed = ", ".join(i.ref for i in sorted(items.values(), key=lambda i: i.number)) or "none"
         return ReplyError(f"That message has no bet {command.number} (it lists: {listed}).")
     sides = item.sides
     if command.side is None:

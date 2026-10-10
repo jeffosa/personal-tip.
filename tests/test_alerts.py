@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ import numpy as np
 import pytest
 import requests
 
+from prop_alpha.alerts.replies import USAGE, PlacedBet, PlaceCommand, ReplyError, parse_reply, resolve_bet
 from prop_alpha.alerts.telegram import (
     AlertContext,
     DEFAULT_CRITERIA,
@@ -23,6 +25,7 @@ from prop_alpha.alerts.telegram import (
     _reference_manager,
     alert_key,
     demo_case,
+    digest_items,
     format_digest,
     format_directive,
     load_config,
@@ -32,7 +35,13 @@ from prop_alpha.alerts.telegram import (
     simulation_seed,
 )
 from prop_alpha.modeling.engine import VoidRule
-from prop_alpha.scanner.market_scanner import AllocationReport, ExposureBook, LiveOddsQuote, price_for_ev
+from prop_alpha.scanner.market_scanner import (
+    AllocationReport,
+    ExposureBook,
+    LiveOddsQuote,
+    StakingDirective,
+    price_for_ev,
+)
 from prop_alpha.scanner.value_screen import HighValueCriteria, assess_high_value
 
 # Assembled at runtime so the repository secrets scan never sees a token-shaped literal.
@@ -288,8 +297,8 @@ def test_a_stake_capped_by_an_assumed_limit_says_so_in_pounds() -> None:
     assumed = replace(directive, limit_published=False)
     for published, text in ((directive, format_directive(directive, assessment, "GBP")),
                             (assumed, format_directive(assumed, assessment, "GBP")),
-                            (directive, format_digest([(directive, assessment, None)], 1, 1, 1, 1, "", "GBP")),
-                            (assumed, format_digest([(assumed, assessment, None)], 1, 1, 1, 1, "", "GBP"))):
+                            (directive, format_digest([(directive, None)], 1, 1, "", "GBP")),
+                            (assumed, format_digest([(assumed, None)], 1, 1, "", "GBP"))):
         assert f"GBP {published.stake:.2f}" in text
         assert ("book limit not published, assumed GBP 50" in text) is (not published.limit_published)
 
@@ -358,14 +367,83 @@ def test_digest_sends_at_most_five_bets_per_message(n_bets: int, expected_messag
     alerted, ids = notifier.notify_digest(AllocationReport(), {}, label="MOCK", descriptions=contexts)
     texts = [call[1]["text"] for call in session.calls]
     assert alerted == n_bets and len(ids) == len(texts) == len(expected_messages)
-    assert [text.count("   Player: ") for text in texts] == expected_messages
-    assert all(text.startswith("MOCK\n" + PAPER_LABEL) for text in texts)
+    assert [len(re.findall(r"^ +\d+[a-z]\) ", text, re.MULTILINE)) for text in texts] == expected_messages
+    assert all(text.startswith("MOCK\nTACKLE") and PAPER_LABEL in text for text in texts)
     if len(texts) > 1:
-        assert f"HIGH-VALUE BETS 6-{n_bets} of {n_bets} (message 2 of 2)" in texts[1]
+        assert texts[0].startswith("MOCK\nTACKLE (message 1 of 2)") and texts[1].startswith("MOCK\nTACKLE (message 2 of 2)")
     first = texts[0]
-    assert "1. Walsall v Port Vale, Sat 10 Oct 14:00 UTC" in first and "   Player: Player 0 (Walsall)" in first
-    assert "   Bet: UNDER 4.5 tackles @ " in first and "SyntheticBookC" in first
+    assert "1. Walsall vs Port Vale, Sat 10 Oct 14:00 UTC" in first
+    assert re.search(r"^   1a\) Player 0 \(Walsall\) tackle under 4\.5 \d\.\d\d odd$", first, re.MULTILINE)
+    assert "SyntheticBookC | take it at " in first
+    assert "HIGH-VALUE" not in first and "Edge:" not in first
     assert len(SentAlertStore(tmp_path / "sent.jsonl").load()) == n_bets
+
+
+def _tip_directives() -> tuple[StakingDirective, StakingDirective, StakingDirective]:
+    _, report = demo_case(NOW)
+    base = next(d for d in report.directives if d.line_value == 4.5)
+    return (replace(base, fixture_id=1, player_id=11), replace(base, fixture_id=2, player_id=21),
+            replace(base, fixture_id=1, player_id=12, side="over", line_value=0.5))
+
+
+def test_tips_group_by_match_and_letter_each_bet() -> None:
+    a, b, c = _tip_directives()
+    contexts = {1: AlertContext("Team A v Team B, Sat 10 Oct 14:00 UTC", "Player A (Team A)"),
+                2: AlertContext("Team C v Team D, Sat 10 Oct 15:00 UTC", "Player C (Team C)")}
+    entries = [(a, contexts[1]), (b, contexts[2]), (c, AlertContext(contexts[1].match, "Player B (Team B)"))]
+    text = format_digest(entries, 1, 1, "", "GBP")
+    lines = text.splitlines()
+    assert lines[0] == "TACKLE"
+    assert lines.index("1. Team A vs Team B, Sat 10 Oct 14:00 UTC") < lines.index("2. Team C vs Team D, Sat 10 Oct 15:00 UTC")
+    # The third bet is the first match's second bet, so it is shown under match 1 as 1b, ahead of match 2's 2a.
+    assert [line.strip().split(" ")[0] for line in lines if re.match(r"^ +\d+[a-z]\) ", line)] == ["1a)", "1b)", "2a)"]
+    assert "   1b) Player B (Team B) tackle over 0.5 " in text and text.index("1b)") < text.index("2a)")
+    items = digest_items(entries)
+    assert [(i.number, i.label, i.player_id, tuple(i.sides)) for i in items] == [
+        (1, "1a", 11, ("under",)), (2, "1b", 12, ("over",)), (3, "2a", 21, ("under",))]
+    assert text.endswith(USAGE) and PAPER_LABEL in text
+
+
+def test_a_tip_message_holds_one_market_and_names_fouls() -> None:
+    a, _, _ = _tip_directives()
+    fouls = replace(a, market_type="fouls")
+    with pytest.raises(ValueError, match="one market"):
+        format_digest([(a, None), (fouls, None)])
+    assert format_digest([(fouls, None)]).startswith("FOUL\n")
+    assert " foul under 4.5 " in format_digest([(fouls, None)])
+    with pytest.raises(ValueError):
+        format_digest([])
+
+
+def test_notify_digest_sends_each_market_as_its_own_message(tmp_path: Path) -> None:
+    notifier, session, bets = _digest_notifier(2, tmp_path)
+    fouls = (replace(bets[1][0], market_type="fouls"), bets[1][1])
+    notifier._high_value = lambda *args: [bets[0], fouls]  # type: ignore[method-assign]
+    alerted, ids = notifier.notify_digest(AllocationReport(), {})
+    texts = [call[1]["text"] for call in session.calls]
+    assert alerted == 2 and len(ids) == 2
+    assert texts[0].startswith("TACKLE\n") and texts[1].startswith("FOUL\n")
+    assert "2." not in texts[0].splitlines()[2]  # each message numbers its own matches from 1
+
+
+def test_a_reply_quoting_a_bet_label_resolves_the_bet() -> None:
+    a, b, c = _tip_directives()
+    entries = [(a, AlertContext("Team A v Team B, x", "Player A (Team A)")),
+               (b, AlertContext("Team C v Team D, y", "Player C (Team C)")),
+               (c, AlertContext("Team A v Team B, x", "Player B (Team B)"))]
+    items = {item.number: item for item in digest_items(entries)}
+    command = parse_reply("placed 1B @1.85 5")
+    assert isinstance(command, PlaceCommand) and command.number == "1b"
+    bet = resolve_bet(command, items, bet_id=1, update_id=1, message_id=9, placed_at=NOW)
+    assert isinstance(bet, PlacedBet) and bet.player == "Player B (Team B)" and bet.side == "over" and bet.number == 2
+    missing = resolve_bet(PlaceCommand("1c", None, 1.8, 5.0, None), items, bet_id=1, update_id=1, message_id=9,
+                          placed_at=NOW)
+    assert isinstance(missing, ReplyError) and "it lists: 1a, 1b, 2a" in missing.message
+    # The over/under shorthand after a plain number still parses (letters o and u are never bet labels).
+    plain = parse_reply("placed 3 u @1.9 5")
+    assert isinstance(plain, PlaceCommand) and plain.number == "3" and plain.side == "under"
+    with pytest.raises(ValueError, match="label"):
+        replace(items[1], label="1")
 
 
 def test_digest_rejects_an_empty_page_size(tmp_path: Path) -> None:

@@ -218,26 +218,22 @@ class ScanSummary:
         lines = [
             *((label,) if label else ()),
             f"prop_alpha scan {self.window_start:%a %d %b %H:%M}-{self.window_end:%H:%M} UTC",
-            f"Matches kicking off in this window: {len(self.fixtures)}"
-            + (f" ({'; '.join(self.fixtures)})" if self.fixtures else ""),
+            f"Matches in this window: {len(self.fixtures)}",
         ]
         if self.fixtures:
-            lines += [
-                f"Players priced: {self.players_priced}; quotes checked: {self.quotes}; "
-                f"stakes suggested: {self.directives}; high-value alerts sent: {self.alerts_sent}",
-                *((f"Bankroll: {self.bankroll}",) if self.bankroll else ()),
-            ]
+            lines.append(f"Players priced: {self.players_priced} | quotes checked: {self.quotes} | "
+                         f"tips sent: {self.alerts_sent}")
+            if self.bankroll:
+                lines.append(f"Bankroll: {self.bankroll}")
             if self.alert_cap is not None and self.alerts_sent >= self.alert_cap:
-                lines.append(f"Alert cap of {self.alert_cap} per run reached: the best by expected profit were sent")
+                lines.append(f"Tip cap of {self.alert_cap} per run reached: the best by expected profit were sent")
             if self.boards_sent:
                 lines.append(f"Fair-price boards sent (matches with no bookmaker line): {self.boards_sent}")
             elif self.unquoted_matches:
-                lines.append(f"Priced matches with no bookmaker quote (nothing sent: no price to qualify against): "
-                             f"{self.unquoted_matches}")
+                lines.append(f"Matches with no bookmaker quote (no price to qualify against): {self.unquoted_matches}")
         lines += self.odds_notes
         if self.fixtures:
-            lines.append(f"Alerted markets: {', '.join(sorted(ALERT_MARKETS))}; other markets are priced for "
-                         f"evaluation only (they fail Gate 2 calibration) and marked {UNCALIBRATED_TAG} on boards")
+            lines.append(f"Tipped markets: {', '.join(sorted(ALERT_MARKETS))} (the others fail Gate 2 calibration)")
         lines += [f"Could not price {failure}" for failure in self.failures]
         lines.append(PAPER_LABEL)
         return "\n".join(lines)

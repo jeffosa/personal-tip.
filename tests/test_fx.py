@@ -97,7 +97,7 @@ def test_alerts_show_the_stake_in_both_currencies_and_the_assumed_limit_converte
     assumed = replace(directive, limit_published=False)
     in_pounds = f"(= GBP {directive.stake / RATE.rate:.2f} at 1.3201, ECB 02 Oct)"
     for text in (format_directive(assumed, assessment, "USD", book_rate=RATE),
-                 format_digest([(assumed, assessment, None)], 1, 1, 1, 1, "", "USD", RATE)):
+                 format_digest([(assumed, None)], 1, 1, "", "USD", RATE)):
         assert f"USD {directive.stake:.2f} {in_pounds}" in text
         assert "book limit not published, assumed GBP 50 = USD 66.00" in text
     plain = format_directive(directive, assessment, "GBP")

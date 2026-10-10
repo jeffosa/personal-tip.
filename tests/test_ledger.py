@@ -45,9 +45,9 @@ MESSAGES = {500: {1: ALERT, 2: BOARD}}
 
 # ---------------- parsing ----------------
 @pytest.mark.parametrize(("text", "expected"), [
-    ("placed 3 @1.95 5", PlaceCommand(3, None, 1.95, 5.0, None)),
-    ("Placed 2 under @ 2.10 £10 Sky Bet", PlaceCommand(2, "under", 2.10, 10.0, "Sky Bet", "£")),
-    ("placed #1 o @1.9 5.50", PlaceCommand(1, "over", 1.9, 5.5, None)),
+    ("placed 3 @1.95 5", PlaceCommand("3", None, 1.95, 5.0, None)),
+    ("Placed 2 under @ 2.10 £10 Sky Bet", PlaceCommand("2", "under", 2.10, 10.0, "Sky Bet", "£")),
+    ("placed #1 o @1.9 5.50", PlaceCommand("1", "over", 1.9, 5.5, None)),
     ("undo 12", UndoCommand(12)),
     ("UNDO #3", UndoCommand(3)),
     ("settled 12 lost", SettleCommand(12, "lost")),
@@ -70,22 +70,22 @@ def _resolve(command: PlaceCommand) -> PlacedBet | ReplyError:
 
 
 def test_alert_bet_takes_its_side_and_book() -> None:
-    bet = _resolve(PlaceCommand(1, None, 2.05, 5.0, None))
+    bet = _resolve(PlaceCommand("1", None, 2.05, 5.0, None))
     assert isinstance(bet, PlacedBet)
     assert (bet.side, bet.book, bet.min_odds, bet.kind, bet.below_minimum) == ("over", "skybet", 1.97, "alert", False)
 
 
 def test_board_bet_needs_a_side_that_is_listed() -> None:
-    assert isinstance(_resolve(PlaceCommand(2, None, 2.0, 5.0, None)), ReplyError)  # both sides listed
-    assert isinstance(_resolve(PlaceCommand(1, "under", 2.0, 5.0, None)), ReplyError)  # alert offers OVER only
-    missing = _resolve(PlaceCommand(9, None, 2.0, 5.0, None))
+    assert isinstance(_resolve(PlaceCommand("2", None, 2.0, 5.0, None)), ReplyError)  # both sides listed
+    assert isinstance(_resolve(PlaceCommand("1", "under", 2.0, 5.0, None)), ReplyError)  # alert offers OVER only
+    missing = _resolve(PlaceCommand("9", None, 2.0, 5.0, None))
     assert isinstance(missing, ReplyError) and "lists: 1, 2" in missing.message
-    bet = _resolve(PlaceCommand(2, "under", 2.80, 5.0, "bet365"))
+    bet = _resolve(PlaceCommand("2", "under", 2.80, 5.0, "bet365"))
     assert isinstance(bet, PlacedBet) and (bet.side, bet.min_odds, bet.book) == ("under", 2.75, "bet365")
 
 
 def test_board_bet_without_a_book_is_recorded_as_unknown_and_low_odds_are_flagged() -> None:
-    bet = _resolve(PlaceCommand(2, "over", 1.60, 5.0, None))
+    bet = _resolve(PlaceCommand("2", "over", 1.60, 5.0, None))
     assert isinstance(bet, PlacedBet) and bet.book == "unknown" and bet.below_minimum
     assert "WARNING: 1.60 is below the minimum 1.70" in confirmation(bet) and "undo 1" in confirmation(bet)
 
