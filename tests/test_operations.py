@@ -4,6 +4,7 @@ running went unnoticed, and placed_bets.jsonl, the only record of the bets place
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -260,6 +261,28 @@ def test_the_backup_covers_the_prediction_log_and_the_t60_team_sheets(tmp_path: 
     manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
     assert set(names) <= set(manifest["state"])
     assert all((folder / "state" / name).read_text(encoding="utf-8") == f"evidence {name}\n" for name in names)
+    # The manifest's hashes and sizes are those of the source bytes, and the copies match them.
+    for name in names:
+        data = (state / name).read_bytes()  # not re-encoded: write_text translates line endings on Windows
+        assert manifest["state"][name] == {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        assert hashlib.sha256((folder / "state" / name).read_bytes()).hexdigest() == manifest["state"][name]["sha256"]
+
+
+def test_absent_prediction_and_lineup_files_are_skipped_safely(tmp_path: Path) -> None:
+    """Before the first scan or T-60 capture the files do not exist: that is not an error and not in the manifest.
+    A later backup picks each up as soon as it exists."""
+    from prop_alpha.alerts import lineup_capture, predictions
+
+    backup = _backup_module()
+    state = _state(tmp_path)
+    optional = {predictions.PREDICTIONS_NAME, lineup_capture.LINEUPS_NAME, lineup_capture.HANDLED_NAME}
+    first = backup.backup(tmp_path / "backups", state, NOW, runner=_fake_runner(LISTING, []))
+    manifest = json.loads((first / "manifest.json").read_text(encoding="utf-8"))
+    assert not optional & set(manifest["state"])
+    (state / predictions.PREDICTIONS_NAME).write_text('{"line": 1}\n', encoding="utf-8")
+    second = backup.backup(tmp_path / "backups", state, NOW + timedelta(days=1), runner=_fake_runner(LISTING, []))
+    manifest = json.loads((second / "manifest.json").read_text(encoding="utf-8"))
+    assert optional & set(manifest["state"]) == {predictions.PREDICTIONS_NAME}
 
 
 def test_a_dump_missing_table_data_fails_and_is_left_incomplete(tmp_path: Path) -> None:
