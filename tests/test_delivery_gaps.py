@@ -207,10 +207,13 @@ def test_a_message_stopped_between_send_and_confirmation_still_takes_bet_replies
         raise KeyboardInterrupt("process stopped")
 
     log.resolve = stopped  # type: ignore[method-assign]
+    # The notifier stamps deliveries with the real clock, so the times here come from it too: a fixed date in the
+    # test (it was 2026-10-10 12:00) stops working once the real clock passes it (found 2026-10-10 at 13:59 UTC).
+    real_now = datetime.now(timezone.utc)
     with pytest.raises(KeyboardInterrupt):
-        notifier.send_tracked("FAIR-PRICE BOARD\n1. B (Walsall)", "board", [BOARD], NOW + timedelta(hours=3))
+        notifier.send_tracked("FAIR-PRICE BOARD\n1. B (Walsall)", "board", [BOARD], real_now + timedelta(hours=3))
     assert index.load()[77] == {2: BOARD}  # a "placed 2 under @..." reply to message 77 is recorded
-    assert DeliveryLog(tmp_path / "deliveries.jsonl").needs_review(NOW + timedelta(hours=1))  # and it is reviewed
+    assert DeliveryLog(tmp_path / "deliveries.jsonl").needs_review(real_now + timedelta(hours=1))  # and it is reviewed
 
 
 def test_two_ledger_writers_cannot_run_at_once_and_a_finished_one_releases_the_lock(tmp_path: Path) -> None:

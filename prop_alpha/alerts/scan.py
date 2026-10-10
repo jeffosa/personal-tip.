@@ -13,9 +13,10 @@ transaction, the alert state files, the OddsPapi cache and odds archive under .p
 in ODDS_BOOKMAKERS, plus the market catalogue (weekly) and team names (when an unknown team appears). The free
 plan has 250 requests, so the run first reads the unmetered account endpoint and skips odds when fetching would
 leave fewer than ODDS_QUOTA_RESERVE. Every raw odds response is archived for closing-line analysis.
-In an `--odds oddspapi` run, a match where no bookmaker quote matched any player gets a fair-price board instead
-(`send_boards`): each priced player's fair and minimum odds on the line closest to even, for manual comparison with
-any bookmaker. Each match is boarded once (`fair_boards_sent.json` in the state directory).
+Only bets that pass the high-value screen are sent as tips. A match where no bookmaker quote matched any player used to
+get a fair-price board (`send_boards`: each priced player's fair and minimum odds on the line closest to even); by
+maintainer decision (2026-10-10) boards are no longer sent, because a price with no bookmaker line to compare against
+cannot pass the benchmark (SEND_FAIR_BOARDS). The summary still says how many priced matches had no bookmaker quote.
 `--odds mock` prices from the model plus noise: its alerts are labelled MOCK on every message and recorded in
 their own state file, so they never count toward real exposure. One fixture that cannot be priced is recorded in the summary and skipped (sanctioned
 handler H9); the rest of the slate is still scanned.
@@ -114,6 +115,9 @@ ODDS_QUOTA_RESERVE: Final[int] = 20
 CATALOGUE_MAX_AGE: Final[timedelta] = timedelta(days=7)
 QuoteSource = Callable[[UpcomingFixture, Mapping[ProjectionKey, FactorProjection]], list[LiveOddsQuote]]
 BOARD_STATE_NAME: Final[str] = "fair_boards_sent.json"
+# Fair-price boards carry no bookmaker price, so they cannot pass the high-value screen: off by maintainer decision
+# (2026-10-10, "anything below the benchmark should not be sent"). `send_boards` and `format_board` stay, tested.
+SEND_FAIR_BOARDS: Final[bool] = False
 # Rows (player, market) per Telegram message, keeping each board message well under the 4,096-character limit.
 BOARD_ROWS_PER_MESSAGE: Final[int] = 25
 # Markets whose bookmaker quotes may be staked and alerted. Fouls fails PRD Gate 2 calibration on the selection
@@ -201,6 +205,7 @@ class ScanSummary:
     directives: int = 0
     alerts_sent: int = 0
     boards_sent: int = 0
+    unquoted_matches: int = 0
     alert_cap: int | None = None
     bankroll: str = ""
     # True when a real-odds run had no usable bookmaker prices (outage, quota reserve, every book failed): main()
@@ -226,6 +231,9 @@ class ScanSummary:
                 lines.append(f"Alert cap of {self.alert_cap} per run reached: the best by expected profit were sent")
             if self.boards_sent:
                 lines.append(f"Fair-price boards sent (matches with no bookmaker line): {self.boards_sent}")
+            elif self.unquoted_matches:
+                lines.append(f"Priced matches with no bookmaker quote (nothing sent: no price to qualify against): "
+                             f"{self.unquoted_matches}")
         lines += self.odds_notes
         if self.fixtures:
             lines.append(f"Alerted markets: {', '.join(sorted(ALERT_MARKETS))}; other markets are priced for "
@@ -650,8 +658,10 @@ def run_scan(
             combined, all_projections, bankroll_currency=currency, label=label, descriptions=all_descriptions,
             max_alerts=max_alerts, book_rate=rate,
         )
-        # No bookmaker line to compare against: give the manual bettor the model's prices instead.
-        summary.boards_sent = send_boards(notifier, unquoted, state_dir / BOARD_STATE_NAME)
+        # No bookmaker line to compare against: nothing can qualify, so nothing is sent unless boards are switched on.
+        summary.unquoted_matches = len(unquoted)
+        if SEND_FAIR_BOARDS:
+            summary.boards_sent = send_boards(notifier, unquoted, state_dir / BOARD_STATE_NAME)
     return summary
 
 

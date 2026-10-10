@@ -275,13 +275,15 @@ def test_odds_outage_is_reported_in_the_summary_not_fatal(
                                 store, 1000.0, "", currency="GBP", odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path)
     assert summary.fixtures == ["Walsall v Port Vale 14:00"]
     assert summary.quotes == 0 and summary.alerts_sent == 0
-    assert summary.boards_sent == 1 and notifier.texts and all(t.startswith(PAPER_LABEL) for t in notifier.texts)
+    # Maintainer decision 2026-10-10: nothing below the high-value benchmark is sent, so no board goes out.
+    assert summary.boards_sent == 0 and summary.unquoted_matches == 1 and notifier.texts == []
     text = summary.text("")
     assert "Bankroll: GBP 1,000.00" in text
     assert summary.odds_unavailable  # main() exits ODDS_UNAVAILABLE_EXIT, so the scheduled task shows a failure
     assert "Odds unavailable this run, nothing priced: HTTPError" in text and "HTTP 403" in text
     assert "Matches kicking off in this window: 1" in text
-    assert "Fair-price boards sent (matches with no bookmaker line): 1" in text
+    assert "Priced matches with no bookmaker quote (nothing sent: no price to qualify against): 1" in text
+    assert "Fair-price boards sent" not in text
 
 
 # ---------------- league level in the scan ----------------
@@ -397,9 +399,24 @@ def test_board_inputs_and_entries_are_validated() -> None:
         FairPrice(1, 1, "fouls", 1.5, "over", 0.5, 2.0, 1.9)
 
 
+def test_boards_are_off_by_default_and_nothing_below_the_benchmark_is_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Maintainer decision 2026-10-10: only bets that pass the high-value screen reach Telegram."""
+    assert scan.SEND_FAIR_BOARDS is False
+    _patch_database(monkeypatch)
+    store = SentAlertStore(tmp_path / "sent.jsonl")
+    notifier = _RecordingNotifier(store)
+    summary = scan.run_scan(KICKOFF - timedelta(hours=2), _StubSportmonks(), "postgresql://unused", notifier, store,
+                            1000.0, "", currency="GBP", odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path)
+    assert summary.alerts_sent == 0 and summary.boards_sent == 0 and notifier.texts == []
+    assert not (tmp_path / scan.BOARD_STATE_NAME).exists()  # nothing was marked as boarded
+
+
 def test_board_is_sent_once_per_match_and_never_for_mock_or_quoted_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(scan, "SEND_FAIR_BOARDS", True)  # the board mechanism itself is still tested, switched on
     _patch_database(monkeypatch)
     store = SentAlertStore(tmp_path / "sent.jsonl")
     first, again = _RecordingNotifier(store), _RecordingNotifier(store)
@@ -491,7 +508,7 @@ def test_a_real_odds_run_logs_its_predictions_before_it_sends_anything(
     assert records and {r["fixture_id"] for r in records} == {9001}
     assert all(r["logged_at"] == now.isoformat() and r["window_start"] == scan_window(now)[0].isoformat()
                for r in records)
-    assert notifier.texts  # the board still went out
+    assert notifier.texts == []  # no board and no alert: nothing below the benchmark is sent
 
 
 def test_a_prediction_that_cannot_be_logged_stops_the_run_before_any_alert(
