@@ -114,6 +114,10 @@ DEFAULT_BOOKMAKERS: Final[tuple[str, ...]] = ("bet365", "skybet", "williamhill")
 ODDS_QUOTA_RESERVE: Final[int] = 20
 CATALOGUE_MAX_AGE: Final[timedelta] = timedelta(days=7)
 QuoteSource = Callable[[UpcomingFixture, Mapping[ProjectionKey, FactorProjection]], list[LiveOddsQuote]]
+PriceFixture = Callable[
+    [UpcomingFixture, "SlateInputs", QuantEngine, Mapping[str, QuantEngine] | None],
+    tuple[dict[ProjectionKey, FactorProjection], list[str]],
+]
 BOARD_STATE_NAME: Final[str] = "fair_boards_sent.json"
 # Fair-price boards carry no bookmaker price, so they cannot pass the high-value screen: off by maintainer decision
 # (2026-10-10, "anything below the benchmark should not be sent"). `send_boards` and `format_board` stay, tested.
@@ -251,12 +255,15 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def fetch_upcoming(client: Any, start: datetime, end: datetime) -> list[UpcomingFixture]:
-    """Not-started SCAN_LEAGUES fixtures with kickoff in [start, end). Raises if the listing is longer than
-    MAX_LISTING_PAGES pages: a scan of part of the window would report normally while missing fixtures."""
+def fetch_upcoming(
+    client: Any, start: datetime, end: datetime, leagues: Mapping[int, str] = sportmonks.SCAN_LEAGUES
+) -> list[UpcomingFixture]:
+    """Not-started fixtures of `leagues` (default SCAN_LEAGUES) with kickoff in [start, end). Raises if the listing is
+    longer than MAX_LISTING_PAGES pages: a scan of part of the window would report normally while missing fixtures."""
     fixtures: list[UpcomingFixture] = []
     for page in range(1, MAX_LISTING_PAGES + 1):
-        rows, has_more = sportmonks.upcoming_fixtures(client.get_json(sportmonks.upcoming_path(start, end, page)))
+        rows, has_more = sportmonks.upcoming_fixtures(
+            client.get_json(sportmonks.upcoming_path(start, end, page, leagues)), leagues)
         fixtures += [UpcomingFixture(**row) for row in rows if start <= row["kickoff_at"] < end]
         if not has_more:
             return sorted(fixtures, key=lambda f: (f.kickoff_at, f.fixture_id))
@@ -321,10 +328,12 @@ def scan_fixture(
     fixture: UpcomingFixture, inputs: SlateInputs, now: datetime, quotes_for: QuoteSource,
     manager: InstitutionalAssetManager, engine: QuantEngine, summary: ScanSummary, exposure: Any,
     market_engines: Mapping[str, QuantEngine] | None = None,
+    pricer: PriceFixture = price_fixture,
 ) -> tuple[dict[ProjectionKey, FactorProjection], AllocationReport | None, list[LiveOddsQuote]]:
-    """Projections, quotes and the allocation for one fixture; a pricing failure is recorded and skipped."""
+    """Projections, quotes and the allocation for one fixture; a pricing failure is recorded and skipped. `pricer` is
+    price_fixture, the frozen League One/Two model; the Championship pilot passes its own."""
     try:
-        projections, skipped = price_fixture(fixture, inputs, engine, market_engines)
+        projections, skipped = pricer(fixture, inputs, engine, market_engines)
         quotes = quotes_for(fixture, projections)
         report = manager.allocate(projections, quotes, now=now, exposure=exposure)
     except (ProjectionError, ValueError, FloatingPointError) as exc:

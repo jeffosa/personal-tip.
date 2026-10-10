@@ -25,6 +25,8 @@ AUTH_QUERY_PARAM: Final[str] = "apiKey"
 SOCCER_SPORT_ID: Final[int] = 10
 # OddsPapi tournament ids for the scanned leagues (Sportmonks name -> OddsPapi id).
 TOURNAMENTS: Final[Mapping[str, int]] = {"League One": 24, "League Two": 25}
+# Tournaments whose tackles and fouls player markets are "k+" ladders (the Championship pilot, 2026-10-08).
+LADDER_TOURNAMENTS: Final[Mapping[str, int]] = {"Championship": 18}
 # OddsPapi marketType -> prop_alpha market. Card markets are not priced by the scan yet.
 MARKET_TYPES: Final[Mapping[str, str]] = {"playertotals-tackles": "tackles", "playertotals-foulscommitted": "fouls"}
 # Championship/Premier League ladders (pilot, 2026-10-08): "k+" is Over k - 0.5 and "0" is Under 0.5.
@@ -301,6 +303,14 @@ def ladder_prices(body: Any, catalogue: Mapping[int, LadderMarket], bookmaker: s
                         stake_limit if stake_limit is not None and stake_limit > 0 else None,
                     ))
     return prices
+
+
+def ladder_as_prop_prices(prices: Sequence[LadderPrice]) -> list[PropPrice]:
+    """The ladder prices as one-sided line prices (PropPrice), so the scan's quote building pairs them. A "k+" step is
+    the Over of line k - 0.5 on its own; the "0" step is the Under of 0.5, which meets the "1+" Over in one two-way
+    quote when both are listed. Nothing is invented: a ladder step has only the side the book offers."""
+    return [PropPrice(p.fixture, p.bookmaker, p.market, p.line, p.side, p.player_ref, p.player_name, p.price, p.limit)
+            for p in prices]
 
 
 def normalise(name: str) -> str:

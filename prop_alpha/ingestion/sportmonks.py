@@ -307,26 +307,30 @@ def lineup_payload(body: Mapping[str, Any]) -> dict[str, Any]:
 
 # Leagues the opportunity scan covers (Sportmonks league id -> prop_alpha.leagues.name).
 SCAN_LEAGUES: Final[Mapping[int, str]] = {12: "League One", 14: "League Two"}
+# The Championship pilot scan (alerts/ladder_scan.py): Sportmonks league id -> name in the pilot database.
+CHAMPIONSHIP_LEAGUES: Final[Mapping[int, str]] = {9: "Championship"}
 UPCOMING_INCLUDE: Final[str] = "participants;state"
 
 
-def upcoming_path(start: datetime, end: datetime, page: int) -> str:
-    """Listing of SCAN_LEAGUES fixtures between two UTC dates (inclusive), one page of 50."""
-    leagues = ",".join(str(league) for league in sorted(SCAN_LEAGUES))
+def upcoming_path(start: datetime, end: datetime, page: int, leagues: Mapping[int, str] = SCAN_LEAGUES) -> str:
+    """Listing of `leagues` (default SCAN_LEAGUES) fixtures between two UTC dates (inclusive), one page of 50."""
+    league_ids = ",".join(str(league) for league in sorted(leagues))
     return (
-        f"fixtures/between/{start:%Y-%m-%d}/{end:%Y-%m-%d}?filters=fixtureLeagues:{leagues}"
+        f"fixtures/between/{start:%Y-%m-%d}/{end:%Y-%m-%d}?filters=fixtureLeagues:{league_ids}"
         f"&include={UPCOMING_INCLUDE}&per_page=50&page={page}"
     )
 
 
-def upcoming_fixtures(body: Mapping[str, Any]) -> tuple[list[dict[str, Any]], bool]:
-    """(not-started fixtures in SCAN_LEAGUES, whether another page follows) from one listing page."""
+def upcoming_fixtures(
+    body: Mapping[str, Any], leagues: Mapping[int, str] = SCAN_LEAGUES
+) -> tuple[list[dict[str, Any]], bool]:
+    """(not-started fixtures in `leagues` (default SCAN_LEAGUES), whether another page follows) from one listing page."""
     data = body.get("data")
     if not isinstance(data, list):
         raise ValueError("Sportmonks listing has no 'data' list")
     fixtures: list[dict[str, Any]] = []
     for fixture in data:
-        league = SCAN_LEAGUES.get(fixture.get("league_id"))
+        league = leagues.get(fixture.get("league_id"))
         state = fixture.get("state")
         if league is None or not isinstance(state, Mapping) or state.get("developer_name") not in SCHEDULED_STATES:
             continue
@@ -348,16 +352,18 @@ def upcoming_fixtures(body: Mapping[str, Any]) -> tuple[list[dict[str, Any]], bo
     return fixtures, bool(isinstance(pagination, Mapping) and pagination.get("has_more"))
 
 
-def finished_fixtures(body: Mapping[str, Any]) -> tuple[list[tuple[str, datetime]], bool]:
-    """(finished SCAN_LEAGUES fixtures as (fixture id, kickoff), whether another page follows) from one page of
-    the upcoming_path listing: the results job ingests these."""
+def finished_fixtures(
+    body: Mapping[str, Any], leagues: Mapping[int, str] = SCAN_LEAGUES
+) -> tuple[list[tuple[str, datetime]], bool]:
+    """(finished `leagues` (default SCAN_LEAGUES) fixtures as (fixture id, kickoff), whether another page follows) from
+    one page of the upcoming_path listing: the results job ingests these."""
     data = body.get("data")
     if not isinstance(data, list):
         raise ValueError("Sportmonks listing has no 'data' list")
     finished: list[tuple[str, datetime]] = []
     for fixture in data:
         state = fixture.get("state")
-        if (fixture.get("league_id") in SCAN_LEAGUES and isinstance(state, Mapping)
+        if (fixture.get("league_id") in leagues and isinstance(state, Mapping)
                 and state.get("developer_name") in FINAL_STATES):
             finished.append((str(int(fixture["id"])), datetime.fromisoformat(_kickoff(fixture))))
     pagination = body.get("pagination")

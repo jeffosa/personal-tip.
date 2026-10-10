@@ -539,6 +539,7 @@ def format_digest(
     label: str = "",
     bankroll_currency: str = "",
     book_rate: ExchangeRate | None = None,
+    usage: str = USAGE,
 ) -> str:
     """One plain-text message of tips for one market, grouped by match (maintainer format, 2026-10-10):
 
@@ -572,7 +573,7 @@ def format_digest(
             if tip.assessment is not None:
                 lines.append(f"       edge held in {tip.assessment.survival_rate:.0%} of "
                              f"{tip.assessment.n_simulations:,} simulated match conditions")
-    lines += ["", PAPER_LABEL, USAGE]
+    lines += ["", PAPER_LABEL, usage]
     return "\n".join(lines)
 
 
@@ -752,6 +753,7 @@ class TelegramNotifier:
         max_alerts: int | None = None,
         per_message: int = DIGEST_SIZE,
         book_rate: ExchangeRate | None = None,
+        usage: str = USAGE,
     ) -> tuple[int, list[int]]:
         """As notify, but the high-value bets go out as tip messages (format_digest): one market per message, at most
         `per_message` bets each (10 tackle bets: two messages of 5), the best first. Returns (bets alerted, message
@@ -768,7 +770,7 @@ class TelegramNotifier:
             parts = -(-len(tips) // per_message)
             for part in range(parts):
                 chunk = tips[part * per_message:(part + 1) * per_message]
-                text = format_digest(chunk, part + 1, parts, label, bankroll_currency, book_rate)
+                text = format_digest(chunk, part + 1, parts, label, bankroll_currency, book_rate, usage)
                 items = digest_items(chunk)
                 delivery_id = self._begin_delivery("digest", text, items, max(entry[0].expires_at for entry in chunk))
                 for directive, _, _ in chunk:
