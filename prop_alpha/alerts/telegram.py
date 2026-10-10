@@ -481,7 +481,8 @@ def stake_text(stake: float, currency: str, book_rate: ExchangeRate | None = Non
     return text
 
 
-TipEntry = tuple[StakingDirective, AlertContext | None]
+# (directive, its high-value assessment or None, readable names or None). The assessment supplies the survival rate.
+TipEntry = tuple[StakingDirective, HighValueAssessment | None, AlertContext | None]
 
 
 @dataclass(frozen=True)
@@ -492,6 +493,7 @@ class TipLine:
     number: int
     label: str
     directive: StakingDirective
+    assessment: HighValueAssessment | None
     context: AlertContext | None
 
     def __post_init__(self) -> None:
@@ -502,7 +504,7 @@ class TipLine:
 def tip_layout(entries: Sequence[TipEntry]) -> list[tuple[str, list[TipLine]]]:
     """The bets of one tip message grouped by match, in order of first appearance (the best bet's match first):
     (match header, its numbered and lettered bets). A message holds one market."""
-    if len({directive.market_type for directive, _ in entries}) > 1:
+    if len({entry[0].market_type for entry in entries}) > 1:
         raise ValueError("a tip message holds one market")
     by_fixture: dict[int, list[TipEntry]] = {}
     for entry in entries:
@@ -512,12 +514,12 @@ def tip_layout(entries: Sequence[TipEntry]) -> list[tuple[str, list[TipLine]]]:
     for match_number, bets in enumerate(by_fixture.values(), start=1):
         if len(bets) > len(BET_LETTERS):
             raise ValueError(f"{len(bets)} bets in one match; a tip message letters at most {len(BET_LETTERS)}")
-        context = bets[0][1]
+        context = bets[0][2]
         header = (context.match if context else f"Fixture {bets[0][0].fixture_id}").replace(" v ", " vs ", 1)
         tips: list[TipLine] = []
-        for letter, (directive, bet_context) in zip(BET_LETTERS, bets):
+        for letter, (directive, assessment, bet_context) in zip(BET_LETTERS, bets):
             number += 1
-            tips.append(TipLine(number, f"{match_number}{letter}", directive, bet_context))
+            tips.append(TipLine(number, f"{match_number}{letter}", directive, assessment, bet_context))
         layout.append((header, tips))
     return layout
 
@@ -545,8 +547,10 @@ def format_digest(
         1. Team A vs Team B, Sat 10 Oct 14:00 UTC
            1a) Player A (Team A) tackle over 0.5 1.80 odd
                bookmaker | take it at 1.70 or better, until 13:30 UTC | stake USD 5.00
+               edge held in 68% of 1,000 simulated match conditions
 
-    A reply records a bet by its label: `placed 1a @1.80 5`."""
+    The last line is the high-value screen's survival rate (more than 60% passes); it is left out when the entry
+    has no assessment. A reply records a bet by its label: `placed 1a @1.80 5`."""
     if not entries:
         raise ValueError("a tip message needs at least one bet")
     market = entries[0][0].market_type
@@ -565,6 +569,9 @@ def format_digest(
                 f"{directive.expires_at:%H:%M} UTC | stake {stake_text(directive.stake, currency, book_rate)}"
                 + ("" if directive.limit_published else f" | {limit_note(book_rate)}"),
             ]
+            if tip.assessment is not None:
+                lines.append(f"       edge held in {tip.assessment.survival_rate:.0%} of "
+                             f"{tip.assessment.n_simulations:,} simulated match conditions")
     lines += ["", PAPER_LABEL, USAGE]
     return "\n".join(lines)
 
@@ -753,9 +760,9 @@ class TelegramNotifier:
             raise ValueError("per_message must be at least 1")
         passing = list(self._high_value(report, projections, criteria, max_alerts))
         by_market: dict[str, list[TipEntry]] = {}
-        for directive, _ in passing:
+        for directive, assessment in passing:
             context = (descriptions or {}).get((directive.fixture_id, directive.player_id, directive.market_type))
-            by_market.setdefault(directive.market_type, []).append((directive, context))
+            by_market.setdefault(directive.market_type, []).append((directive, assessment, context))
         message_ids: list[int] = []
         for market, tips in by_market.items():
             parts = -(-len(tips) // per_message)
@@ -763,8 +770,8 @@ class TelegramNotifier:
                 chunk = tips[part * per_message:(part + 1) * per_message]
                 text = format_digest(chunk, part + 1, parts, label, bankroll_currency, book_rate)
                 items = digest_items(chunk)
-                delivery_id = self._begin_delivery("digest", text, items, max(d.expires_at for d, _ in chunk))
-                for directive, _ in chunk:
+                delivery_id = self._begin_delivery("digest", text, items, max(entry[0].expires_at for entry in chunk))
+                for directive, _, _ in chunk:
                     self._record(directive)
                 message_ids.append(self._send_and_confirm(text, delivery_id, items))
                 logger.info("%s tips message %d/%d sent with %d bets", market, part + 1, parts, len(chunk))

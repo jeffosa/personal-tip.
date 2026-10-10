@@ -42,7 +42,7 @@ from prop_alpha.scanner.market_scanner import (
     StakingDirective,
     price_for_ev,
 )
-from prop_alpha.scanner.value_screen import HighValueCriteria, assess_high_value
+from prop_alpha.scanner.value_screen import HighValueAssessment, HighValueCriteria, assess_high_value
 
 # Assembled at runtime so the repository secrets scan never sees a token-shaped literal.
 FAKE_TOKEN = "123456789" + ":" + "AAH" + "x" * 32
@@ -297,8 +297,8 @@ def test_a_stake_capped_by_an_assumed_limit_says_so_in_pounds() -> None:
     assumed = replace(directive, limit_published=False)
     for published, text in ((directive, format_directive(directive, assessment, "GBP")),
                             (assumed, format_directive(assumed, assessment, "GBP")),
-                            (directive, format_digest([(directive, None)], 1, 1, "", "GBP")),
-                            (assumed, format_digest([(assumed, None)], 1, 1, "", "GBP"))):
+                            (directive, format_digest([(directive, assessment, None)], 1, 1, "", "GBP")),
+                            (assumed, format_digest([(assumed, assessment, None)], 1, 1, "", "GBP"))):
         assert f"GBP {published.stake:.2f}" in text
         assert ("book limit not published, assumed GBP 50" in text) is (not published.limit_published)
 
@@ -376,6 +376,9 @@ def test_digest_sends_at_most_five_bets_per_message(n_bets: int, expected_messag
     assert re.search(r"^   1a\) Player 0 \(Walsall\) tackle under 4\.5 \d\.\d\d odd$", first, re.MULTILINE)
     assert "SyntheticBookC | take it at " in first
     assert "HIGH-VALUE" not in first and "Edge:" not in first
+    survival = bets[0][1].survival_rate
+    assert f"edge held in {survival:.0%} of 1,000 simulated match conditions" in first
+    assert first.count("simulated match conditions") == len(re.findall(r"^ +\d+[a-z]\) ", first, re.MULTILINE))
     assert len(SentAlertStore(tmp_path / "sent.jsonl").load()) == n_bets
 
 
@@ -390,7 +393,7 @@ def test_tips_group_by_match_and_letter_each_bet() -> None:
     a, b, c = _tip_directives()
     contexts = {1: AlertContext("Team A v Team B, Sat 10 Oct 14:00 UTC", "Player A (Team A)"),
                 2: AlertContext("Team C v Team D, Sat 10 Oct 15:00 UTC", "Player C (Team C)")}
-    entries = [(a, contexts[1]), (b, contexts[2]), (c, AlertContext(contexts[1].match, "Player B (Team B)"))]
+    entries = [(a, None, contexts[1]), (b, None, contexts[2]), (c, None, AlertContext(contexts[1].match, "Player B (Team B)"))]
     text = format_digest(entries, 1, 1, "", "GBP")
     lines = text.splitlines()
     assert lines[0] == "TACKLE"
@@ -404,13 +407,26 @@ def test_tips_group_by_match_and_letter_each_bet() -> None:
     assert text.endswith(USAGE) and PAPER_LABEL in text
 
 
+def test_each_tip_shows_its_survival_percentage() -> None:
+    a, b, _ = _tip_directives()
+    passing = HighValueAssessment(0.08, 0.6, 0.5, True, True, 683, 1000, True)
+    marginal = HighValueAssessment(0.05, 0.55, 0.5, True, True, 612, 1000, True)
+    text = format_digest([(a, passing, None), (b, marginal, None), (replace(b, player_id=99), None, None)])
+    lines = text.splitlines()
+    first = next(i for i, line in enumerate(lines) if line.startswith("   1a)"))
+    assert lines[first + 2] == "       edge held in 68% of 1,000 simulated match conditions"
+    assert "       edge held in 61% of 1,000 simulated match conditions" in lines
+    # An entry without an assessment shows no survival line rather than a made-up one.
+    assert text.count("simulated match conditions") == 2
+
+
 def test_a_tip_message_holds_one_market_and_names_fouls() -> None:
     a, _, _ = _tip_directives()
     fouls = replace(a, market_type="fouls")
     with pytest.raises(ValueError, match="one market"):
-        format_digest([(a, None), (fouls, None)])
-    assert format_digest([(fouls, None)]).startswith("FOUL\n")
-    assert " foul under 4.5 " in format_digest([(fouls, None)])
+        format_digest([(a, None, None), (fouls, None, None)])
+    assert format_digest([(fouls, None, None)]).startswith("FOUL\n")
+    assert " foul under 4.5 " in format_digest([(fouls, None, None)])
     with pytest.raises(ValueError):
         format_digest([])
 
@@ -428,9 +444,9 @@ def test_notify_digest_sends_each_market_as_its_own_message(tmp_path: Path) -> N
 
 def test_a_reply_quoting_a_bet_label_resolves_the_bet() -> None:
     a, b, c = _tip_directives()
-    entries = [(a, AlertContext("Team A v Team B, x", "Player A (Team A)")),
-               (b, AlertContext("Team C v Team D, y", "Player C (Team C)")),
-               (c, AlertContext("Team A v Team B, x", "Player B (Team B)"))]
+    entries = [(a, None, AlertContext("Team A v Team B, x", "Player A (Team A)")),
+               (b, None, AlertContext("Team C v Team D, y", "Player C (Team C)")),
+               (c, None, AlertContext("Team A v Team B, x", "Player B (Team B)"))]
     items = {item.number: item for item in digest_items(entries)}
     command = parse_reply("placed 1B @1.85 5")
     assert isinstance(command, PlaceCommand) and command.number == "1b"
