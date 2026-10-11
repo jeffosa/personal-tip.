@@ -50,9 +50,9 @@ def test_each_tip_becomes_a_numbered_paper_bet_with_its_odds_and_a_tip_line(tmp_
     tips = pilot_ledger.load_tips(tips_file)
     assert set(tips) == {1, 2} and tips[1]["league"] == "Brazil Serie A" and tips[1]["kickoff_at"] == KICKOFF.isoformat()
     assert pilot_ledger.fixture_of(tips[1]) == FIXTURE
-    # Ids carry on from the file, so a second run never reuses one.
-    pilot_ledger.record_tips(store, tips_file, _tips(1), {500: FIXTURE}, NOW + timedelta(hours=4))
-    assert [b.bet_id for b in store.open_bets(NOW)] == [1, 2, 3]
+    # Ids carry on from the file, so a second run never reuses one; only the new selection (the third player) is added.
+    [third] = pilot_ledger.record_tips(store, tips_file, _tips(3), {500: FIXTURE}, NOW + timedelta(hours=4))
+    assert third.player_id == 72 and [b.bet_id for b in store.open_bets(NOW)] == [1, 2, 3]
 
 
 def test_a_tip_with_no_fixture_is_refused_and_a_damaged_tip_line_raises(tmp_path: Path) -> None:
@@ -115,30 +115,89 @@ def test_the_record_command_refuses_an_unknown_bet_and_a_bad_result(
         pilot_ledger.main(["--record", "1", "maybe"])
 
 
-def test_settle_sends_the_new_results_only_when_asked(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_reconstructed_paper_bets_are_kept_out_of_the_model_scored_total(tmp_path: Path) -> None:
+    store, tips_file = _record(tmp_path)
+    for _, settlement in ledger.settle_open_bets(store.open_bets(NOW), _rows(count=2), NOW):
+        store.record_settlement(settlement)
+    records = pilot_ledger.load_tips(tips_file)
+    assert pilot_ledger.reconstructed_ids(records) == set()
+    records[2]["reconstructed"] = True
+    rebuilt = pilot_ledger.reconstructed_ids(records)
+    text = pilot_ledger.results_text(store.settled_bets(), [], rebuilt)
+    assert rebuilt == {2} and "1 reconstructed (no model numbers, excluded from model scoring): model-scored 1 settled" in text
+    assert "reconstructed" not in pilot_ledger.results_text(store.settled_bets(), [])
+
+
+def _settle_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sent: list[str], fail: bool = False) -> PlacedBetStore:
     store, _ = _record(tmp_path)
-    for name, value in (("PILOT_BETS_FILE", store.path), ("PILOT_CLOSING_FILE", tmp_path / "closing.jsonl"),
-                        ("PILOT_LOCK_FILE", tmp_path / "pilot.lock")):
-        monkeypatch.setattr(pilot_ledger, name, value)
+    monkeypatch.setattr(pilot_ledger, "PILOT_BETS_FILE", store.path)
+    monkeypatch.setattr(pilot_ledger, "PILOT_CLOSING_FILE", tmp_path / "closing.jsonl")
+    monkeypatch.setattr(ledger, "DEFAULT_LOCK_FILE", tmp_path / "ledger.lock")  # never the real ledger's lock or queue
+    monkeypatch.setattr(ledger, "DEFAULT_ANSWERS_FILE", tmp_path / "answers.jsonl")
     monkeypatch.setattr(ledger, "read_settlement_rows", lambda dsn, bets: dict(_rows(count=0)))
-    sent: list[str] = []
 
     class _Notifier:
         def __init__(self, config: object) -> None:
             self.config = config
 
         def send_message(self, text: str) -> int:
+            if fail:
+                raise ConnectionError("Telegram unreachable")
             sent.append(text)
             return 1
 
     monkeypatch.setattr(pilot_ledger, "TelegramNotifier", _Notifier)
     monkeypatch.setattr(pilot_ledger, "load_config", lambda: object())
+    return store
+
+
+def test_settle_sends_the_new_results_only_when_asked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sent: list[str] = []
+    _settle_setup(tmp_path, monkeypatch, sent)
     assert pilot_ledger.main(["--settle", "--send"]) == 0
     assert "#1 LOST (provisional)" in capsys.readouterr().out
     assert len(sent) == 1 and sent[0].startswith(pilot_ledger.SETTLED_HEADER) and "never bets you placed" in sent[0]
+    assert ledger.AnswerOutbox(tmp_path / "answers.jsonl").unsent() == []  # queued, then marked sent
     assert pilot_ledger.main(["--settle", "--send"]) == 0 and len(sent) == 1  # nothing new: nothing sent
+
+
+def test_a_settlement_notice_that_fails_to_send_stays_queued_for_the_next_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Audit 2026-10-11 (second pass): the settlements were recorded before the send, so a failed send was lost for good."""
+    store = _settle_setup(tmp_path, monkeypatch, [], fail=True)
+    with pytest.raises(ConnectionError):
+        pilot_ledger.main(["--settle", "--send"])
+    capsys.readouterr()
+    assert len(store.settled_bets()) == 2  # the results are kept
+    [(answer_id, reply_to, text, attempts)] = ledger.AnswerOutbox(tmp_path / "answers.jsonl").unsent()
+    assert reply_to is None and text.startswith(pilot_ledger.SETTLED_HEADER) and attempts == 1  # the poll re-sends it
+
+
+def test_recording_is_idempotent_locked_and_never_leaves_a_bet_without_its_tip_line(tmp_path: Path) -> None:
+    store, tips_file = _record(tmp_path)
+    assert pilot_ledger.record_tips(store, tips_file, _tips(), {500: FIXTURE}, NOW) == []  # an overlapping run adds nothing
+    assert [b.bet_id for b in store.open_bets(NOW)] == [1, 2]
+    with ledger.ledger_lock(pilot_ledger.lock_for(store)):  # another writer holds the store
+        with pytest.raises(OSError):
+            pilot_ledger.record_tips(store, tips_file, _tips(3), {500: FIXTURE}, NOW)
+    assert [b.bet_id for b in store.open_bets(NOW)] == [1, 2]
+    # A crash after the tip line and before the bet: the tip line is an orphan nothing reads, and a later run records the bet.
+    crash_store, crash_tips = PlacedBetStore(tmp_path / "c.jsonl"), tmp_path / "c_tips.jsonl"
+
+    def crash(bet: Any) -> None:
+        raise OSError("disk full")
+
+    original = crash_store.record_bet
+    crash_store.record_bet = crash  # type: ignore[method-assign]
+    with pytest.raises(OSError):
+        pilot_ledger.record_tips(crash_store, crash_tips, _tips(1), {500: FIXTURE}, NOW)
+    assert crash_store.open_bets(NOW) == [] and len(pilot_ledger.load_tips(crash_tips)) == 1
+    crash_store.record_bet = original  # type: ignore[method-assign]
+    [bet] = pilot_ledger.record_tips(crash_store, crash_tips, _tips(1), {500: FIXTURE}, NOW)
+    assert bet.bet_id == 1 and set(pilot_ledger.load_tips(crash_tips)) == {1}
 
 
 # ---------------- closing prices ----------------

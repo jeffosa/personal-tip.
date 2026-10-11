@@ -357,6 +357,7 @@ def descriptions(
         key: AlertContext(
             f"{fixture.name}, {fixture.kickoff_at:%a %d %b %H:%M} UTC",
             f"{players[key[1]].name} ({team_names[players[key[1]].team_uid]})",
+            teams=fixture.name, kickoff_at=fixture.kickoff_at, league=fixture.league,
         )
         for key in projections
     }

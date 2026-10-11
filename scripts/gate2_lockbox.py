@@ -14,6 +14,10 @@ the scan. Deviation from the PRD protocol: lineups are the scan's estimates, not
 sheets. Positions are as of kickoff (player_match_stats.match_position, migration 007), so a lockbox match never
 informs its own price.
 
+Reproducibility (audit 2026-10-11, second pass): every repriced probability is compared with the prediction logged before
+kickoff (alerts/predictions.py) for the same fixture, player, market and line; any difference above COMPARE_TOLERANCE, which
+would mean the stored history was revised after the match was priced, is reported and written to the result file.
+
 Refuses to run when the pricing code differs from the freeze (model_freeze.FROZEN_DIGEST). Read-only on the working
 database. Run from the repository root:
     .venv\\Scripts\\python.exe scripts\\gate2_lockbox.py
@@ -29,7 +33,7 @@ from collections import defaultdict
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Mapping, Sequence
 
 import numpy as np
 
@@ -42,9 +46,13 @@ from prop_alpha.evaluation.gate2 import MIN_BENCHMARK_PREDICTIONS, market_benchm
 from prop_alpha.scanner.market_scanner import devig_two_way  # noqa: E402
 from prop_alpha.ingestion.sportmonks import SCAN_LEAGUES  # noqa: E402
 from prop_alpha.modeling.model_freeze import FROZEN_DIGEST, GATE2_LINES, LOCKBOX_START, pricing_digest  # noqa: E402
+from prop_alpha.alerts.predictions import PredictionLog, counts_for_lockbox  # noqa: E402
 from prop_alpha.scanner.slate import UpcomingFixture  # noqa: E402
 
 SEED: Final[int] = 20261005
+# Repriced and logged probabilities of the same prediction must agree to this (both are the same frozen code on the same data).
+COMPARE_TOLERANCE: Final[float] = 1e-9
+PredictionKey = tuple[int, int, str, float]
 OUTCOME_COLUMNS: Final[dict[str, int]] = {"tackles": 1, "fouls": 2}
 FIXTURES_SQL: Final[str] = """
     SELECT f.vendor_fixture_uid, l.name, ht.vendor_team_uid, at.vendor_team_uid, ht.name, at.name, f.kickoff_at
@@ -80,6 +88,30 @@ def benchmark_rows(market: str, lines: tuple[float, ...], predictions: dict[tupl
             if (fixture_id, player_id, market, line) in closing]
 
 
+def compare_with_log(repriced: Mapping[PredictionKey, float], logged: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Pure: repriced P(over | plays) against the earliest logged one (only records that count towards the lockbox), on the
+    (fixture, player, market, line) both have. Reports how many agree, the largest difference and the keys that differ, and
+    how many repriced matches have no logged prediction (priced before the log existed, or not scanned)."""
+    first: dict[PredictionKey, tuple[str, float]] = {}
+    for record in logged:
+        if not counts_for_lockbox(record):
+            continue
+        total = float(record["p_win"]) + float(record["p_lose"])
+        if total <= 0.0:
+            continue
+        key = (int(record["fixture_id"]), int(record["player_id"]), str(record["market"]), float(record["line"]))
+        if key not in first or str(record["logged_at"]) < first[key][0]:
+            first[key] = (str(record["logged_at"]), float(record["p_win"]) / total)
+    common = sorted(set(repriced) & set(first))
+    differ = [key for key in common if abs(repriced[key] - first[key][1]) > COMPARE_TOLERANCE]
+    logged_fixtures = {key[0] for key in first}
+    return {"compared": len(common), "differ": len(differ), "tolerance": COMPARE_TOLERANCE,
+            "max_difference": max((abs(repriced[k] - first[k][1]) for k in common), default=0.0),
+            "differing": [list(key) for key in differ[:50]],
+            "matches_logged": len(logged_fixtures & {key[0] for key in repriced}),
+            "matches_not_logged": len({key[0] for key in repriced} - logged_fixtures)}
+
+
 def main() -> int:
     import psycopg2
 
@@ -90,6 +122,7 @@ def main() -> int:
     engine, market_engines = scan_engines()
     closing = closing_over_probabilities(load_closing_quotes(ROOT / ".prop_alpha_state"))
     predictions: dict[tuple[str, float], list[tuple[int, int, float, int]]] = defaultdict(list)
+    repriced: dict[PredictionKey, float] = {}
     failures: list[str] = []
     conn = psycopg2.connect(os.environ.get(DSN_ENV, DEFAULT_DSN),
                             options="-c statement_timeout=60000 -c default_transaction_read_only=on")
@@ -114,6 +147,7 @@ def main() -> int:
                     count = int(played[player_id][1 + OUTCOME_COLUMNS[market]])
                     for line in GATE2_LINES[market]:
                         side = projection.side_probabilities(line, "over")
+                        repriced[(fixture_id, player_id, market, line)] = side.p_win / (side.p_win + side.p_lose)
                         predictions[(market, line)].append(
                             (fixture_id, player_id, side.p_win / (side.p_win + side.p_lose), int(count > line)))
     finally:
@@ -124,6 +158,11 @@ def main() -> int:
                               "frozen_digest": FROZEN_DIGEST, "fixtures": len(fixtures), "unpriced": failures,
                               "seed": SEED, "markets": {}}
     print(f"Lockbox from {LOCKBOX_START:%Y-%m-%d}: {len(fixtures)} final matches, {len(failures)} could not be priced")
+    check = compare_with_log(repriced, PredictionLog(ROOT / ".prop_alpha_state" / "predictions.jsonl").load())
+    result["logged_v_repriced"] = check
+    print(f"Logged before kickoff v repriced now: {check['compared']} predictions in {check['matches_logged']} matches compared, "
+          f"{check['differ']} differ by more than {COMPARE_TOLERANCE:g} (largest {check['max_difference']:.2e}); "
+          f"{check['matches_not_logged']} scored matches have no logged prediction")
     for market, lines in GATE2_LINES.items():
         verdicts: list[bool] = []
         result["markets"][market] = {}

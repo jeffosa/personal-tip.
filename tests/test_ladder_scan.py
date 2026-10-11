@@ -288,7 +288,7 @@ def test_a_mock_scan_tips_tackles_in_the_tip_format_with_the_pilot_label_and_its
     assert summary.players_priced == 4  # both leagues are priced
     assert summary.alerts_sent >= 1 and len(notifier.texts) == 1  # one tip message holds up to five bets
     first = notifier.texts[0]
-    assert first.startswith(label) and "\nTACKLE" in first and "Walsall vs Port Vale, Tue 13 Oct 18:45 UTC" in first
+    assert first.startswith(label + "\nBRAZIL SERIE A \u00b7 TACKLES \u00b7 1/1\n") and "\nWalsall vs Port Vale | 18:45 UTC\n" in first
     assert first.endswith(ladder_scan.PILOT_USAGE) and "placed" not in first
     assert "Celtic" not in first  # the Scottish Premiership has no backtest: it is priced, never tipped
     assert {alert.key[0] for alert in store.load()} == {9101}  # recorded in the store it was given, never the real one
@@ -363,8 +363,8 @@ def test_a_real_ladder_price_above_the_models_becomes_a_pilot_tip_and_is_archive
     assert (tmp_path / scan.ODDS_CACHE_DIR / ladder_scan.LADDER_CATALOGUE_FILE).is_file()
     assert (tmp_path / scan.ODDS_CACHE_DIR / scan.CATALOGUE_FILE).is_file()  # the line catalogue the other scan also reads
     assert summary.alerts_sent >= 1 and notifier.texts[0].startswith(ladder_scan.PILOT_LABEL)
-    assert "1a) Regular Starter (Walsall) tackle over 1.5 9.00 odd" in notifier.texts[0]  # the 2+ ladder step
-    assert "bet365 | take it at" in notifier.texts[0] and "simulated match conditions" in notifier.texts[0]
+    assert "\n1a Regular Starter \u2014 OVER 1.5 tackles\n" in notifier.texts[0]  # the 2+ ladder step
+    assert "   bet365 @ 9.00 | take it at" in notifier.texts[0] and "simulated match conditions" in notifier.texts[0]
     # The short-priced Away Starter ladder (1.10 for 1+) is no edge: it is never tipped.
     assert "Away Starter" not in notifier.texts[0] and "Celtic" not in notifier.texts[0]
     assert {alert.key[0] for alert in store.load()} == {9101}
@@ -508,3 +508,11 @@ def test_the_stale_exit_code_follows_the_skipped_leagues_not_the_wording_of_a_fa
         codes[name] = ladder_scan.main(["--odds", "mock"])
     capsys.readouterr()
     assert codes == {"stale": ladder_scan.STALE_EXIT, "other failure": 0, "clean": 0}
+
+
+def test_the_heartbeat_records_what_the_status_report_shows() -> None:
+    summary = scan.ScanSummary(NOW, KICKOFF, fixtures=["a", "b"], players_priced=40, quotes=12, alerts_sent=1,
+                               failures=["x"], stale_leagues=["Scottish Championship"], odds_unavailable=True)
+    assert ladder_scan.heartbeat_record(summary, NOW) == {
+        "at": NOW.isoformat(), "window_end": KICKOFF.isoformat(), "fixtures": 2, "players_priced": 40, "quotes": 12,
+        "tips": 1, "failures": 1, "stale_leagues": ["Scottish Championship"], "odds_unavailable": True}

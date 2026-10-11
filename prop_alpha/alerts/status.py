@@ -35,7 +35,10 @@ from prop_alpha.alerts.ledger import (
     last_poll,
     results_summary,
 )
+from prop_alpha.alerts import ladder_scan, pilot_ledger
+from prop_alpha.alerts.predictions import PredictionLog
 from prop_alpha.alerts.scan import CATALOGUE_FILE, ODDS_ARCHIVE_DIR, ODDS_CACHE_DIR, STATE_DIR, load_catalogue
+from prop_alpha.ingestion.results import PILOT_REFUSED_FILE, load_refused
 from prop_alpha.alerts.telegram import PAPER_LABEL, DeliveryLog, SentAlertStore, TelegramNotifier, load_config
 from prop_alpha.config import DEFAULT_DSN, DSN_ENV
 from prop_alpha.ingestion import oddspapi
@@ -265,6 +268,40 @@ def poll_section(heartbeat_file: Path, outbox: AnswerOutbox, now: datetime) -> l
     return lines
 
 
+# The pilot scan runs every 4 hours; past this, the report says it has stopped.
+PILOT_SCAN_OVERDUE: Final[timedelta] = timedelta(hours=5)
+
+
+def pilot_section(state_dir: Path, now: datetime) -> list[str]:
+    """The pilot's health (audit 2026-10-11): its last scan, the predictions it has logged, its paper bets and their
+    provisional results, closing prices captured and matches the data feed refused. Read from its own files only."""
+    lines: list[str] = []
+    heartbeat = state_dir / ladder_scan.PILOT_HEARTBEAT_FILE.name
+    if heartbeat.is_file():
+        beat: Any = json.loads(heartbeat.read_text(encoding="utf-8"))
+        at = datetime.fromisoformat(str(beat["at"]))
+        line = (f"Pilot scan: last run {at:%a %d %b %H:%M} UTC ({beat['fixtures']} matches, {beat['quotes']} prices, "
+                f"{beat['tips']} tips" + (f", skipped as stale: {', '.join(beat['stale_leagues'])}" if beat["stale_leagues"] else "")
+                + (", NO real odds" if beat["odds_unavailable"] else "") + ")")
+        lines.append(f"WARNING: {line}; it has not run for over {PILOT_SCAN_OVERDUE.total_seconds() / 3600:g} hours"
+                     if now - at > PILOT_SCAN_OVERDUE else line)
+    else:
+        lines.append("Pilot scan: no real run recorded yet")
+    predictions = PredictionLog(state_dir / ladder_scan.PILOT_PREDICTIONS_FILE.name).load()
+    store = PlacedBetStore(state_dir / pilot_ledger.PILOT_BETS_FILE.name)
+    settled = store.settled_bets()
+    closing = pilot_ledger.load_closing(state_dir / pilot_ledger.PILOT_CLOSING_FILE.name)
+    lines += [
+        f"Pilot predictions logged: {len(predictions)} lines for {len({r['fixture_id'] for r in predictions})} matches; "
+        f"matches the data feed refused: {len(load_refused(state_dir / PILOT_REFUSED_FILE.name))}",
+        f"Pilot paper tips: {len(store.open_bets(now))} open; "
+        + (pilot_ledger.results_text(settled, closing, pilot_ledger.reconstructed_ids(
+            pilot_ledger.load_tips(state_dir / pilot_ledger.PILOT_TIPS_FILE.name))) if settled else "none settled yet")
+        + f"; closing prices captured: {len(closing)}",
+    ]
+    return lines
+
+
 def fx_section(rate: ExchangeRate | None, now: datetime) -> list[str]:
     """The cached book-currency rate, flagged when the scan would refuse it as too old."""
     if rate is None:
@@ -301,13 +338,15 @@ def format_report(now: datetime, database_lines: list[str], alerts_in_window: in
 
 def build_report(now: datetime, dsn: str, store: SentAlertStore, bets: PlacedBetStore | None = None,
                  rate: ExchangeRate | None = None, deliveries: DeliveryLog | None = None,
-                 poll_state: tuple[Path, AnswerOutbox] | None = None, odds_state: Path | None = None) -> str:
+                 poll_state: tuple[Path, AnswerOutbox] | None = None, odds_state: Path | None = None,
+                 pilot_state: Path | None = None) -> str:
     alerts = [alert for alert in store.load() if alert.sent_at > now - REPORT_INTERVAL]
     return format_report(now, database_section(dsn), len(alerts), store.exposure(now).total,
                          [*(bet_section(bets, now) if bets is not None else ()),
                           *(delivery_section(deliveries, now) if deliveries is not None else ()),
                           *(poll_section(*poll_state, now) if poll_state is not None else ()),
                           *(quote_section(odds_state) if odds_state is not None else ()),
+                          *(pilot_section(pilot_state, now) if pilot_state is not None else ()),
                           *fx_section(rate, now)])
 
 
@@ -318,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     report = build_report(datetime.now(timezone.utc), os.environ.get(DSN_ENV, DEFAULT_DSN), SentAlertStore(),
                           PlacedBetStore(), cached_rate(), DeliveryLog(), (DEFAULT_HEARTBEAT_FILE, AnswerOutbox()),
-                          STATE_DIR)
+                          STATE_DIR, pilot_state=STATE_DIR)
     print(report)
     if args.send:
         message_id = TelegramNotifier(load_config()).send_message(report)

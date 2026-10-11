@@ -108,6 +108,8 @@ MARKET_TIP_NAMES: Final[Mapping[str, str]] = {"tackles": "tackle", "fouls": "fou
 # A tip message is cut at a complete bet well before Telegram's 4,096-character limit (maintainer, 2026-10-11, on the
 # format recommendation: about 3,500). Every part repeats the heading with its part number and the paper-only line.
 TIP_TARGET_CHARS: Final[int] = 3500
+# A player is named without the club in brackets: the match line above names both clubs.
+_CLUB_SUFFIX: Final[re.Pattern[str]] = re.compile(r"\s*\([^)]*\)\s*$")
 # Said under every tip that shows the model's numbers: they are unvalidated until a PRD gate passes.
 EXPERIMENT_FOOTNOTE: Final[str] = ("*Experimental: the model's estimates, expected value and survival are unvalidated, and the "
                                    "bookmaker's settlement rules are unverified.")
@@ -463,10 +465,14 @@ def simulation_seed(directive: StakingDirective) -> int:
 @dataclass(frozen=True)
 class AlertContext:
     """Readable names for one projection key: the match ("Walsall v Port Vale, Sat 10 Oct 14:00 UTC") and the
-    player with his club ("Alex Hunt (York City)")."""
+    player with his club ("Alex Hunt (York City)"). The tip layout also uses the clubs alone ("Walsall v Port Vale"), the
+    kickoff and the league when the scan supplies them; without them it falls back to `match`."""
 
     match: str
     player: str
+    teams: str = ""
+    kickoff_at: datetime | None = None
+    league: str = ""
 
 
 def limit_note(book_rate: ExchangeRate | None = None) -> str:
@@ -521,7 +527,10 @@ def tip_layout(entries: Sequence[TipEntry]) -> list[tuple[str, list[TipLine]]]:
         if len(bets) > len(BET_LETTERS):
             raise ValueError(f"{len(bets)} bets in one match; a tip message letters at most {len(BET_LETTERS)}")
         context = bets[0][2]
-        header = (context.match if context else f"Fixture {bets[0][0].fixture_id}").replace(" v ", " vs ", 1)
+        if context is not None and context.teams and context.kickoff_at is not None:
+            header = f"{context.teams.replace(' v ', ' vs ', 1)} | {context.kickoff_at:%H:%M} UTC"
+        else:
+            header = (context.match if context else f"Fixture {bets[0][0].fixture_id}").replace(" v ", " vs ", 1)
         tips: list[TipLine] = []
         for letter, (directive, assessment, bet_context) in zip(BET_LETTERS, bets):
             number += 1
@@ -547,40 +556,42 @@ def format_digest(
     book_rate: ExchangeRate | None = None,
     usage: str = USAGE,
 ) -> str:
-    """One plain-text message of tips for one market, grouped by match (maintainer format, 2026-10-10):
+    """One plain-text message of tips for one league and market, grouped by match (maintainer's layout, 2026-10-11):
 
-        TACKLE
+        BRAZIL SERIE A \u00b7 TACKLES \u00b7 1/2
 
-        1. Team A vs Team B, Sat 10 Oct 14:00 UTC
-           1a) Player A (Team A) tackle over 0.5 1.80 odd
-               bookmaker | take it at 1.70 or better, until 13:30 UTC | stake USD 5.00
-               edge held in 68% of 1,000 simulated match conditions
+        Flamengo vs Fluminense | 20:30 UTC
+        1a Player Name \u2014 OVER 1.5 tackles
+           bet365 @ 3.00 | take it at 2.70 or better, until 19:05 UTC | stake USD 5.00
+           model estimate 42%* | market implied 33% | EV estimate +26%*
+           edge held in 68% of 1,000 simulated match conditions*
 
-    The last line is the high-value screen's survival rate (more than 60% passes); it is left out when the entry
-    has no assessment. A reply records a bet by its label: `placed 1a @1.80 5`."""
+    The model lines are left out for an entry without an assessment, and so is the footnote when no line has them. Every
+    part repeats the heading with its part number and the paper-only line. A reply records a bet by its label:
+    `placed 1a @3.00 5`."""
     if not entries:
         raise ValueError("a tip message needs at least one bet")
     market = entries[0][0].market_type
-    name = MARKET_TIP_NAMES.get(market, market)
+    league = next((entry[2].league for entry in entries if entry[2] is not None and entry[2].league), "")
     currency = f"{bankroll_currency} " if bankroll_currency else ""
-    lines = [*((label,) if label else ()), name.upper() + (f" (message {part} of {parts})" if parts > 1 else "")]
-    for match_number, (header, tips) in enumerate(tip_layout(entries), start=1):
-        lines += ["", f"{match_number}. {header}"]
+    heading = " \u00b7 ".join(part for part in (league.upper(), market.upper(), f"{part}/{parts}") if part)
+    lines = [*((label,) if label else ()), heading]
+    for header, tips in tip_layout(entries):
+        lines += ["", header]
         for tip in tips:
             directive = tip.directive
-            player = tip.context.player if tip.context else f"player {directive.player_id}"
+            player = _CLUB_SUFFIX.sub("", tip.context.player) if tip.context else f"player {directive.player_id}"
             lines += [
-                f"   {tip.label}) {player} {name} {directive.side.lower()} {directive.line_value:g} "
-                f"{directive.decimal_odds:.2f} odd",
-                f"       {directive.sportsbook} | take it at {directive.min_acceptable_odds:.2f} or better, until "
-                f"{directive.expires_at:%H:%M} UTC | stake {stake_text(directive.stake, currency, book_rate)}"
+                f"{tip.label} {player} \u2014 {directive.side.upper()} {directive.line_value:g} {market}",
+                f"   {directive.sportsbook} @ {directive.decimal_odds:.2f} | take it at {directive.min_acceptable_odds:.2f} or "
+                f"better, until {directive.expires_at:%H:%M} UTC | stake {stake_text(directive.stake, currency, book_rate)}"
                 + ("" if directive.limit_published else f" | {limit_note(book_rate)}"),
             ]
             if tip.assessment is not None:
                 lines += [
-                    f"       model estimate {tip.assessment.model_win_probability:.0%}* | market implied "
+                    f"   model estimate {tip.assessment.model_win_probability:.0%}* | market implied "
                     f"{tip.assessment.book_win_probability:.0%} | EV estimate {tip.assessment.ev_per_unit:+.0%}*",
-                    f"       edge held in {tip.assessment.survival_rate:.0%} of {tip.assessment.n_simulations:,} "
+                    f"   edge held in {tip.assessment.survival_rate:.0%} of {tip.assessment.n_simulations:,} "
                     "simulated match conditions*",
                 ]
     shows_model = any(entry[1] is not None for entry in entries)
@@ -788,28 +799,31 @@ class TelegramNotifier:
         """As notify, but the high-value bets go out as tip messages (format_digest): one market per message, at most
         `per_message` bets each (10 tackle bets: two messages of 5), the best first. Returns (bets alerted, message
         ids). Every bet of a message is recorded before that message is sent. `on_tips` is called with the message's
-        numbered bets (in the order the message shows them) just before it is sent, so a caller can keep its own record
-        of what was tipped (the pilot scan's paper bets); an exception from it stops the run before that send."""
+        numbered bets (in the order the message shows them) before anything about that message is recorded or sent, so a
+        caller can keep its own record of what was tipped (the pilot scan's paper bets); an exception from it stops the run
+        with nothing recorded and nothing sent for that message (audit 2026-10-11: it used to run after the alert store and
+        the delivery record, so a failed callback left a pending delivery and an alerted stake for a tip never sent)."""
         if per_message < 1:
             raise ValueError("per_message must be at least 1")
         passing = list(self._high_value(report, projections, criteria, max_alerts))
-        by_market: dict[str, list[TipEntry]] = {}
+        by_market: dict[tuple[str, str], list[TipEntry]] = {}
         for directive, assessment in passing:
             context = (descriptions or {}).get((directive.fixture_id, directive.player_id, directive.market_type))
-            by_market.setdefault(directive.market_type, []).append((directive, assessment, context))
+            league = context.league if context is not None else ""
+            by_market.setdefault((league, directive.market_type), []).append((directive, assessment, context))
         message_ids: list[int] = []
-        for market, tips in by_market.items():
+        for (_, market), tips in by_market.items():
             # Sized with the longest part marker, so adding the real "message 2 of 3" can never push a part over the limit.
             chunks = split_tips(tips, per_message, lambda e: format_digest(e, 99, 99, label, bankroll_currency, book_rate, usage))
             parts = len(chunks)
             for part, chunk in enumerate(chunks):
                 text = format_digest(chunk, part + 1, parts, label, bankroll_currency, book_rate, usage)
                 items = digest_items(chunk)
+                if on_tips is not None:
+                    on_tips([tip for _, tips_of_match in tip_layout(chunk) for tip in tips_of_match])
                 delivery_id = self._begin_delivery("digest", text, items, max(entry[0].expires_at for entry in chunk))
                 for directive, _, _ in chunk:
                     self._record(directive)
-                if on_tips is not None:
-                    on_tips([tip for _, tips_of_match in tip_layout(chunk) for tip in tips_of_match])
                 message_ids.append(self._send_and_confirm(text, delivery_id, items))
                 logger.info("%s tips message %d/%d sent with %d bets", market, part + 1, parts, len(chunk))
         return len(passing), message_ids

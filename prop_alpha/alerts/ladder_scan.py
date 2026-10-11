@@ -130,6 +130,8 @@ PILOT_STATE_FILE: Final[Path] = scan.STATE_DIR / "pilot_sent_alerts.jsonl"
 PILOT_INDEX_FILE: Final[Path] = scan.STATE_DIR / "pilot_alert_messages.jsonl"
 PILOT_DELIVERY_FILE: Final[Path] = scan.STATE_DIR / "pilot_alert_deliveries.jsonl"
 PILOT_PREDICTIONS_FILE: Final[Path] = scan.STATE_DIR / "pilot_predictions.jsonl"
+# Written after every real run, so the status report can say when the pilot last scanned and what it found (audit 2026-10-11).
+PILOT_HEARTBEAT_FILE: Final[Path] = scan.STATE_DIR / "pilot_last_scan.json"
 PILOT_ODDS_DIR: Final[str] = "pilot"
 LADDER_CATALOGUE_FILE: Final[str] = "ladder_markets.json"
 
@@ -436,6 +438,14 @@ def run_ladder_scan(
     return summary
 
 
+def heartbeat_record(summary: scan.ScanSummary, now: datetime) -> dict[str, object]:
+    """Pure: what the status report shows about the latest real pilot run."""
+    return {"at": now.isoformat(), "window_end": summary.window_end.isoformat(), "fixtures": len(summary.fixtures),
+            "players_priced": summary.players_priced, "quotes": summary.quotes, "tips": summary.alerts_sent,
+            "failures": len(summary.failures), "stale_leagues": list(summary.stale_leagues),
+            "odds_unavailable": summary.odds_unavailable}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logging.getLogger("prop_alpha.scanner").setLevel(logging.WARNING)
@@ -480,6 +490,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             odds_client.close()
     text = summary_text(summary, label)
     print(text)
+    if real:
+        PILOT_HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PILOT_HEARTBEAT_FILE.write_text(json.dumps(heartbeat_record(summary, now)), encoding="utf-8")
     # Every 4 hours most windows have no pilot match: the chat hears about a run only when there was something to say.
     if notifier is not None and (summary.fixtures or summary.failures):
         print(f"summary sent (message_id {notifier.send_message(text)})")

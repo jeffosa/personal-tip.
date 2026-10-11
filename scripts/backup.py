@@ -61,7 +61,7 @@ STATE_FILES: Final[tuple[str, ...]] = (
     # matches the data feed refused. The pilot database itself is not dumped here.
     "pilot_sent_alerts.jsonl", "pilot_alert_messages.jsonl", "pilot_alert_deliveries.jsonl", "pilot_paper_bets.jsonl",
     "pilot_tips.jsonl", "pilot_predictions.jsonl", "pilot_closing_quotes.jsonl", "pilot_closing_handled.json",
-    "pilot_refused.json",
+    "pilot_refused.json", "pilot_last_scan.json",
 )
 # Folders copied whole: the raw bookmaker responses are the evidence for closing-line analysis (PRD Gate 3).
 STATE_DIRS: Final[tuple[str, ...]] = ("odds_archive",)

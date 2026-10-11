@@ -215,3 +215,35 @@ def test_report_includes_the_quote_count_when_given_the_odds_state(tmp_path: Pat
     report = status.build_report(NOW, "postgresql://unused", SentAlertStore(tmp_path / "sent.jsonl"),
                                  odds_state=state)
     assert "F-02 open: no tackles/fouls price in 1 archived OddsPapi reply" in report
+
+
+def test_the_report_shows_the_pilots_health_from_its_own_files(tmp_path: Path) -> None:
+    """Audit 2026-10-11 (second pass): a healthy task log did not show whether the pilot was gathering evidence."""
+    import json
+    from datetime import timedelta
+
+    from prop_alpha.alerts import ladder_scan, pilot_ledger
+    from prop_alpha.alerts.ledger import PlacedBetStore
+    from prop_alpha.alerts.replies import PlacedBet, Settlement
+
+    now = datetime(2026, 10, 11, 12, tzinfo=timezone.utc)
+    assert status.pilot_section(tmp_path, now)[0] == "Pilot scan: no real run recorded yet"
+    beat = {"at": (now - timedelta(hours=1)).isoformat(), "window_end": now.isoformat(), "fixtures": 3, "players_priced": 80,
+            "quotes": 412, "tips": 2, "failures": 0, "stale_leagues": [], "odds_unavailable": False}
+    (tmp_path / ladder_scan.PILOT_HEARTBEAT_FILE.name).write_text(json.dumps(beat), encoding="utf-8")
+    (tmp_path / ladder_scan.PILOT_PREDICTIONS_FILE.name).write_text("", encoding="utf-8")
+    store = PlacedBetStore(tmp_path / pilot_ledger.PILOT_BETS_FILE.name)
+    for bet_id in (1, 2):
+        store.record_bet(PlacedBet(bet_id, bet_id, 0, bet_id, "alert", 500, 70 + bet_id, "tackles", 1.5, "over", 3.0, 10.0,
+                                   "bet365", 2.5, "A v B", f"Player {bet_id}", now - timedelta(hours=3)))
+    store.record_settlement(Settlement(1, "won", "auto", "3 tackles", now))
+    lines = status.pilot_section(tmp_path, now)
+    assert lines[0] == "Pilot scan: last run Sun 11 Oct 11:00 UTC (3 matches, 412 prices, 2 tips)"
+    assert lines[1] == "Pilot predictions logged: 0 lines for 0 matches; matches the data feed refused: 0"
+    assert lines[2].startswith("Pilot paper tips: 1 open; 1 settled paper bet(s) (1 won, 0 lost, 0 void)")
+    assert "paper profit +20.00" in lines[2] and lines[2].endswith("closing prices captured: 0")
+    stale = {**beat, "at": (now - timedelta(hours=6)).isoformat(), "stale_leagues": ["Brazil Serie A"], "odds_unavailable": True}
+    (tmp_path / ladder_scan.PILOT_HEARTBEAT_FILE.name).write_text(json.dumps(stale), encoding="utf-8")
+    warning = status.pilot_section(tmp_path, now)[0]
+    assert warning.startswith("WARNING: Pilot scan: last run Sun 11 Oct 06:00 UTC") and "skipped as stale: Brazil Serie A" in warning
+    assert "NO real odds" in warning and "has not run for over 5 hours" in warning

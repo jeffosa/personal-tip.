@@ -537,3 +537,35 @@ def test_a_mock_run_never_writes_the_prediction_log(tmp_path: Path, monkeypatch:
     scan.run_scan(KICKOFF - timedelta(hours=2), _StubSportmonks(), "postgresql://unused", _RecordingNotifier(store),
                   store, 1000.0, scan.MOCK_LABEL, currency="GBP", odds="mock", state_dir=tmp_path)
     assert not (tmp_path / "predictions.jsonl").exists()
+
+
+def _covered(runs: list[datetime], kickoffs: list[datetime]) -> dict[datetime, int]:
+    """How many scan windows each kickoff falls in, for runs at the given times."""
+    windows = [scan_window(run) for run in runs]
+    return {k: sum(1 for start, end in windows if start <= k < end) for k in kickoffs}
+
+
+def test_on_time_utc_runs_scan_every_kickoff_exactly_once_across_the_clock_change() -> None:
+    """Audit 2026-10-11 (second pass): the task fired at 23:00, 03:00, ... UTC (a local-time start in BST) while windows end
+    at UTC 4-hour boundaries, so an on-time run covered one hour of four. The task now starts on a UTC boundary; this pins the
+    contract the schedule relies on, over 24-26 Oct (the UK clocks go back on the 25th, which UTC runs do not notice)."""
+    start = datetime(2026, 10, 24, 0, tzinfo=timezone.utc)
+    runs = [start + timedelta(hours=4 * i) for i in range(18)]  # 00:00, 04:00, ... UTC for three days
+    kickoffs = [start + timedelta(minutes=15 * i) for i in range(4 * 24 * 3)]
+    assert set(_covered(runs, kickoffs).values()) == {1}
+    # The old schedule (an hour before each boundary) left three hours in four unscanned.
+    old = _covered([run - timedelta(hours=1) for run in runs], kickoffs)
+    assert sum(1 for n in old.values() if n == 0) > len(kickoffs) / 2
+
+
+def test_a_late_catch_up_run_covers_the_rest_of_its_window_and_a_missed_run_only_loses_what_already_kicked_off() -> None:
+    start = datetime(2026, 10, 17, 8, tzinfo=timezone.utc)
+    kickoffs = [start + timedelta(minutes=15 * i) for i in range(4 * 12)]  # 08:00-19:45 UTC
+    late = _covered([start, start + timedelta(hours=5, minutes=44), start + timedelta(hours=8)], kickoffs)  # 12:00 ran at 13:44
+    assert all(n == 1 for k, n in late.items() if not (start + timedelta(hours=4) <= k < start + timedelta(hours=5, minutes=44)))
+    assert all(n == 0 for k, n in late.items() if start + timedelta(hours=4) <= k < start + timedelta(hours=5, minutes=44))
+    assert max(late.values()) == 1  # windows never overlap, so nothing is scanned twice
+    # A retry inside the same window overlaps the first run: the alert store and the prediction log (once per fixture and
+    # digest) keep it from alerting or logging a fixture twice.
+    retry = _covered([start, start + timedelta(minutes=5)], kickoffs)
+    assert max(retry.values()) == 2

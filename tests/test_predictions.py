@@ -50,13 +50,15 @@ def test_a_projection_for_another_fixture_is_refused() -> None:
         prediction_records(other, _projections(), NOW, WINDOW, "abc")
 
 
-def test_the_log_is_append_only_and_a_retried_window_is_not_logged_twice(tmp_path: Path) -> None:
+def test_the_log_is_append_only_and_a_fixture_is_logged_once_per_digest_whatever_the_window(tmp_path: Path) -> None:
+    """Audit 2026-10-11: a retry, a late catch-up run or an overlapping window must not log the fixture again."""
     log = PredictionLog(tmp_path / "p.jsonl")
     first = log.record(FIXTURE, _projections(), NOW, WINDOW, "abc")
     assert first > 0 and len(log.load()) == first
-    assert log.record(FIXTURE, _projections(), NOW + timedelta(minutes=5), WINDOW, "abc") == 0
-    assert len(log.load()) == first
-    assert log.record(FIXTURE, _projections(), NOW, WINDOW + timedelta(hours=1), "abc") == first
+    assert log.record(FIXTURE, _projections(), NOW + timedelta(minutes=5), WINDOW, "abc") == 0  # a retried run
+    assert log.record(FIXTURE, _projections(), NOW, WINDOW + timedelta(hours=1), "abc") == 0  # another window
+    assert len(log.load()) == first and {r["logged_at"] for r in log.load()} == {NOW.isoformat()}  # the earliest stands
+    assert log.record(FIXTURE, _projections(), NOW, WINDOW + timedelta(hours=1), "def") == first  # a re-frozen model
     assert len(log.load()) == 2 * first
 
 

@@ -53,7 +53,7 @@ logged-in user, and retries a failed run. Task Scheduler history is off.
 
 | Task | Schedule | Script | Log |
 |---|---|---|---|
-| `Telegram status` | every 4 hours from 00:00 | `scripts/telegram_status.cmd`: results job, pilot results job, exchange rate, status report, League One/Two scan, pilot-leagues scan | `.prop_alpha_state\status.log` |
+| `Telegram status` | every 4 hours from 00:00 UTC (00, 04, ... 20 UTC, since 2026-10-11) | `scripts/telegram_status.cmd`: results job, pilot results job, exchange rate, status report, League One/Two scan, pilot-leagues scan | `.prop_alpha_state\status.log` |
 | `Bet ledger poll` | every 10 minutes | `scripts/ledger_poll.cmd`: reply poll, closing-price capture, T-60 team sheets, settlement, pilot closing prices, pilot paper-bet settlement | `.prop_alpha_state\ledger.log` |
 | `Daily backup` | 03:30 | `scripts/backup.cmd`: `backup.py`, then `backup_push.py` | `.prop_alpha_state\backup.log` |
 
@@ -87,7 +87,9 @@ a step of `Telegram status`, after `python -m prop_alpha.ingestion.results --pil
 ## 6. Monitoring
 
 - The 4-hourly status report (`python -m prop_alpha.alerts.status`) states database counts, last merge, alerts, open bets, the odds-archive
-  evidence line (F-02), trial days left, and warnings (unknown alert deliveries, stale poll, unsent answers).
+  evidence line (F-02), trial days left, and warnings (unknown alert deliveries, stale poll, unsent answers). Its pilot section shows the
+  last pilot scan (`pilot_last_scan.json`; WARNING when older than 5 hours), pilot predictions logged, refused matches, open paper bets
+  and results (the 8 reconstructed 2026-10-11 tips are listed apart from the model-scored total) and closing prices captured.
 - `alerts/task_health.py`: each scheduled script reports its failed steps; two failing runs in a row raise a Telegram alert (at most every 6
   hours), recovery sends one message, and a task that has not run for 5 hours (status), 40 minutes (poll) or 26 hours (backup) is flagged.
   It cannot see a machine that is off, asleep or logged out. State: `.prop_alpha_state/task_health.json`.

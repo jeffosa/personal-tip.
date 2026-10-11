@@ -31,7 +31,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Final, Mapping, Sequence
+from typing import Any, Collection, Final, Mapping, Sequence
 
 from prop_alpha.alerts import ledger
 from prop_alpha.alerts.ledger import PlacedBetStore
@@ -54,11 +54,21 @@ STATE_DIR: Final[Path] = ledger.STATE_DIR
 PILOT_BETS_FILE: Final[Path] = STATE_DIR / "pilot_paper_bets.jsonl"
 PILOT_TIPS_FILE: Final[Path] = STATE_DIR / "pilot_tips.jsonl"
 PILOT_CLOSING_FILE: Final[Path] = STATE_DIR / "pilot_closing_quotes.jsonl"
-PILOT_LOCK_FILE: Final[Path] = STATE_DIR / "pilot_ledger.lock"
 SETTLED_HEADER: Final[str] = "PILOT PAPER TIPS SETTLED (provisional: assumed market rules; these were never bets you placed)"
 TIP_FIELDS: Final[tuple[str, ...]] = (
     "bet_id", "fixture_id", "league", "home_team_uid", "away_team_uid", "home_name", "away_name", "kickoff_at",
 )
+
+
+def lock_for(store: PlacedBetStore) -> Path:
+    """The lock every writer of this paper-bet store holds: the scan recording tips and the settlement job (one file per store,
+    so a test store never touches the real one's lock)."""
+    return store.path.with_name(store.path.stem + ".lock")
+
+
+def selection(bet: PlacedBet) -> tuple[int, int, str, float, str, str]:
+    """What makes two paper bets the same tip: fixture, player, market, line, side and book."""
+    return bet.fixture_id, bet.player_id, bet.market, bet.line, bet.side, bet.book.lower()
 
 
 def paper_bet(tip: TipLine, bet_id: int, now: datetime) -> PlacedBet:
@@ -92,23 +102,31 @@ def tip_record(tip: TipLine, bet: PlacedBet, fixture: UpcomingFixture) -> dict[s
 def record_tips(
     store: PlacedBetStore, tips_file: Path, tips: Sequence[TipLine], fixtures: Mapping[int, UpcomingFixture], now: datetime,
 ) -> list[PlacedBet]:
-    """Record each tip as a paper bet and a tip line. A tip whose fixture is unknown raises: it could never be settled."""
-    bets, _, _, _ = store.load_all()
-    next_id = max(bets, default=0) + 1
+    """Record each tip as a paper bet and a tip line, under the store's lock (a second writer fails at once rather than
+    interleave). A tip already recorded (same selection, not undone) is skipped, so an overlapping or retried run never
+    records it twice. The tip line is written before the bet: a crash between them leaves a tip line with no bet, which
+    nothing reads, never a bet whose match cannot be found. A tip whose fixture is unknown raises before anything is written."""
+    missing = sorted({tip.directive.fixture_id for tip in tips if tip.directive.fixture_id not in fixtures})
+    if missing:
+        raise ValueError(f"tip for fixture {missing[0]} has no fixture to settle against")
     recorded: list[PlacedBet] = []
-    for tip in tips:
-        fixture = fixtures.get(tip.directive.fixture_id)
-        if fixture is None:
-            raise ValueError(f"tip for fixture {tip.directive.fixture_id} has no fixture to settle against")
-        bet = paper_bet(tip, next_id, now)
-        store.record_bet(bet)
-        tips_file.parent.mkdir(parents=True, exist_ok=True)
-        with tips_file.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(tip_record(tip, bet, fixture)) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        recorded.append(bet)
-        next_id += 1
+    with ledger.ledger_lock(lock_for(store)):
+        bets, cancelled, _, _ = store.load_all()
+        known = {selection(bet) for bet_id, bet in bets.items() if bet_id not in cancelled}
+        next_id = max(bets, default=0) + 1
+        for tip in tips:
+            bet = paper_bet(tip, next_id, now)
+            if selection(bet) in known:
+                continue
+            tips_file.parent.mkdir(parents=True, exist_ok=True)
+            with tips_file.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(tip_record(tip, bet, fixtures[tip.directive.fixture_id])) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            store.record_bet(bet)
+            known.add(selection(bet))
+            recorded.append(bet)
+            next_id += 1
     return recorded
 
 
@@ -176,8 +194,15 @@ def clv_summary(bets: Sequence[PlacedBet], closing: Sequence[Mapping[str, Any]])
     return f"mean closing-price value {sum(values) / len(values):+.1%} over {len(values)} paper bet(s) with a closing price"
 
 
-def results_text(settled: Sequence[tuple[PlacedBet, Settlement]], closing: Sequence[Mapping[str, Any]]) -> str:
-    """Count, stake, paper profit and return on stake of the settled paper bets, the confirmed-only split and the CLV."""
+def reconstructed_ids(tips: Mapping[int, Mapping[str, Any]]) -> set[int]:
+    """Paper bets rebuilt after the fact (the 8 tips of 2026-10-11 sent before this ledger existed): they have no model numbers."""
+    return {bet_id for bet_id, record in tips.items() if record.get("reconstructed")}
+
+
+def results_text(settled: Sequence[tuple[PlacedBet, Settlement]], closing: Sequence[Mapping[str, Any]],
+                 reconstructed: Collection[int] = ()) -> str:
+    """Count, stake, paper profit and return on stake of the settled paper bets, the confirmed-only split and the CLV. Bets
+    in `reconstructed` are counted in the paper totals but kept out of a separate model-scored total (no model numbers)."""
     staked = sum(bet.stake for bet, _ in settled)
     total = sum(profit(bet, s) for bet, s in settled)
     by_result = {result: sum(1 for _, s in settled if s.result == result) for result in RESULTS}
@@ -186,7 +211,16 @@ def results_text(settled: Sequence[tuple[PlacedBet, Settlement]], closing: Seque
     return (f"{len(settled)} settled paper bet(s) ({by_result['won']} won, {by_result['lost']} lost, {by_result['void']} void): "
             f"staked {staked:.2f}, paper profit {total:+.2f}{roi}; {len(settled) - len(confirmed)} provisional (automatic, assumed "
             f"market rules), {len(confirmed)} with a bookmaker result you recorded; "
-            f"{clv_summary([bet for bet, _ in settled], closing)}")
+            f"{clv_summary([bet for bet, _ in settled], closing)}" + _model_scored(settled, reconstructed))
+
+
+def _model_scored(settled: Sequence[tuple[PlacedBet, Settlement]], reconstructed: Collection[int]) -> str:
+    rebuilt = [bet for bet, _ in settled if bet.bet_id in reconstructed]
+    if not rebuilt:
+        return ""
+    scored = [(bet, s) for bet, s in settled if bet.bet_id not in reconstructed]
+    return (f"; {len(rebuilt)} reconstructed (no model numbers, excluded from model scoring): model-scored "
+            f"{len(scored)} settled, paper profit {sum(profit(bet, s) for bet, s in scored):+.2f}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -212,7 +246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         settled = store.settled_bets()
         for bet, settlement in settled:
             print(settlement_text(bet, settlement))
-        print(results_text(settled, closing))
+        print(results_text(settled, closing, reconstructed_ids(load_tips(PILOT_TIPS_FILE))))
         return 0
     if args.record:
         bet_id, result = int(args.record[0]), str(args.record[1]).lower()
@@ -230,13 +264,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         lines = [reconciliation_text(bet, item) for bet, item in items if item.outcome != "unconfirmed"]
         print("\n".join([*lines, reconciliation_summary([item for _, item in items])]))
         return 1 if any(item.outcome == "discrepancy" for _, item in items) else 0
-    with ledger.ledger_lock(PILOT_LOCK_FILE):
+    # The real ledger's lock as well: the notice goes through its answer queue (ledger_answers.jsonl), which only one writer
+    # may touch at a time.
+    with ledger.ledger_lock(lock_for(store)), ledger.ledger_lock(ledger.DEFAULT_LOCK_FILE):
         settled = ledger.settle(store, dsn, now)
         lines = [settlement_text(bet, settlement) for bet, settlement in settled]
         print("\n".join(lines) if lines else "no open paper bet has a final match in the pilot database")
         if args.send and lines:
-            notice = "\n".join([SETTLED_HEADER, *lines, results_text(store.settled_bets(), closing)])
-            TelegramNotifier(load_config()).send_message(notice)
+            notice = "\n".join([SETTLED_HEADER, *lines, results_text(store.settled_bets(), closing,
+                                                                      reconstructed_ids(load_tips(PILOT_TIPS_FILE)))])
+            # Queued before it is sent (audit 2026-10-11): the settlements are already recorded, so a failed send used to be
+            # lost for good; the 10-minute ledger poll re-sends a queued notice ("Delayed") up to MAX_ANSWER_ATTEMPTS times.
+            ledger.send_queued_notice(TelegramNotifier(load_config()), ledger.AnswerOutbox(ledger.DEFAULT_ANSWERS_FILE),
+                                      notice, now)
     return 0
 
 

@@ -10,7 +10,8 @@ over the line (win, lose and void shares of the over side, void if the player do
 towards the lockbox only if the fixture kicked off on or after LOCKBOX_START and its digest equals FROZEN_DIGEST
 (modeling/model_freeze.py), so a price made by code that has since changed is never counted by accident.
 
-Every record is written once per fixture and scan window (`window_start`): a retried run does not repeat it. A failed
+Every fixture is written once per pricing digest, whatever the scan window (audit 2026-10-11: a retried run, a late catch-up
+run or overlapping windows used to log the same fixture again, double counting it towards the lockbox). A failed
 write raises, so the scan stops before it alerts: no alert is sent on a price that was not recorded.
 
 I/O: the log file, and the repository's pricing source files through `model_freeze.pricing_digest`. It records the
@@ -104,12 +105,12 @@ class PredictionLog:
         self, fixture: UpcomingFixture, projections: Mapping[ProjectionKey, FactorProjection], logged_at: datetime,
         window_start: datetime, digest: str | None = None,
     ) -> int:
-        """Append the fixture's predictions unless this fixture and window are already logged; returns lines written."""
-        if any(r["fixture_id"] == fixture.fixture_id and r["window_start"] == window_start.isoformat()
-               for r in self.load()):
+        """Append the fixture's predictions unless it is already logged under the same digest (the earliest prediction
+        stands; a new digest after a re-freeze is a different model and is logged); returns lines written."""
+        made_by = pricing_digest() if digest is None else digest
+        if any(r["fixture_id"] == fixture.fixture_id and r["digest"] == made_by for r in self.load()):
             return 0
-        records = prediction_records(fixture, projections, logged_at, window_start,
-                                     pricing_digest() if digest is None else digest)
+        records = prediction_records(fixture, projections, logged_at, window_start, made_by)
         if not records:
             return 0
         self.path.parent.mkdir(parents=True, exist_ok=True)

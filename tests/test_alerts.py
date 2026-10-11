@@ -370,18 +370,18 @@ def test_digest_sends_at_most_five_bets_per_message(n_bets: int, expected_messag
     alerted, ids = notifier.notify_digest(AllocationReport(), {}, label="MOCK", descriptions=contexts)
     texts = [call[1]["text"] for call in session.calls]
     assert alerted == n_bets and len(ids) == len(texts) == len(expected_messages)
-    assert [len(re.findall(r"^ +\d+[a-z]\) ", text, re.MULTILINE)) for text in texts] == expected_messages
-    assert all(text.startswith("MOCK\nTACKLE") and PAPER_LABEL in text for text in texts)
+    assert [len(re.findall(r"^\d+[a-z] ", text, re.MULTILINE)) for text in texts] == expected_messages
+    assert all(text.startswith("MOCK\nTACKLES \u00b7 ") and PAPER_LABEL in text for text in texts)
     if len(texts) > 1:
-        assert texts[0].startswith("MOCK\nTACKLE (message 1 of 2)") and texts[1].startswith("MOCK\nTACKLE (message 2 of 2)")
+        assert texts[0].startswith("MOCK\nTACKLES \u00b7 1/2") and texts[1].startswith("MOCK\nTACKLES \u00b7 2/2")
     first = texts[0]
-    assert "1. Walsall vs Port Vale, Sat 10 Oct 14:00 UTC" in first
-    assert re.search(r"^   1a\) Player 0 \(Walsall\) tackle under 4\.5 \d\.\d\d odd$", first, re.MULTILINE)
-    assert "SyntheticBookC | take it at " in first
+    assert "\nWalsall vs Port Vale, Sat 10 Oct 14:00 UTC\n" in first  # no teams/kickoff given: the match line itself
+    assert re.search(r"^1a Player 0 \u2014 UNDER 4\.5 tackles$", first, re.MULTILINE)  # the club is on the match line
+    assert re.search(r"^   SyntheticBookC @ \d\.\d\d \| take it at ", first, re.MULTILINE)
     assert "HIGH-VALUE" not in first and "Edge:" not in first
     survival = bets[0][1].survival_rate
     assert f"edge held in {survival:.0%} of 1,000 simulated match conditions" in first
-    assert first.count("simulated match conditions") == len(re.findall(r"^ +\d+[a-z]\) ", first, re.MULTILINE))
+    assert first.count("simulated match conditions") == len(re.findall(r"^\d+[a-z] ", first, re.MULTILINE))
     assert len(SentAlertStore(tmp_path / "sent.jsonl").load()) == n_bets
 
 
@@ -399,11 +399,11 @@ def test_tips_group_by_match_and_letter_each_bet() -> None:
     entries = [(a, None, contexts[1]), (b, None, contexts[2]), (c, None, AlertContext(contexts[1].match, "Player B (Team B)"))]
     text = format_digest(entries, 1, 1, "", "GBP")
     lines = text.splitlines()
-    assert lines[0] == "TACKLE"
-    assert lines.index("1. Team A vs Team B, Sat 10 Oct 14:00 UTC") < lines.index("2. Team C vs Team D, Sat 10 Oct 15:00 UTC")
+    assert lines[0] == "TACKLES \u00b7 1/1"
+    assert lines.index("Team A vs Team B, Sat 10 Oct 14:00 UTC") < lines.index("Team C vs Team D, Sat 10 Oct 15:00 UTC")
     # The third bet is the first match's second bet, so it is shown under match 1 as 1b, ahead of match 2's 2a.
-    assert [line.strip().split(" ")[0] for line in lines if re.match(r"^ +\d+[a-z]\) ", line)] == ["1a)", "1b)", "2a)"]
-    assert "   1b) Player B (Team B) tackle over 0.5 " in text and text.index("1b)") < text.index("2a)")
+    assert [line.split(" ")[0] for line in lines if re.match(r"^\d+[a-z] ", line)] == ["1a", "1b", "2a"]
+    assert "\n1b Player B \u2014 OVER 0.5 tackles\n" in text and text.index("\n1b ") < text.index("\n2a ")
     items = digest_items(entries)
     assert [(i.number, i.label, i.player_id, tuple(i.sides)) for i in items] == [
         (1, "1a", 11, ("under",)), (2, "1b", 12, ("over",)), (3, "2a", 21, ("under",))]
@@ -416,11 +416,11 @@ def test_each_tip_shows_its_survival_percentage_and_marks_the_model_numbers_expe
     marginal = HighValueAssessment(0.05, 0.55, 0.5, True, True, 612, 1000, True)
     text = format_digest([(a, passing, None), (b, marginal, None), (replace(b, player_id=99), None, None)])
     lines = text.splitlines()
-    first = next(i for i, line in enumerate(lines) if line.startswith("   1a)"))
-    assert lines[first + 2] == "       model estimate 60%* | market implied 50% | EV estimate +8%*"
-    assert lines[first + 3] == "       edge held in 68% of 1,000 simulated match conditions*"
-    assert "       model estimate 55%* | market implied 50% | EV estimate +5%*" in lines
-    assert "       edge held in 61% of 1,000 simulated match conditions*" in lines
+    first = next(i for i, line in enumerate(lines) if line.startswith("1a "))
+    assert lines[first + 2] == "   model estimate 60%* | market implied 50% | EV estimate +8%*"
+    assert lines[first + 3] == "   edge held in 68% of 1,000 simulated match conditions*"
+    assert "   model estimate 55%* | market implied 50% | EV estimate +5%*" in lines
+    assert "   edge held in 61% of 1,000 simulated match conditions*" in lines
     # An entry without an assessment shows no numbers rather than made-up ones.
     assert text.count("simulated match conditions") == 2 and text.count("model estimate") == 2
     assert text.count(EXPERIMENT_FOOTNOTE) == 1 and text.index(EXPERIMENT_FOOTNOTE) < text.index(PAPER_LABEL)
@@ -439,13 +439,30 @@ def test_tip_messages_are_cut_by_size_at_complete_bets_and_every_part_repeats_it
     assert alerted == 5 and len(texts) == len(ids) > 1
     assert all(len(text) <= TIP_TARGET_CHARS for text in texts), [len(t) for t in texts]
     for number, text in enumerate(texts, start=1):
-        assert f"TACKLE (message {number} of {len(texts)})" in text.splitlines()[1]
+        assert text.splitlines()[1] == f"TACKLES \u00b7 {number}/{len(texts)}"
         assert PAPER_LABEL in text and text.endswith(USAGE)
         assert EXPERIMENT_FOOTNOTE in text  # the model's numbers are on every part, so is their warning
-    shown = [line for text in texts for line in text.splitlines() if re.match(r"^ +\d+[a-z]\) ", line)]
+    shown = [line for text in texts for line in text.splitlines() if re.match(r"^\d+[a-z] ", line)]
     assert len(shown) == 5 and len(set(shown)) == 5  # every bet exactly once: none cut, none repeated
     assert len(SentAlertStore(tmp_path / "sent.jsonl").load()) == 5
     assert assessment.survival_rate > 0.6
+
+
+def test_a_failing_tip_callback_leaves_nothing_recorded_and_nothing_sent(tmp_path: Path) -> None:
+    """Audit 2026-10-11 (second pass): the callback ran after the alert store and the delivery record, so a failure left an
+    alerted stake and a pending delivery for a tip that was never sent."""
+    from prop_alpha.alerts.telegram import DeliveryLog
+
+    notifier, session, _ = _digest_notifier(2, tmp_path)
+    notifier.deliveries = DeliveryLog(tmp_path / "deliveries.jsonl")
+
+    def refuse(tips: Any) -> None:
+        raise OSError("paper ledger locked")
+
+    with pytest.raises(OSError, match="locked"):
+        notifier.notify_digest(AllocationReport(), {}, on_tips=refuse)
+    assert session.calls == [] and SentAlertStore(tmp_path / "sent.jsonl").load() == []
+    assert DeliveryLog(tmp_path / "deliveries.jsonl").load(NOW) == {}
 
 
 def test_split_tips_respects_both_the_bet_count_and_the_size_and_keeps_order() -> None:
@@ -465,8 +482,8 @@ def test_a_tip_message_holds_one_market_and_names_fouls() -> None:
     fouls = replace(a, market_type="fouls")
     with pytest.raises(ValueError, match="one market"):
         format_digest([(a, None, None), (fouls, None, None)])
-    assert format_digest([(fouls, None, None)]).startswith("FOUL\n")
-    assert " foul under 4.5 " in format_digest([(fouls, None, None)])
+    assert format_digest([(fouls, None, None)]).startswith("FOULS \u00b7 1/1\n")
+    assert "\u2014 UNDER 4.5 fouls" in format_digest([(fouls, None, None)])
     with pytest.raises(ValueError):
         format_digest([])
 
@@ -478,7 +495,7 @@ def test_notify_digest_sends_each_market_as_its_own_message(tmp_path: Path) -> N
     alerted, ids = notifier.notify_digest(AllocationReport(), {})
     texts = [call[1]["text"] for call in session.calls]
     assert alerted == 2 and len(ids) == 2
-    assert texts[0].startswith("TACKLE\n") and texts[1].startswith("FOUL\n")
+    assert texts[0].startswith("TACKLES \u00b7 1/1\n") and texts[1].startswith("FOULS \u00b7 1/1\n")
     assert "2." not in texts[0].splitlines()[2]  # each message numbers its own matches from 1
 
 

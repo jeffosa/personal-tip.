@@ -22,6 +22,15 @@ Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not e
 - **Audit 2026-10-11, Medium and Low findings:** (5) `prop_alpha_pilot` is now dumped by the daily backup (41 MB, verified and pushed like the main dump) and the pilot state files are in it; (6) and (7) are evidence, not code: Gate 2 is not passed (24 lockbox matches, calibration failing) and no League One/Two tackles or fouls price has been seen; (8) the unreviewed import change in `lineup_capture.py` is reverted, and the remote URL `personal-tip..git` is correct (the repository's name ends with a dot); a pull request and the GitHub Actions result still need the maintainer (no `gh` here); (9) `CLAUDE.md` no longer contradicts itself on the trial, the schedule, the task steps and the backup; (10) two unused keys in `.env` and (11) the OddsPapi key printed in a session log need the maintainer (removal and rotation; `.env` is never edited by an assistant); (12) the pilot scan's stale-league exit code now follows `ScanSummary.stale_leagues`, not the wording of a failure line.
 - **Evidence still open (blocks any move beyond paper):** the tackles and fouls settlement contract is unverified (`MARKET_CONTRACT.md`); 2,715 logged predictions are unscored; no League One/Two tackles or fouls price, closing price, paper bet or T-60 sheet has been seen; the Sportmonks trial ends 2026-10-16; the pilot-leagues scan (Brazil Serie A, Scottish Premiership, Scottish Championship; only Brazil Serie A is tipped) has no freeze, lockbox or settlement evidence.
 
+## Second audit 2026-10-11: code fixes (maintainer chose all code fixes, urgent first)
+
+- **Schedule [T]:** `Telegram status` now runs at 00/04/08/12/16/20 UTC, aligned with the scan's UTC windows; a fixture is logged once per pricing digest; tests cover every kickoff being scanned exactly once across the clock change and a late catch-up run.
+- **Pilot ledger [T]:** paper-bet recording is idempotent per selection, locked and crash-safe; the settled notice is queued and retried; a failing tip callback stops the send before anything is recorded; reconstructed tips are kept out of the model-scored total.
+- **Monitoring [T]:** pilot heartbeat and a pilot section in the status report.
+- **Scoring [T]:** `scripts/pilot_score.py` column bug fixed; `scripts/gate2_lockbox.py` compares repriced with logged predictions (2,235 in 20 matches: 125 differ, largest 3.7e-03; 4 matches not logged).
+- **Tip layout [T]:** the maintainer's layout (league/market heading, match header with UTC kickoff, pick line, book/minimum/stake line).
+- **Maintainer decisions, not code:** keep tipping paper-only; the data provider after the 2026-10-25 trial; pull requests and GitHub Actions; an always-on host (VPS) instead of a laptop that sleeps.
+
 ## Audit rerun on 2026-10-11
 
 **Strict readiness score: 5.8/10**, unchanged from the previous audit. The independent validation evidence is still missing, so the system remains **PAPER / SHADOW ONLY**.
