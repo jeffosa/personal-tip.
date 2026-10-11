@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule for prop-alpha-backup.service
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 UTC
+# A run missed while the host was down starts once at boot.
+Persistent=true
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target

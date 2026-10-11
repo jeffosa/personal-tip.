@@ -228,9 +228,16 @@ LISTING = "\n".join(f"1; 0 1 TABLE DATA prop_alpha {table} postgres" for table i
     "fixtures", "player_match_stats", "players", "teams", "leagues", "raw_payloads", "incomplete_team_matches"))
 
 
+COUNTS = {"fixtures": 3, "player_match_stats": 70, "players": 40, "teams": 6, "leagues": 2, "raw_payloads": 3,
+          "incomplete_team_matches": 0}
+COUNTS_TEXT = "".join(f"{table}|{count}\n" for table, count in COUNTS.items())
+
+
 def _fake_runner(listing: str, calls: list[list[str]]) -> Any:
     def runner(command: Sequence[str]) -> str:
         calls.append(list(command))
+        if "-c" in command:
+            return COUNTS_TEXT
         if "--list" in command:
             return listing
         Path(command[command.index("-f") + 1]).write_bytes(b"PGDMP fake dump")
@@ -253,13 +260,15 @@ def test_backup_dumps_copies_and_verifies_the_ledger_and_writes_a_manifest(tmp_p
     calls: list[list[str]] = []
     folder = backup.backup(tmp_path / "backups", _state(tmp_path), NOW, runner=_fake_runner(LISTING, calls))
     assert folder.name == "prop_alpha_20261006T080000Z"
-    assert calls[0][1:3] == ["-w", "-h"] and "-Fc" in calls[0] and calls[1][1] == "--list"
+    dump_at = next(i for i, call in enumerate(calls) if "-Fc" in call)
+    assert calls[dump_at][1:3] == ["-w", "-h"] and calls[dump_at + 1][1] == "--list"
+    assert "-c" in calls[0] and "-c" in calls[dump_at + 2]  # counted before and after the dump
     assert not any("password" in part.lower() or "@" in part for call in calls for part in call)
     manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
     assert set(manifest["state"]) == {"placed_bets.jsonl", "sent_alerts.jsonl",
                                       "odds_archive/20261010T120000Z_bet365.json.gz"}
     assert (folder / "state" / "placed_bets.jsonl").read_text(encoding="utf-8") == '{"event": "placed", "bet_id": 1}\n'
-    assert manifest["dump"]["bytes"] == len(b"PGDMP fake dump")
+    assert manifest["dump"]["bytes"] == len(b"PGDMP fake dump") and manifest["dump"]["counts"] == COUNTS
 
 
 def test_the_backup_covers_the_prediction_log_and_the_t60_team_sheets(tmp_path: Path) -> None:
@@ -409,7 +418,7 @@ def _pilot_runner(exists: bool, calls: list[list[str]], pilot_listing: str = LIS
     def runner(command: Sequence[str]) -> str:
         calls.append(list(command))
         if "-c" in command:
-            return "1\n" if exists else ""
+            return ("1\n" if exists else "") if "pg_database" in command[-1] else COUNTS_TEXT
         if "--list" in command:
             return pilot_listing if "prop_alpha_pilot.dump" in command[-1] else LISTING
         Path(command[command.index("-f") + 1]).write_bytes(b"PGDMP " + command[command.index("-d") + 1].encode())
@@ -427,7 +436,7 @@ def test_the_pilot_database_is_dumped_checked_and_listed_in_the_manifest(tmp_pat
     dump = folder / backup.PILOT_DUMP_NAME
     assert dump.read_bytes() == b"PGDMP prop_alpha_pilot"
     assert manifest["pilot_dump"] == {"database": "prop_alpha_pilot", "bytes": dump.stat().st_size,
-                                      "sha256": hashlib.sha256(dump.read_bytes()).hexdigest()}
+                                      "sha256": hashlib.sha256(dump.read_bytes()).hexdigest(), "counts": COUNTS}
     assert (folder / "prop_alpha.dump").read_bytes() == b"PGDMP prop_alpha"  # the working dump is unchanged
     assert sum(1 for call in calls if "-Fc" in call) == 2 and not any("password" in " ".join(c).lower() for c in calls)
 
