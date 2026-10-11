@@ -1,10 +1,11 @@
-"""The Championship ladder scan (alerts/ladder_scan.py): pilot pricing, ladder quotes, the stale-database gate, and
-the pilot's own alert state."""
+"""The pilot scan (alerts/ladder_scan.py): Brazil Serie A and the Scottish leagues, pilot pricing, ladder quotes, the
+per-league stale-database gate, the tip policy, and the pilot's own alert state."""
 
 from __future__ import annotations
 
 import gzip
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -28,9 +29,10 @@ from prop_alpha.scanner.slate import (
 FAKE_TOKEN = "123456789" + ":" + "AAH" + "x" * 32
 NOW = datetime(2026, 10, 13, 16, 30, tzinfo=timezone.utc)
 KICKOFF = datetime(2026, 10, 13, 18, 45, tzinfo=timezone.utc)
-FIXTURE = UpcomingFixture(9101, "Championship", "76", "348", "Walsall", "Port Vale", KICKOFF)
+FIXTURE = UpcomingFixture(9101, "Brazil Serie A", "76", "348", "Walsall", "Port Vale", KICKOFF)
 RATES = {(position, market): rate for position in ("DEF", "MID") for market, rate in (("tackles", 1.8), ("fouls", 1.2))}
 FINISHED_UID = "7001"
+SCOTTISH_ID = 9103
 
 
 def _history(player_id: int, team: str, starts: int, n: int = 10) -> list[Appearance]:
@@ -50,23 +52,34 @@ def _inputs() -> scan.SlateInputs:
     return scan.SlateInputs(squad, history, recent, RATES)
 
 
-def _row(fixture_id: int, state: str, kickoff: datetime, league: int = 9) -> dict[str, Any]:
+def _row(fixture_id: int, state: str, kickoff: datetime, league: int = 648,
+         names: tuple[str, str] = ("Walsall", "Port Vale")) -> dict[str, Any]:
     return {"id": fixture_id, "league_id": league, "state": {"developer_name": state},
             "starting_at_timestamp": int(kickoff.timestamp()),
-            "participants": [{"id": 76, "name": "Walsall", "meta": {"location": "home"}},
-                             {"id": 348, "name": "Port Vale", "meta": {"location": "away"}}]}
+            "participants": [{"id": 76, "name": names[0], "meta": {"location": "home"}},
+                             {"id": 348, "name": names[1], "meta": {"location": "away"}}]}
+
+
+LEAGUE_LIST = {"data": [{"id": 648, "name": "Serie A", "country": {"name": "Brazil"}},
+                        {"id": 12, "name": "League One", "country": {"name": "England"}},
+                        {"id": 501, "name": "Premiership", "country": {"name": "Scotland"}}],
+               "pagination": {"has_more": False}}
 
 
 class _StubSportmonks:
-    """Answers every listing with one Championship match about to start, one in League One, and one finished."""
+    """The plan lists Brazil Serie A and the Scottish Premiership (not the Scottish Championship). Every fixture
+    listing answers with a Brazil Serie A match and a Scottish Premiership match about to start, a League One match, and
+    a finished Brazil Serie A match."""
 
     def __init__(self, finished_kickoff: datetime = NOW - timedelta(days=5)) -> None:
-        self.rows = [_row(9101, "NS", KICKOFF), _row(9102, "NS", KICKOFF, league=12),
-                     _row(int(FINISHED_UID), "FT", finished_kickoff)]
+        self.rows = [_row(9101, "NS", KICKOFF), _row(SCOTTISH_ID, "NS", KICKOFF, 501, ("Celtic", "Rangers")),
+                     _row(9102, "NS", KICKOFF, league=12), _row(int(FINISHED_UID), "FT", finished_kickoff)]
         self.paths: list[str] = []
 
     def get_json(self, path: str) -> dict[str, Any]:
         self.paths.append(path)
+        if path.startswith("leagues?"):
+            return LEAGUE_LIST
         return {"data": self.rows, "pagination": {"has_more": False}}
 
 
@@ -119,67 +132,117 @@ def _run(tmp_path: Path, notifier: _Recording, store: SentAlertStore, **kwargs: 
 
 
 # ---------------- pricing ----------------
-def test_the_pilot_prices_with_the_championship_settings_not_the_frozen_ones() -> None:
+def test_only_brazil_may_tip_and_an_empty_tip_list_says_nothing_is_tipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The maintainer turned Brazil Serie A on (2026-10-11); the Scottish leagues have no backtest and no bookmaker price."""
+    assert ladder_scan.TIP_LEAGUES == frozenset({"Brazil Serie A"})
+    assert "Tipped: tackles in Brazil Serie A only" in ladder_scan.summary_text(scan.ScanSummary(NOW, NOW, fixtures=["x"]), "")
+    monkeypatch.setattr(ladder_scan, "TIP_LEAGUES", frozenset())
+    assert "Tipped: nothing yet" in ladder_scan.summary_text(scan.ScanSummary(NOW, NOW, fixtures=["x"]), "")
+
+
+def test_the_pilot_prices_with_its_own_settings_by_league_not_the_frozen_ones() -> None:
     inputs = _inputs()
-    engine, market_engines = ladder_scan.championship_engines()
-    pilot, _ = ladder_scan.price_championship(FIXTURE, inputs, engine, market_engines)
-    assert pilot[(9101, 1, "tackles")].game_state_k == 21.1 and pilot[(9101, 1, "fouls")].game_state_k == 1000.0
+    scottish = replace(FIXTURE, league="Scottish Premiership")
+    engine, market_engines = ladder_scan.pilot_engines(scottish.league)
+    fallback, _ = ladder_scan.price_pilot(scottish, inputs, engine, market_engines)
+    # A league without its own fit uses the English Championship's: tackles 21.1, fouls 1000.
+    assert fallback[(9101, 1, "tackles")].game_state_k == 21.1 and fallback[(9101, 1, "fouls")].game_state_k == 1000.0
+    brazil, _ = ladder_scan.price_pilot(FIXTURE, inputs, *ladder_scan.pilot_engines(FIXTURE.league))
+    assert brazil[(9101, 1, "tackles")].game_state_k == 496.882 and brazil[(9101, 1, "fouls")].game_state_k == 40.556
     frozen, _ = scan.price_fixture(FIXTURE, inputs, *scan.scan_engines())
-    assert frozen[(9101, 1, "tackles")].game_state_k == scan.SCAN_GAME_STATE_K_BY_MARKET["tackles"] != 21.1
+    assert frozen[(9101, 1, "tackles")].game_state_k == scan.SCAN_GAME_STATE_K_BY_MARKET["tackles"] not in (21.1, 496.882)
     # The pilot applies no rate multiplier and its own prior strength: the same call by hand agrees.
     by_hand, _ = build_projections(FIXTURE, inputs.squad, inputs.history_by_player, inputs.team_recent_fixtures,
                                    RATES, QuantEngine(game_state_k=6.0),
-                                   market_engines={m: QuantEngine(game_state_k=k) for m, k in ladder_scan.GAME_STATE_K.items()},
+                                   market_engines={m: QuantEngine(game_state_k=k)
+                                                   for m, k in ladder_scan.LEAGUE_GAME_STATE_K["Brazil Serie A"].items()},
                                    prior_strengths=ladder_scan.PRIOR_STRENGTH)
-    assert pilot[(9101, 1, "tackles")].rate_posterior.alpha == pytest.approx(by_hand[(9101, 1, "tackles")].rate_posterior.alpha)
+    assert brazil[(9101, 1, "tackles")].rate_posterior.alpha == pytest.approx(by_hand[(9101, 1, "tackles")].rate_posterior.alpha)
 
 
 # ---------------- listings ----------------
-def test_the_listing_helpers_default_to_league_one_and_two_and_take_the_championship() -> None:
-    body = {"data": [_row(1, "NS", KICKOFF, 9), _row(2, "NS", KICKOFF, 12), _row(3, "FT", KICKOFF, 9)],
-            "pagination": {"has_more": False}}
-    rows, _ = sportmonks.upcoming_fixtures(body, sportmonks.CHAMPIONSHIP_LEAGUES)
-    assert [(r["fixture_id"], r["league"]) for r in rows] == [(1, "Championship")]
+PILOT = {648: "Brazil Serie A", 501: "Scottish Premiership"}
+
+
+def test_the_plans_league_list_resolves_the_wanted_leagues_and_reports_the_rest() -> None:
+    rows, more = sportmonks.league_rows(LEAGUE_LIST)
+    found, absent = sportmonks.resolve_leagues(rows)
+    assert not more and found == PILOT and absent == ["Scottish Championship"]
+    # A league is told apart by country; an unwanted league (England's Championship, no longer a focus) is ignored.
+    both = [*rows, {"id": 504, "name": "Championship", "country": {"name": "Scotland"}}]
+    assert sportmonks.resolve_leagues(both) == ({**PILOT, 504: "Scottish Championship"}, [])
+    english = {"id": 9, "name": "Championship", "country": {"name": "England"}}
+    assert sportmonks.resolve_leagues([english, {"id": 648, "name": "Serie A", "country": None}]) == (
+        {}, ["Brazil Serie A", "Scottish Championship", "Scottish Premiership"])
+    with pytest.raises(ValueError, match="no 'data' list"):
+        sportmonks.league_rows({"oops": 1})
+
+
+def test_the_listing_helpers_default_to_league_one_and_two_and_take_the_pilot_leagues() -> None:
+    body = {"data": [_row(1, "NS", KICKOFF, 648), _row(2, "NS", KICKOFF, 12), _row(3, "FT", KICKOFF, 648),
+                     _row(4, "FT", KICKOFF, 501), _row(5, "NS", KICKOFF, 501)], "pagination": {"has_more": False}}
+    rows, _ = sportmonks.upcoming_fixtures(body, PILOT)
+    assert [(r["fixture_id"], r["league"]) for r in rows] == [(1, "Brazil Serie A"), (5, "Scottish Premiership")]
     assert [r["fixture_id"] for r in sportmonks.upcoming_fixtures(body)[0]] == [2]  # the default is unchanged
-    assert [uid for uid, _ in sportmonks.finished_fixtures(body, sportmonks.CHAMPIONSHIP_LEAGUES)[0]] == ["3"]
+    assert sportmonks.finished_with_leagues(body, PILOT)[0] == [("3", KICKOFF, "Brazil Serie A"),
+                                                                ("4", KICKOFF, "Scottish Premiership")]
+    assert [uid for uid, _ in sportmonks.finished_fixtures(body, PILOT)[0]] == ["3", "4"]
     assert sportmonks.finished_fixtures(body)[0] == []
-    assert "fixtureLeagues:9&" in sportmonks.upcoming_path(NOW, NOW, 1, sportmonks.CHAMPIONSHIP_LEAGUES)
+    assert "fixtureLeagues:501,648&" in sportmonks.upcoming_path(NOW, NOW, 1, PILOT)
     assert "fixtureLeagues:12,14&" in sportmonks.upcoming_path(NOW, NOW, 1)
 
 
 # ---------------- the stale-database gate ----------------
-def test_missing_results_lists_finished_matches_not_stored_and_spares_the_last_hours() -> None:
-    finished = [("1", NOW - timedelta(days=4)), ("2", NOW - timedelta(days=9)), ("3", NOW - timedelta(hours=1)),
-                ("4", NOW - timedelta(days=2))]
-    assert ladder_scan.missing_results(finished, {"4"}, NOW) == [("2", NOW - timedelta(days=9)),
-                                                                 ("1", NOW - timedelta(days=4))]
-    assert ladder_scan.missing_results(finished, {"1", "2", "4"}, NOW) == []  # "3" kicked off an hour ago: not yet due
-    assert ladder_scan.missing_results([("19729100", NOW - timedelta(days=3))], set(), NOW) == []  # a known vendor defect
+def test_missing_by_league_lists_finished_matches_not_stored_and_spares_the_last_hours() -> None:
+    finished = [("1", NOW - timedelta(days=4), "Brazil Serie A"), ("2", NOW - timedelta(days=9), "Brazil Serie A"),
+                ("3", NOW - timedelta(hours=1), "Brazil Serie A"), ("4", NOW - timedelta(days=2), "Brazil Serie A"),
+                ("5", NOW - timedelta(days=2), "Scottish Premiership")]
+    assert ladder_scan.missing_by_league(finished, {"4"}, NOW) == {
+        "Brazil Serie A": [("2", NOW - timedelta(days=9)), ("1", NOW - timedelta(days=4))],
+        "Scottish Premiership": [("5", NOW - timedelta(days=2))]}
+    # "3" kicked off an hour ago (not yet due); a league with nothing missing is not listed.
+    assert ladder_scan.missing_by_league(finished, {"1", "2", "4"}, NOW) == {
+        "Scottish Premiership": [("5", NOW - timedelta(days=2))]}
+    assert ladder_scan.missing_by_league([("19729100", NOW - timedelta(days=3), "Brazil Serie A")], set(), NOW) == {}
     with pytest.raises(ValueError, match="UTC"):
-        ladder_scan.missing_results(finished, set(), datetime(2026, 10, 13, 16))
+        ladder_scan.missing_by_league(finished, set(), datetime(2026, 10, 13, 16))
 
 
-def test_a_stale_pilot_database_refuses_the_scan_and_names_the_fix(
+def test_a_stale_league_is_skipped_and_named_while_the_others_are_still_scanned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The finished Brazil Serie A match is not stored: Brazil is not priced and the run says how to fix it,
+    but the Scottish Premiership (nothing finished in its listing) is still priced."""
     _patch_database(monkeypatch, stored=set())
-    notifier = _Recording(SentAlertStore(tmp_path / "s.jsonl"))
-    with pytest.raises(ValueError, match="not in the pilot database") as caught:
-        _run(tmp_path, notifier, SentAlertStore(tmp_path / "s.jsonl"))
-    assert "pilot_backfill.py --list --ingest --fix-leagues" in str(caught.value) and FINISHED_UID in str(caught.value)
-    assert notifier.texts == []
+    store = SentAlertStore(tmp_path / "s.jsonl")
+    notifier = _Recording(store)
+    summary = _run(tmp_path, notifier, store)
+    [failure] = summary.failures
+    assert failure.startswith("Brazil Serie A skipped, not priced") and FINISHED_UID in failure
+    assert "ingestion.results --pilot" in failure and "pilot_backfill.py --list --seed --ingest" in failure
+    assert summary.players_priced == 2 and notifier.texts == []  # the Scottish fixture only; it is never tipped
+    assert "Could not price Brazil Serie A skipped" in ladder_scan.summary_text(summary, "")
 
 
-def test_a_window_with_no_championship_match_reads_nothing_else(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_a_window_with_no_pilot_match_reads_no_database(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import psycopg2
 
     monkeypatch.setattr(psycopg2, "connect", lambda *a, **k: pytest.fail("the database must not be opened"))
     empty = _StubSportmonks()
-    empty.rows = [_row(9102, "NS", KICKOFF, league=12)]  # League One only
+    empty.rows = [_row(9102, "NS", KICKOFF, league=12)]  # League One only: the other scan's
     summary = _run(tmp_path, _Recording(SentAlertStore(tmp_path / "s.jsonl")), SentAlertStore(tmp_path / "s.jsonl"),
                    client=empty)
     assert summary.fixtures == [] and "Matches in this window: 0" in ladder_scan.summary_text(summary, "")
-    assert all("fixtureLeagues:9&" in path for path in empty.paths)
+    assert all("fixtureLeagues:501,648&" in path for path in empty.paths if not path.startswith("leagues?"))
+
+
+def test_a_token_with_none_of_the_pilot_leagues_scans_nothing_and_says_so(tmp_path: Path) -> None:
+    bare = _StubSportmonks()
+    bare.get_json = lambda path: {"data": [], "pagination": {"has_more": False}}  # type: ignore[method-assign]
+    summary = _run(tmp_path, _Recording(SentAlertStore(tmp_path / "s.jsonl")), SentAlertStore(tmp_path / "s.jsonl"),
+                   client=bare)
+    assert summary.fixtures == []
+    assert "Not in the Sportmonks plan, not scanned: Brazil Serie A, Scottish Championship, Scottish Premiership" in summary.odds_notes[0]
 
 
 # ---------------- ladder quotes ----------------
@@ -220,14 +283,18 @@ def test_a_mock_scan_tips_tackles_in_the_tip_format_with_the_pilot_label_and_its
     notifier = _Recording(store)
     label = f"{scan.MOCK_LABEL}\n{ladder_scan.PILOT_LABEL}"
     summary = _run(tmp_path, notifier, store, label=label, odds="mock")
-    assert summary.fixtures == ["Walsall v Port Vale 18:45"] and summary.players_priced == 2
+    assert summary.fixtures == ["Walsall v Port Vale 18:45 (Brazil Serie A)", "Celtic v Rangers 18:45 (Scottish Premiership)"]
+    assert summary.players_priced == 4  # both leagues are priced
     assert summary.alerts_sent >= 1 and len(notifier.texts) == 1  # one tip message holds up to five bets
     first = notifier.texts[0]
     assert first.startswith(label) and "\nTACKLE" in first and "Walsall vs Port Vale, Tue 13 Oct 18:45 UTC" in first
     assert first.endswith(ladder_scan.PILOT_USAGE) and "placed" not in first
-    assert len(store.load()) == summary.alerts_sent  # recorded in the store it was given, never the real one
+    assert "Celtic" not in first  # the Scottish Premiership has no backtest: it is priced, never tipped
+    assert {alert.key[0] for alert in store.load()} == {9101}  # recorded in the store it was given, never the real one
     text = ladder_scan.summary_text(summary, label)
-    assert "Championship pilot scan" in text and "Tipped markets: tackles" in text and "League One" not in text
+    assert "Pilot leagues scan" in text and "Leagues: Brazil Serie A 1, Scottish Premiership 1" in text
+    assert "Tipped: tackles in Brazil Serie A only" in text and "League One" not in text
+    assert "Not in the Sportmonks plan, not scanned: Scottish Championship" in text
 
 
 def _market_catalogue() -> list[dict[str, Any]]:
@@ -236,15 +303,20 @@ def _market_catalogue() -> list[dict[str, Any]]:
                           {"outcomeId": 3, "outcomeName": "0"}]}]
 
 
-def _ladder_body(prices: Mapping[str, tuple[float, float, float]]) -> list[dict[str, Any]]:
+def _ladder_fixture(fixture_id: str, home: int, away: int,
+                    prices: Mapping[str, tuple[float, float, float]]) -> dict[str, Any]:
     """One bet365 fixture: `prices` maps a player name to the (1+, 2+, 0) prices of his tackles ladder."""
     outcomes: dict[str, dict[str, Any]] = {"1": {"players": {}}, "2": {"players": {}}, "3": {"players": {}}}
     for ref, (name, (one, two, zero)) in enumerate(prices.items(), start=1):
         for outcome, price in (("1", one), ("2", two), ("3", zero)):
             outcomes[outcome]["players"][f"p{ref}"] = {"active": True, "price": price, "playerName": name, "limit": 100}
-    return [{"fixtureId": "id1", "participant1Id": 11, "participant2Id": 12, "startTime": "2026-10-13T18:45:00Z",
-             "bookmakerOdds": {"bet365": {"bookmakerIsActive": True,
-                                          "markets": {"5001": {"marketActive": True, "outcomes": outcomes}}}}}]
+    return {"fixtureId": fixture_id, "participant1Id": home, "participant2Id": away, "startTime": "2026-10-13T18:45:00Z",
+            "bookmakerOdds": {"bet365": {"bookmakerIsActive": True,
+                                         "markets": {"5001": {"marketActive": True, "outcomes": outcomes}}}}}
+
+
+def _ladder_body(prices: Mapping[str, tuple[float, float, float]]) -> list[dict[str, Any]]:
+    return [_ladder_fixture("id1", 11, 12, prices)]
 
 
 class _FakeOdds:
@@ -266,7 +338,8 @@ class _FakeOdds:
 def _names_cache(tmp_path: Path) -> None:
     cache = tmp_path / scan.ODDS_CACHE_DIR
     cache.mkdir(parents=True)
-    (cache / "participants.json").write_text(json.dumps({"11": "Walsall", "12": "Port Vale"}), encoding="utf-8")
+    (cache / "participants.json").write_text(
+        json.dumps({"11": "Walsall", "12": "Port Vale", "21": "Celtic", "22": "Rangers"}), encoding="utf-8")
 
 
 def test_a_real_ladder_price_above_the_models_becomes_a_pilot_tip_and_is_archived(
@@ -274,20 +347,26 @@ def test_a_real_ladder_price_above_the_models_becomes_a_pilot_tip_and_is_archive
 ) -> None:
     _patch_database(monkeypatch, stored={FINISHED_UID})
     _names_cache(tmp_path)
-    odds = _FakeOdds(_ladder_body({"Regular Starter": (2.6, 9.0, 1.45), "Away Starter": (1.10, 1.5, 7.0)}))
+    # A juicy ladder for the Scottish Premiership match as well: it is matched, priced and never tipped.
+    body = [*_ladder_body({"Regular Starter": (2.6, 9.0, 1.45), "Away Starter": (1.10, 1.5, 7.0)}),
+            _ladder_fixture("id2", 21, 22, {"Regular Starter": (3.0, 12.0, 1.2)})]
+    odds = _FakeOdds(body)
     store = SentAlertStore(tmp_path / "pilot.jsonl")
     notifier = _Recording(store)
     summary = _run(tmp_path, notifier, store, odds="oddspapi", odds_client=odds)
     assert not summary.odds_unavailable and summary.quotes >= 2
-    assert any(path.startswith("odds-by-tournaments?bookmakers=bet365&tournamentIds=18&") for path in odds.paths)
-    [archived] = (tmp_path / ladder_scan.PILOT_ODDS_DIR).glob("*_bet365_championship.json.gz")
-    assert json.loads(gzip.open(archived, "rt", encoding="utf-8").read())[0]["fixtureId"] == "id1"
+    # One request covers every pilot league in the window: Brazil Serie A (325) and the Scottish Premiership (36).
+    assert any(path.startswith("odds-by-tournaments?bookmakers=bet365&tournamentIds=36,325&") for path in odds.paths)
+    [archived] = (tmp_path / ladder_scan.PILOT_ODDS_DIR).glob("*_bet365_pilot.json.gz")
+    assert [f["fixtureId"] for f in json.loads(gzip.open(archived, "rt", encoding="utf-8").read())] == ["id1", "id2"]
     assert (tmp_path / scan.ODDS_CACHE_DIR / ladder_scan.LADDER_CATALOGUE_FILE).is_file()
+    assert (tmp_path / scan.ODDS_CACHE_DIR / scan.CATALOGUE_FILE).is_file()  # the line catalogue the other scan also reads
     assert summary.alerts_sent >= 1 and notifier.texts[0].startswith(ladder_scan.PILOT_LABEL)
     assert "1a) Regular Starter (Walsall) tackle over 1.5 9.00 odd" in notifier.texts[0]  # the 2+ ladder step
     assert "bet365 | take it at" in notifier.texts[0] and "simulated match conditions" in notifier.texts[0]
     # The short-priced Away Starter ladder (1.10 for 1+) is no edge: it is never tipped.
-    assert "Away Starter" not in notifier.texts[0]
+    assert "Away Starter" not in notifier.texts[0] and "Celtic" not in notifier.texts[0]
+    assert {alert.key[0] for alert in store.load()} == {9101}
 
 
 def test_odds_are_not_fetched_below_the_quota_reserve_and_no_tip_is_made(
@@ -336,3 +415,15 @@ def test_the_scan_adds_no_exception_handler_and_the_frozen_model_is_unchanged() 
     assert not [node for node in ast.walk(tree) if isinstance(node, ast.ExceptHandler)]
     assert ladder_scan.ALERT_MARKETS <= scan.ALERT_MARKETS
     assert fx_identity("GBP").identity
+
+
+def test_recorded_vendor_refusals_are_not_stale_but_are_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A recent match the data feed cannot load (no tackles in any line-up) must not make its league stale for ever."""
+    assert ladder_scan.missing_by_league([("77", NOW - timedelta(days=2), "Scottish Championship")], set(), NOW,
+                                         refused={"77"}) == {}
+    _patch_database(monkeypatch, stored=set())
+    (tmp_path / "pilot_refused.json").write_text(json.dumps({FINISHED_UID: "ValueError: no tackles"}), encoding="utf-8")
+    store = SentAlertStore(tmp_path / "s.jsonl")
+    summary = _run(tmp_path, _Recording(store), store)
+    assert summary.failures == [] and summary.players_priced == 4
+    assert any("cannot load" in note and "Brazil Serie A 1" in note for note in summary.odds_notes)

@@ -1,28 +1,34 @@
-"""Championship ladder scan (pilot): the 4-hourly opportunity scan for the English Championship, whose bookmakers
-list tackles and fouls as "k+" ladders ("to make k or more") instead of over/under lines. It never places a bet.
+"""Pilot scan: the 4-hourly opportunity scan for the leagues outside the frozen League One/Two model: Brazil Serie A and
+the two Scottish leagues (the maintainer's five leagues, 2026-10-11, with League One and League Two, which alerts/scan.py
+covers). Brazil Serie A's bookmakers list tackles and fouls as "k+" ladders ("to make k or more") instead of over/under
+lines. It never places a bet.
 
-    python -m prop_alpha.alerts.ladder_scan --odds oddspapi --send      # real bet365 ladders (OddsPapi)
+    python -m prop_alpha.alerts.ladder_scan --odds oddspapi --send      # real bet365 prices (OddsPapi)
     python -m prop_alpha.alerts.ladder_scan --odds mock                 # print what would be sent
     python -m prop_alpha.alerts.ladder_scan --odds mock --at 2026-10-13T16:30:00+00:00   # simulate a run time
 
-It is the League One/Two scan (alerts/scan.py) with four differences, and nothing else:
+It is the League One/Two scan (alerts/scan.py) with these differences, and nothing else:
 
-* Pricing is the Championship pilot's, read from the pilot database `prop_alpha_pilot` (read-only), never from the
-  working `prop_alpha`: game-state k 21.1 for tackles and 1000 for fouls, prior strength 6, no rate multiplier (the
-  settings of the 2026-10-08 Championship backtest, scripts/pilot_price_match.py). These are NOT the frozen League
-  One/Two settings and are not frozen themselves: the model_freeze fingerprint and the League One/Two lockbox are
-  untouched, and no Championship lockbox exists.
-* Odds are ladders (oddspapi.ladder_prices). A "k+" step is the Over of line k - 0.5 on its own; the "0" step is the
-  Under of 0.5. They go through the same quote building, allocator and high-value screen as the other scan.
+* Leagues: Sportmonks league ids are read from the plan's own league list (sportmonks.PILOT_LEAGUES_WANTED), so a
+  league the plan does not include is reported ("not in the Sportmonks plan"), never guessed.
+* Pricing is the pilot's, read from the pilot database `prop_alpha_pilot` (read-only), never from the working
+  `prop_alpha`: prior strength 6, no rate multiplier, and a game-state k per league and market (LEAGUE_GAME_STATE_K: Brazil
+  Serie A's own fit; the English Championship's 21.1 for tackles and 1000 for fouls for the Scottish leagues, which have no
+  backtest at all). These are NOT the frozen League One/Two settings and are not frozen themselves: the model_freeze
+  fingerprint and the League One/Two lockbox are untouched, and no pilot lockbox exists.
+* Tips: only leagues in TIP_LEAGUES can produce a tip (Brazil Serie A, turned on by the maintainer on 2026-10-11 after seeing its
+  backtest). The Scottish leagues are scanned, priced and reported, never tipped.
+* Odds are ladders (oddspapi.ladder_prices) or over/under lines (oddspapi.prop_prices): both parsers read the same
+  reply. A "k+" step is the Over of line k - 0.5 on its own; the "0" step is the Under of 0.5. They go through the same
+  quote building, allocator and high-value screen as the other scan.
 * Every message says it is a pilot. The settlement statistic and void rule of bet365's tackles and fouls markets are
   NOT verified (MARKET_CONTRACT.md), and the first comparisons found bet365 pricing events well above the model's
   plain counts; the screen cannot detect that, so a tip here is a model-versus-price gap and nothing more.
 * Tips are recorded in pilot state files (`pilot_*.jsonl`), never the real alert store, message index or ledger: a
   reply to a pilot message is not recorded as a bet, and the exposure of pilot tips is its own.
-
-The scan refuses to run (ValueError) when a finished Championship match of the last STALE_AFTER is missing from the
-pilot database: the history it prices from would silently lack it. Refresh it first with
-`scripts/pilot_backfill.py --list --ingest --fix-leagues`.
+* Freshness is checked per league: a league with a finished match of the last STALE_AFTER missing from the pilot
+  database is not priced in this run, and the run says so and exits STALE_EXIT, so the scheduled task reports it. The
+  pilot database is kept current by `python -m prop_alpha.ingestion.results --pilot` (run before this scan).
 
 I/O: Sportmonks listings through VendorClient, one read-only pilot-database transaction, the pilot state files, the
 OddsPapi cache and archive under .prop_alpha_state/, and Telegram. There is no exception handler here (AGENT.md 1.3):
@@ -39,6 +45,7 @@ import json
 import logging
 import os
 import sys
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Collection, Final, Mapping, Sequence
@@ -57,7 +64,9 @@ from prop_alpha.alerts.telegram import (
     TelegramNotifier,
     load_config,
 )
+from prop_alpha.config import DEFAULT_PILOT_DSN, PILOT_DSN_ENV
 from prop_alpha.ingestion import oddspapi, sportmonks
+from prop_alpha.ingestion.results import PILOT_REFUSED_FILE, load_refused, pilot_leagues
 from prop_alpha.modeling.engine import FactorProjection, QuantEngine
 from prop_alpha.scanner.market_scanner import (
     MODEL_RISK_LOSS_FLOOR,
@@ -79,29 +88,37 @@ from prop_alpha.scanner.slate import (
 
 logger = logging.getLogger("prop_alpha.ladder_scan")
 
-LEAGUE: Final[str] = "Championship"
-PILOT_DSN_ENV: Final[str] = "PROP_ALPHA_PILOT_DSN"
-DEFAULT_PILOT_DSN: Final[str] = "postgresql://postgres@localhost:5432/prop_alpha_pilot"
-# The Championship pilot's pricing settings (2026-10-08 backtest, fitted on Championship data before 2026-03-01).
+# The pilot's pricing settings. Game-state dispersion k per market: Brazil Serie A has its own, fitted by scripts/quick_backtest.py
+# on its matches before 2026-03-01 (run 2026-10-11, scored on 4,808 starters in 253 matches after that date); a league without
+# its own (the two Scottish leagues, which have no backtest) falls back to the English Championship's fit of 2026-10-08.
 DEFAULT_GAME_STATE_K: Final[float] = 6.0
 GAME_STATE_K: Final[Mapping[str, float]] = {"tackles": 21.1, "fouls": 1000.0}
+LEAGUE_GAME_STATE_K: Final[Mapping[str, Mapping[str, float]]] = {"Brazil Serie A": {"tackles": 496.882, "fouls": 40.556}}
 PRIOR_STRENGTH: Final[Mapping[str, float]] = {"tackles": 6.0, "fouls": 6.0}
 # Only tackles are tipped, as in the League One/Two scan; fouls are priced but never staked or tipped (the pilot's
 # fouls calibration slopes were 0.86 and 0.89 against the 0.9-1.1 the PRD requires).
 ALERT_MARKETS: Final[frozenset[str]] = frozenset({"tackles"})
+# The leagues that may produce a tip. Brazil Serie A was turned on by the maintainer on 2026-10-11 ("yes"), after being shown its
+# backtest (tackles Brier skill +0.06 to +0.08 over the league average, slopes 0.93-1.02, the strict PRD bin test failing) and
+# that the bookmakers' prices run far above the model's counts (mean expected profit about -60%). The Scottish leagues have
+# neither a backtest nor a bookmaker price: they are scanned and priced, never tipped. Adding a league here is a maintainer decision.
+TIP_LEAGUES: Final[frozenset[str]] = frozenset({"Brazil Serie A"})
 BOOKMAKERS_ENV: Final[str] = "LADDER_BOOKMAKERS"
-DEFAULT_BOOKMAKERS: Final[tuple[str, ...]] = ("bet365",)
-# Finished Championship matches this old (and not within STALE_GRACE of now, which ingestion may not have reached
-# yet) must be in the pilot database before the scan prices anything.
+# Brazil Serie A: Betway lists the tackles and fouls ladders for every fixture seen on 2026-10-11 (7 of 7), bet365 for 4 of 13.
+DEFAULT_BOOKMAKERS: Final[tuple[str, ...]] = ("bet365", "betway")
+# Finished matches this old (and not within STALE_GRACE of now, which ingestion may not have reached yet) must be in the
+# pilot database before a league is priced.
 STALE_AFTER: Final[timedelta] = timedelta(days=10)
 STALE_GRACE: Final[timedelta] = timedelta(hours=4)
-# Championship matches Sportmonks refuses to load (vendor data errors, 2026-10-08): never in the pilot database, so
-# never counted as missing. 19427700 and 19431984: goal events do not reproduce the score; 19729100: duels won above
-# duels; 19427583: card counts out of range.
+# Exit code of a run that skipped a league because its results were missing (the scheduled task reports the step).
+STALE_EXIT: Final[int] = 4
+# Matches Sportmonks refuses to load (vendor data errors, 2026-10-08): never in the pilot database, so never counted
+# as missing. 19427700 and 19431984: goal events do not reproduce the score; 19729100: duels won above duels; 19427583:
+# card counts out of range.
 KNOWN_VENDOR_ERRORS: Final[frozenset[str]] = frozenset({"19427700", "19431984", "19729100", "19427583"})
 PILOT_LABEL: Final[str] = (
-    "CHAMPIONSHIP PILOT - model not validated for this league; bet365's tackle and foul rules are unverified and its "
-    "prices have run above the model's plain counts. Token stakes only."
+    "PILOT LEAGUES - model not validated for them; bet365's tackle and foul rules are unverified and its prices have run "
+    "above the model's plain counts. Token stakes only."
 )
 PILOT_USAGE: Final[str] = (
     "Pilot tips are not recorded by the bet ledger: a reply to this message is ignored. Track any bet yourself."
@@ -113,52 +130,58 @@ PILOT_ODDS_DIR: Final[str] = "pilot"
 LADDER_CATALOGUE_FILE: Final[str] = "ladder_markets.json"
 
 
-def championship_engines() -> tuple[QuantEngine, dict[str, QuantEngine]]:
-    """The pilot's engines: the default and one per market (GAME_STATE_K)."""
-    return QuantEngine(game_state_k=DEFAULT_GAME_STATE_K), {m: QuantEngine(game_state_k=k) for m, k in GAME_STATE_K.items()}
+def pilot_engines(league: str) -> tuple[QuantEngine, dict[str, QuantEngine]]:
+    """The engines for `league`: the default and one per market (LEAGUE_GAME_STATE_K, else GAME_STATE_K)."""
+    ks = LEAGUE_GAME_STATE_K.get(league, GAME_STATE_K)
+    return QuantEngine(game_state_k=DEFAULT_GAME_STATE_K), {m: QuantEngine(game_state_k=k) for m, k in ks.items()}
 
 
-def price_championship(
+def price_pilot(
     fixture: UpcomingFixture, inputs: scan.SlateInputs, engine: QuantEngine,
     market_engines: Mapping[str, QuantEngine] | None = None,
 ) -> tuple[dict[ProjectionKey, FactorProjection], list[str]]:
-    """The model's projections for one Championship fixture with the pilot's settings (scan.scan_fixture's `pricer`)."""
+    """The model's projections for one pilot-league fixture (scan.scan_fixture's `pricer`); pass the engines of
+    `pilot_engines(fixture.league)`."""
     return build_projections(
         fixture, inputs.squad, inputs.history_by_player, inputs.team_recent_fixtures, inputs.league_rates, engine,
         season_levels=inputs.season_levels or None, market_engines=market_engines, prior_strengths=PRIOR_STRENGTH,
     )
 
 
-def missing_results(
-    finished: Sequence[tuple[str, datetime]], stored: Collection[str], now: datetime,
-) -> list[tuple[str, datetime]]:
-    """Pure: the finished matches in `finished` ((Sportmonks fixture id, kickoff)) that are not in `stored`, oldest
-    first), leaving out KNOWN_VENDOR_ERRORS and those that kicked off within STALE_GRACE of `now` (ingestion may not have
-    reached them)."""
+def missing_by_league(
+    finished: Sequence[tuple[str, datetime, str]], stored: Collection[str], now: datetime,
+    refused: Collection[str] = (),
+) -> dict[str, list[tuple[str, datetime]]]:
+    """Pure: per league, the finished matches in `finished` ((Sportmonks fixture id, kickoff, league)) that are not in
+    `stored`, oldest first, leaving out KNOWN_VENDOR_ERRORS, `refused` (the results job's recorded refusals) and those
+    that kicked off within STALE_GRACE of `now` (ingestion may not have reached them). A league with none is not in the
+    result."""
     if now.tzinfo is None or now.utcoffset() != timedelta(0):
         raise ValueError("now must be a timezone-aware UTC datetime")
-    return sorted(((uid, kickoff) for uid, kickoff in finished
-                   if uid not in stored and uid not in KNOWN_VENDOR_ERRORS and kickoff <= now - STALE_GRACE),
-                  key=lambda item: item[1])
+    missing: dict[str, list[tuple[str, datetime]]] = {}
+    for uid, kickoff, league in sorted(finished, key=lambda item: item[1]):
+        if uid not in stored and uid not in KNOWN_VENDOR_ERRORS and uid not in refused and kickoff <= now - STALE_GRACE:
+            missing.setdefault(league, []).append((uid, kickoff))
+    return missing
 
 
-def stale_message(missing: Sequence[tuple[str, datetime]]) -> str:
-    shown = ", ".join(f"{uid} ({kickoff:%d %b})" for uid, kickoff in missing[:5])
-    return (f"{len(missing)} finished Championship match(es) of the last {STALE_AFTER.days} days are not in the pilot "
-            f"database (e.g. {shown}): its history would be out of date. Refresh it with "
-            "`scripts/pilot_backfill.py --list --ingest --fix-leagues`, then run the scan again.")
+def stale_message(league: str, missing: Sequence[tuple[str, datetime]]) -> str:
+    examples = ", ".join(f"{uid} ({kickoff:%d %b})" for uid, kickoff in missing[:5])
+    return (f"{league} skipped, not priced: {len(missing)} finished match(es) of the last {STALE_AFTER.days} days are not "
+            f"in the pilot database (e.g. {examples}). Run `python -m prop_alpha.ingestion.results --pilot`, or "
+            "`scripts/pilot_backfill.py --list --seed --ingest` for a league never loaded.")
 
 
-def finished_listing(client: Any, now: datetime) -> list[tuple[str, datetime]]:
-    """Finished Championship matches from the last STALE_AFTER, from the Sportmonks listing (at most MAX_LISTING_PAGES)."""
-    finished: list[tuple[str, datetime]] = []
+def finished_listing(client: Any, now: datetime, leagues: Mapping[int, str]) -> list[tuple[str, datetime, str]]:
+    """Finished matches of `leagues` from the last STALE_AFTER, from the Sportmonks listing (at most MAX_LISTING_PAGES)."""
+    finished: list[tuple[str, datetime, str]] = []
     for page in range(1, scan.MAX_LISTING_PAGES + 1):
-        body = client.get_json(sportmonks.upcoming_path(now - STALE_AFTER, now, page, sportmonks.CHAMPIONSHIP_LEAGUES))
-        rows, has_more = sportmonks.finished_fixtures(body, sportmonks.CHAMPIONSHIP_LEAGUES)
+        body = client.get_json(sportmonks.upcoming_path(now - STALE_AFTER, now, page, leagues))
+        rows, has_more = sportmonks.finished_with_leagues(body, leagues)
         finished += rows
         if not has_more:
             return finished
-    raise ValueError(f"finished Championship listing has more than {scan.MAX_LISTING_PAGES} pages; check refused")
+    raise ValueError(f"finished pilot listing has more than {scan.MAX_LISTING_PAGES} pages; check refused")
 
 
 def load_ladder_catalogue(path: Path) -> dict[int, oddspapi.LadderMarket]:
@@ -184,60 +207,68 @@ def _save_ladder_catalogue(path: Path, catalogue: Mapping[int, oddspapi.LadderMa
     }), encoding="utf-8")
 
 
-def collect_ladder_odds(
+def collect_pilot_odds(
     client: Any, fixtures: Sequence[UpcomingFixture], squads: Mapping[int, Sequence[SquadPlayer]],
     now: datetime, window_end: datetime, books: Sequence[str], state_dir: Path,
 ) -> tuple[OddsCoverage, list[str], bool]:
-    """Real ladder quotes for `fixtures` from OddsPapi, summary lines, and whether real odds were available (False when
-    the quota reserve stopped the fetch). Same quota rule as scan.collect_odds: the unmetered account endpoint is read
-    first and odds are skipped when fewer than ODDS_QUOTA_RESERVE requests would remain. A bookmaker that reports no
-    fixtures is recorded; any other failure, or a reply the ladder parser does not understand, raises. Every raw reply is
-    archived under pilot/ as <stamp>_<book>_championship.json.gz."""
+    """Real quotes for `fixtures` from OddsPapi (ladders and over/under lines), summary lines, and whether real odds
+    were available (False when the quota reserve stopped the fetch). Same quota rule as scan.collect_odds: the unmetered
+    account endpoint is read first and odds are skipped when fewer than ODDS_QUOTA_RESERVE requests would remain. A
+    bookmaker that reports no fixtures is recorded; any other failure, or a reply a parser does not understand, raises.
+    One request per bookmaker covers every pilot league (at most five tournaments per request). Every raw reply is
+    archived under pilot/ as <stamp>_<book>_pilot.json.gz."""
     empty = OddsCoverage((), 0, 0, (), ())
     cache = state_dir / scan.ODDS_CACHE_DIR
-    catalogue_file, names_file = cache / LADDER_CATALOGUE_FILE, cache / "participants.json"
-    catalogue_fresh = catalogue_file.is_file() and (
-        datetime.now(timezone.utc) - datetime.fromtimestamp(catalogue_file.stat().st_mtime, timezone.utc)
-        < scan.CATALOGUE_MAX_AGE
-    )
+    line_file, ladder_file, names_file = cache / scan.CATALOGUE_FILE, cache / LADDER_CATALOGUE_FILE, cache / "participants.json"
+
+    def fresh(path: Path) -> bool:
+        return path.is_file() and (datetime.now(timezone.utc) - datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+                                   < scan.CATALOGUE_MAX_AGE)
+
+    catalogues_fresh = fresh(line_file) and fresh(ladder_file)
     left = scan._requests_left(client.get_json_value(oddspapi.ACCOUNT_PATH))  # noqa: SLF001 - the scan's own reader
-    needed = len(books) + (0 if catalogue_fresh else 1) + (0 if names_file.is_file() else 1)
+    needed = len(books) + (0 if catalogues_fresh else 1) + (0 if names_file.is_file() else 1)
     if left - needed < scan.ODDS_QUOTA_RESERVE:
         return empty, [f"Odds NOT fetched: OddsPapi has {left} requests left; this run needs {needed} and "
                        f"{scan.ODDS_QUOTA_RESERVE} are kept in reserve"], False
-    if catalogue_fresh:
-        catalogue = load_ladder_catalogue(catalogue_file)
+    if catalogues_fresh:
+        line_catalogue = scan.load_catalogue(line_file)
+        ladder_catalogue = load_ladder_catalogue(ladder_file)
     else:
-        catalogue = oddspapi.ladder_catalogue(client.get_json_value(oddspapi.MARKETS_PATH))
-        _save_ladder_catalogue(catalogue_file, catalogue)
-    tournaments = sorted({oddspapi.LADDER_TOURNAMENTS[f.league] for f in fixtures if f.league in oddspapi.LADDER_TOURNAMENTS})
+        markets = client.get_json_value(oddspapi.MARKETS_PATH)
+        line_catalogue = oddspapi.line_catalogue(markets)
+        ladder_catalogue = oddspapi.ladder_catalogue(markets)
+        scan._save_catalogue(line_file, line_catalogue)  # noqa: SLF001 - the same file the League One/Two scan reads
+        _save_ladder_catalogue(ladder_file, ladder_catalogue)
+    tournaments = sorted({oddspapi.PILOT_TOURNAMENTS[f.league] for f in fixtures if f.league in oddspapi.PILOT_TOURNAMENTS})
     archive = state_dir / PILOT_ODDS_DIR
     archive.mkdir(parents=True, exist_ok=True)
     window_start = (fixtures[0].kickoff_at if fixtures else now) - FIXTURE_KICKOFF_TOLERANCE
-    prices: list[oddspapi.LadderPrice] = []
+    prices: list[oddspapi.PropPrice] = []
     no_odds: list[str] = []
     for book in books:
         body: Any = client.get_json_value(oddspapi.odds_path(book, tournaments), empty_on=oddspapi.NO_FIXTURES_REPLIES)
         if body is None:
             no_odds.append(book)
             continue
-        with gzip.open(archive / f"{now:%Y%m%dT%H%M%SZ}_{book}_championship.json.gz", "wt", encoding="utf-8") as handle:
+        with gzip.open(archive / f"{now:%Y%m%dT%H%M%SZ}_{book}_pilot.json.gz", "wt", encoding="utf-8") as handle:
             json.dump(body, handle)
-        prices += [p for p in oddspapi.ladder_prices(body, catalogue, book)
-                   if window_start <= p.fixture.kickoff_at < window_end + FIXTURE_KICKOFF_TOLERANCE]
+        book_prices = [*oddspapi.prop_prices(body, line_catalogue, book),
+                       *oddspapi.ladder_as_prop_prices(oddspapi.ladder_prices(body, ladder_catalogue, book))]
+        prices += [p for p in book_prices if window_start <= p.fixture.kickoff_at < window_end + FIXTURE_KICKOFF_TOLERANCE]
     names = scan._load_names(names_file) if names_file.is_file() else {}  # noqa: SLF001
     if any(team not in names for p in prices for team in (p.fixture.home_id, p.fixture.away_id)):
         names = oddspapi.participant_names(client.get_json_value(oddspapi.PARTICIPANTS_PATH))
         cache.mkdir(parents=True, exist_ok=True)
         names_file.write_text(json.dumps({str(k): v for k, v in names.items()}), encoding="utf-8")
-    coverage = quotes_from_prices(oddspapi.ladder_as_prop_prices(prices), names, fixtures, squads, now)
+    coverage = quotes_from_prices(prices, names, fixtures, squads, now)
     notes = [
-        f"Odds: OddsPapi ({', '.join(books)}): {coverage.prices} Championship tackles/fouls ladder prices in this window, "
+        f"Odds: OddsPapi ({', '.join(books)}): {coverage.prices} tackles/fouls prices in this window, "
         f"{coverage.matched_prices} matched to our players, {len(coverage.quotes)} lines; "
         f"about {left - client.requests_sent + 1} OddsPapi requests left",
     ]
     if no_odds:
-        notes.append(f"No odds for the Championship from: {', '.join(no_odds)}")
+        notes.append(f"No odds for the pilot leagues from: {', '.join(no_odds)}")
     if coverage.unmatched_fixtures:
         notes.append(f"Odds for matches we could not match: {'; '.join(coverage.unmatched_fixtures)}")
     if coverage.unmatched_players:
@@ -250,7 +281,7 @@ def summary_text(summary: scan.ScanSummary, label: str) -> str:
     """The run's one-message summary (not scan.ScanSummary.text, whose wording is the League One/Two scan's)."""
     lines = [
         *((label,) if label else ()),
-        f"Championship pilot scan {summary.window_start:%a %d %b %H:%M}-{summary.window_end:%H:%M} UTC",
+        f"Pilot leagues scan {summary.window_start:%a %d %b %H:%M}-{summary.window_end:%H:%M} UTC",
         f"Matches in this window: {len(summary.fixtures)}",
     ]
     if summary.fixtures:
@@ -261,10 +292,12 @@ def summary_text(summary: scan.ScanSummary, label: str) -> str:
         if summary.alert_cap is not None and summary.alerts_sent >= summary.alert_cap:
             lines.append(f"Tip cap of {summary.alert_cap} per run reached: the best by expected profit were sent")
         if summary.unquoted_matches:
-            lines.append(f"Matches with no bookmaker ladder (nothing to qualify against): {summary.unquoted_matches}")
-        lines += summary.odds_notes
-        lines.append(f"Tipped markets: {', '.join(sorted(ALERT_MARKETS))} (fouls are priced, never tipped: the pilot's "
-                     "fouls calibration was below the PRD's)")
+            lines.append(f"Tip-league matches with no bookmaker price (nothing to qualify against): {summary.unquoted_matches}")
+    lines += summary.odds_notes
+    if summary.fixtures:
+        lines.append(f"Tipped: {', '.join(sorted(ALERT_MARKETS))} in {', '.join(sorted(TIP_LEAGUES))} only (fouls are priced, never tipped)"
+                     if TIP_LEAGUES else "Tipped: nothing yet; every pilot league is priced for evaluation until the maintainer turns "
+                     "a league on after its backtest")
     lines += [f"Could not price {failure}" for failure in summary.failures]
     lines.append(PAPER_LABEL)
     return "\n".join(lines)
@@ -276,8 +309,9 @@ def run_ladder_scan(
     odds: str = "mock", odds_client: Any | None = None, books: Sequence[str] = DEFAULT_BOOKMAKERS,
     state_dir: Path = scan.STATE_DIR, currency: str, book_rate: ExchangeRate | None = None,
 ) -> scan.ScanSummary:
-    """One scan of the Championship matches kicking off in [now, next 4-hour boundary). `store` is the pilot (or mock)
-    alert store: exposure is net of its stakes only. Raises ValueError when the pilot database is stale."""
+    """One scan of the pilot-league matches kicking off in [now, next 4-hour boundary). `store` is the pilot (or mock)
+    alert store: exposure is net of its stakes only. A league whose results are missing from the pilot database is
+    skipped and recorded in `summary.failures` (the caller exits STALE_EXIT)."""
     import psycopg2
 
     if currency not in SUPPORTED_CURRENCIES:
@@ -292,11 +326,17 @@ def run_ladder_scan(
     start, end = scan_window(now)
     conversion = "" if rate.identity else f"; book limits converted at {rate.describe()}"
     summary = scan.ScanSummary(start, end, alert_cap=max_alerts, bankroll=f"{currency} {bankroll:,.2f}{conversion}")
-    fixtures = scan.fetch_upcoming(client, start, end, sportmonks.CHAMPIONSHIP_LEAGUES)
-    summary.fixtures = [f"{f.name} {f.kickoff_at:%H:%M}" for f in fixtures]
-    if not fixtures:
+    leagues, absent = pilot_leagues(client)
+    if absent:
+        summary.odds_notes.append(f"Not in the Sportmonks plan, not scanned: {', '.join(name for name in absent)}")
+    if not leagues:
         return summary
-    finished = finished_listing(client, now)
+    listed = scan.fetch_upcoming(client, start, end, leagues)
+    summary.fixtures = [f"{f.name} {f.kickoff_at:%H:%M} ({f.league})" for f in listed]
+    if not listed:
+        return summary
+    summary.odds_notes.append("Leagues: " + ", ".join(f"{name} {count}" for name, count in sorted(Counter(f.league for f in listed).items())))
+    finished = finished_listing(client, now, leagues)
     conn = psycopg2.connect(dsn, options="-c statement_timeout=30000 -c default_transaction_read_only=on",
                             connect_timeout=10)
     try:
@@ -304,22 +344,32 @@ def run_ladder_scan(
             with conn.cursor() as cur:
                 cur.execute("SELECT vendor_fixture_uid FROM prop_alpha.fixtures WHERE status = 'final'")
                 stored = {str(row[0]) for row in cur.fetchall()}
-                missing = missing_results(finished, stored, now)
-                if missing:
-                    raise ValueError(stale_message(missing))
+                refused = load_refused(state_dir / PILOT_REFUSED_FILE.name)
+                stale = missing_by_league(finished, stored, now, refused)
+                unloadable = Counter(league for uid, _, league in finished if uid in refused and uid not in stored)
+                if unloadable:
+                    summary.odds_notes.append("Recent matches the data feed cannot load (no tackles or other data defect), priced "
+                                              "without them: " + ", ".join(f"{name} {count}" for name, count in sorted(unloadable.items())))
+                for league, missing in sorted(stale.items()):
+                    summary.failures.append(stale_message(league, missing))
+                fixtures = [f for f in listed if f.league not in stale]
                 slate = [(fixture, scan.load_slate_inputs(cur, fixture)) for fixture in fixtures]
     finally:
         conn.close()
+    if not fixtures:
+        return summary
     if odds == "oddspapi":
         if odds_client is None:
             raise ValueError("--odds oddspapi needs an OddsPapi client")
         squads = {fixture.fixture_id: inputs.squad for fixture, inputs in slate}
-        coverage, summary.odds_notes, available = collect_ladder_odds(odds_client, fixtures, squads, now, end, books,
-                                                                      state_dir)
+        coverage, notes, available = collect_pilot_odds(odds_client, fixtures, squads, now, end, books, state_dir)
+        summary.odds_notes += notes
         summary.odds_unavailable = not available
         real_quotes = coverage.quotes
 
         def quotes_for(fixture: UpcomingFixture, projections: Mapping[ProjectionKey, FactorProjection]) -> list[LiveOddsQuote]:
+            if fixture.league not in TIP_LEAGUES:
+                return []
             return scan.in_bankroll_currency([q for q in real_quotes if q.fixture_id == fixture.fixture_id
                                               and q.market_type in ALERT_MARKETS], rate)
     elif odds == "mock":
@@ -327,22 +377,24 @@ def run_ladder_scan(
         rng = np.random.default_rng(seed)
 
         def quotes_for(fixture: UpcomingFixture, projections: Mapping[ProjectionKey, FactorProjection]) -> list[LiveOddsQuote]:
+            if fixture.league not in TIP_LEAGUES:
+                return []
             return scan.in_bankroll_currency([q for q in mock_quotes(projections, now, rng)
                                               if q.market_type in ALERT_MARKETS], rate)
     else:
         raise ValueError(f"unknown odds source {odds!r}")
     manager = InstitutionalAssetManager(bankroll, model_risk_loss_floor=MODEL_RISK_LOSS_FLOOR)
-    engine, market_engines = championship_engines()
     combined = AllocationReport()
     all_projections: dict[ProjectionKey, FactorProjection] = {}
     all_descriptions: dict[ProjectionKey, AlertContext] = {}
     exposure = store.exposure(now)
     for fixture, inputs in slate:
+        engine, market_engines = pilot_engines(fixture.league)
         projections, report, quotes = scan.scan_fixture(fixture, inputs, now, quotes_for, manager, engine, summary,
-                                                        exposure, market_engines, pricer=price_championship)
+                                                        exposure, market_engines, pricer=price_pilot)
         if report is None:
             continue
-        if odds == "oddspapi" and not quotes and projections:
+        if odds == "oddspapi" and fixture.league in TIP_LEAGUES and not quotes and projections:
             summary.unquoted_matches += 1
         summary.players_priced += len({key[1] for key in projections})
         summary.quotes += len(quotes)
@@ -362,9 +414,9 @@ def run_ladder_scan(
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logging.getLogger("prop_alpha.scanner").setLevel(logging.WARNING)
-    parser = argparse.ArgumentParser(description="Scan the next Championship matches and tip high-value bets (pilot).")
+    parser = argparse.ArgumentParser(description="Scan the next pilot-league matches and tip high-value bets (pilot).")
     parser.add_argument("--odds", choices=("oddspapi", "mock"), required=True,
-                        help="oddspapi: real bet365 ladders; mock: model price plus noise, labelled MOCK")
+                        help="oddspapi: real bet365 prices; mock: model price plus noise, labelled MOCK")
     parser.add_argument("--send", action="store_true", help="send tips and the summary to Telegram")
     parser.add_argument("--at", type=datetime.fromisoformat, default=None, help="simulated UTC run time (testing)")
     args = parser.parse_args(argv)
@@ -400,9 +452,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             odds_client.close()
     text = summary_text(summary, label)
     print(text)
-    if notifier is not None:
+    # Every 4 hours most windows have no pilot match: the chat hears about a run only when there was something to say.
+    if notifier is not None and (summary.fixtures or summary.failures):
         print(f"summary sent (message_id {notifier.send_message(text)})")
-    return 0
+    if any("skipped, not priced" in failure for failure in summary.failures):
+        return STALE_EXIT
+    return scan.ODDS_UNAVAILABLE_EXIT if real and summary.odds_unavailable else 0
 
 
 if __name__ == "__main__":

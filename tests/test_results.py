@@ -90,3 +90,73 @@ def test_run_ingests_only_the_missing_fixtures_and_reports_failures(monkeypatch:
     assert "3 finished, 2 not yet stored, 1 ingested, 1 FAILED (103)" in report.text()
     dry = results.run(NOW, _Listing(3), "postgresql://unused", dry_run=True)
     assert dry.missing == ["102", "103"] and dry.ingested == 0 and len(sent) == 1
+
+
+PILOT = {648: "Brazil Serie A", 501: "Scottish Premiership"}
+
+
+class _PilotListing:
+    """A Sportmonks stub that answers the leagues listing in two pages and every fixture listing with one finished
+    match in a pilot league, one in League One and one in the Premier League (not wanted)."""
+
+    def __init__(self) -> None:
+        self.paths: list[str] = []
+
+    def get_json(self, path: str) -> dict[str, Any]:
+        self.paths.append(path)
+        if path.startswith("leagues?"):
+            if path.endswith("page=1"):
+                return {"data": [{"id": 648, "name": "Serie A", "country": {"name": "Brazil"}}],
+                        "pagination": {"has_more": True}}
+            return {"data": [{"id": 501, "name": "Premiership", "country": {"name": "Scotland"}}],
+                    "pagination": {"has_more": False}}
+        return {"data": [_row(1, 648, "FT", LATEST), _row(2, 501, "FT", LATEST), _row(3, 12, "FT", LATEST),
+                         _row(4, 8, "FT", LATEST)], "pagination": {"has_more": False}}
+
+
+def test_the_pilot_leagues_are_resolved_across_pages_and_missing_ones_are_named() -> None:
+    client = _PilotListing()
+    assert results.pilot_leagues(client) == (PILOT, ["Scottish Championship"])
+    assert [p.rsplit("page=", 1)[1] for p in client.paths] == ["1", "2"]
+
+
+def test_the_results_job_lists_and_ingests_only_the_pilot_leagues_when_given_them(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(results, "read_stored", lambda dsn: (LATEST, frozenset({"1"})))
+    client = _PilotListing()
+    report = results.run(NOW, client, "postgresql://pilot", dry_run=True, leagues=PILOT)
+    assert report.listed == 2 and report.missing == ["2"]  # League One and the Premier League are not the pilot's
+    assert all("fixtureLeagues:501,648&" in path for path in client.paths)
+    default = results.run(NOW, client, "postgresql://working", dry_run=True)
+    assert default.listed == 1 and any("fixtureLeagues:12,14&" in path for path in client.paths)
+
+
+def test_vendor_refusals_are_recorded_once_and_never_network_errors(tmp_path: Any) -> None:
+    path = tmp_path / "pilot_refused.json"
+    assert results.load_refused(path) == {}
+    failed = {"1": "ValueError: fixture 1: no ['TACKLES'] in any lineup", "2": "ConnectionError: read timed out",
+              "3": "timed out"}
+    assert results.record_refused(path, failed) == 1 and list(results.load_refused(path)) == ["1"]
+    assert results.record_refused(path, failed) == 0  # recorded once
+    path.write_text("[1]", encoding="utf-8")
+    with pytest.raises(ValueError, match="not a refusal record"):
+        results.load_refused(path)
+
+
+def test_the_pilot_results_job_skips_recorded_refusals_and_records_new_ones(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    monkeypatch.setattr(results, "read_stored", lambda dsn: (LATEST, frozenset({"1"})))
+    path = tmp_path / "pilot_refused.json"
+    path.write_text('{"2": "ValueError: refused earlier"}', encoding="utf-8")
+    sent: list[list[str]] = []
+
+    def fake_ingest(client: Any, dsn: str, uids: list[str], workers: int) -> SlateReport:
+        sent.append(list(uids))
+        return SlateReport(job="stats", results={u: FixtureResult(u, False, 0, 0, 0.1, error="ValueError: new defect")
+                                                  for u in uids})
+
+    monkeypatch.setattr(results, "ingest", fake_ingest)
+    monkeypatch.setattr(results, "refresh_incomplete", lambda dsn, since: 0)
+    report = results.run(NOW, _PilotListing(), "postgresql://pilot", leagues=PILOT, refused_path=path)
+    assert sent == []  # "2" is the only pilot match not stored and it was refused earlier: nothing is ingested
+    assert report.missing == [] and set(results.load_refused(path)) == {"2"}

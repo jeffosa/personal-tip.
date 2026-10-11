@@ -11,6 +11,26 @@ settlements, closing prices) that code cannot produce. They take calendar time a
 
 Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not executed where it will run · **[N]** not built.
 
+## Status on 2026-10-10 (read this first; the rest of the file is the 2026-10-05 history)
+
+**PAPER / SHADOW ONLY.** Deployment, scheduling, backup, restore, monitoring and rollback are in `RUNBOOK.md`.
+
+- **Release gate [T]:** `bash ci/bootstrap.sh --release` against the disposable `prop_alpha_ci` passed on Python 3.14.6 at 20:18 UTC: 728 collected, 728 passed, 0 skipped, mypy and pyright clean, schema install, re-apply and the 003 to 009 upgrade path passed. It ran on the working tree at commit `c0b6768`, before the later edits to this file, `RUNBOOK.md` and the `EXPECTED_TESTS` constant. GitHub Actions for newer commits has not been seen **[U]**.
+- **Backups [T]:** the prediction log and the T-60 team-sheet files are now in the daily backup list, with tests that their manifest hashes match and that absent files are skipped. The next scheduled backup is the first to include them on the real state **[U]**; the lineup files do not exist yet.
+- **Scheduled tasks:** `Telegram status`, `Bet ledger poll` and `Daily backup` are registered (read-only inventory 2026-10-10) and the last two last returned 0. `Telegram status` returned 1 at 20:00 local because its results step could not reach Sportmonks for four matches.
+- **Evidence still open (blocks any move beyond paper):** the tackles and fouls settlement contract is unverified (`MARKET_CONTRACT.md`); 2,715 logged predictions are unscored; no League One/Two tackles or fouls price, closing price, paper bet or T-60 sheet has been seen; the Sportmonks trial ends 2026-10-16; the pilot-leagues scan (Brazil Serie A, Scottish Premiership, Scottish Championship; only Brazil Serie A is tipped) has no freeze, lockbox or settlement evidence.
+
+## Audit rerun on 2026-10-11
+
+**Strict readiness score: 5.8/10**, unchanged from the previous audit. The independent validation evidence is still missing, so the system remains **PAPER / SHADOW ONLY**.
+
+- On the working tree based on `c0b6768`, the full suite collected **728 tests**. On the available bundled Python 3.12.14, **722 passed and 6 failed** because the sandbox denied Python's child-process launch of `git` (`WinError 5: Access is denied`) in the backup-push tests. This is not a clean full-suite result or a finding that the push logic is defective. The three focused backup-copy, manifest-hash and optional-file tests passed.
+- `python -m compileall -q prop_alpha tests` completed successfully; `python -m mypy` reported no issues in 81 source files.
+- Pyright did not run: the available `pnpm dlx` failed with `EPERM` while resolving the user profile. `ci/bootstrap.sh --preflight` could not start because Git Bash was denied by the execution environment.
+- The full `--release` gate was not rerun. Read-only `psql` checks for `prop_alpha_ci` failed with `no password supplied`; the disposable marker and empty-table conditions could not be reverified, so stage 6 was not invoked. No database was reset or modified.
+- Scheduled-task state could not be reverified: `Get-ScheduledTask` returned access denied and `schtasks /Query` failed in this session. No tasks were created or changed.
+- The earlier Python 3.14.6 release-gate pass recorded above is prior evidence for `c0b6768`; this rerun does not extend it to the current uncommitted documentation/test changes. A clean release-gate run on the final reviewed tree remains required.
+
 ## Summary
 
 | # | Item | Status | Blocking a 7/10? |

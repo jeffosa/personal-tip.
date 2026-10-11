@@ -1,9 +1,10 @@
-"""Results job: ingest every League One and League Two match that has finished since the latest final fixture in
-the database, so the scan prices from current history, bets settle (alerts/ledger.py --settle) and the Gate 2
+"""Results job: ingest every League One and League Two match (with `--pilot`, every match of the pilot leagues, into the
+pilot database) that has finished since the latest final fixture in the database, so the scan prices from current history, bets settle (alerts/ledger.py --settle) and the Gate 2
 lockbox fills. Runs first in scripts/telegram_status.cmd, every 4 hours.
 
     python -m prop_alpha.ingestion.results              # list, then ingest what is missing
     python -m prop_alpha.ingestion.results --dry-run    # list only (one or two vendor requests)
+    python -m prop_alpha.ingestion.results --pilot      # the pilot leagues into prop_alpha_pilot (alerts/ladder_scan.py)
 
 The listing covers [latest stored final kickoff - LOOKBACK, today], at most MAX_SPAN per run, so a job that has
 not run for weeks catches up over several runs. Fixtures already final in the database are skipped; the rest go
@@ -15,14 +16,16 @@ MAX_LISTING_PAGES raises rather than ingest part of it. Exit code 1 when any fix
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Final, Sequence
+from typing import Any, Final, Mapping, Sequence
 
-from prop_alpha.config import DEFAULT_DSN, DSN_ENV
+from prop_alpha.config import DEFAULT_DSN, DEFAULT_ENV_FILE, DEFAULT_PILOT_DSN, DSN_ENV, PILOT_DSN_ENV
 from prop_alpha.ingestion import sportmonks
 
 logger = logging.getLogger("prop_alpha.results")
@@ -33,6 +36,10 @@ MAX_SPAN: Final[timedelta] = timedelta(days=14)
 MAX_LISTING_PAGES: Final[int] = 10
 DEFAULT_MAX_REQUESTS: Final[int] = 80
 DEFAULT_WORKERS: Final[int] = 4
+# Pilot fixtures the data adapter refused (a ValueError: a vendor data defect, e.g. a Scottish Championship match with no
+# tackles in any line-up): fixture id -> reason. They are not retried, not counted as missing by this job, and not
+# counted as stale by alerts/ladder_scan.py; a network error is never recorded, so it is retried.
+PILOT_REFUSED_FILE: Final[Path] = DEFAULT_ENV_FILE.parent / ".prop_alpha_state" / "pilot_refused.json"
 
 LATEST_FINAL_SQL: Final[str] = "SELECT max(kickoff_at) FROM prop_alpha.fixtures WHERE status = 'final'"
 # Final fixtures from a day before the listing window starts (kickoff dates are listed in UTC).
@@ -83,12 +90,36 @@ def missing_fixtures(listed: Sequence[tuple[str, datetime]], stored_final: froze
     return [uid for uid, _ in sorted(listed, key=lambda item: (item[1], item[0])) if uid not in stored_final]
 
 
-def list_finished(client: Any, start: date, end: date) -> list[tuple[str, datetime]]:
+def load_refused(path: Path) -> dict[str, str]:
+    """The recorded refusals (fixture id -> reason); none when the file does not exist. A damaged file raises."""
+    if not path.is_file():
+        return {}
+    raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path.name} is not a refusal record; fix or delete it")
+    return {str(uid): str(reason) for uid, reason in raw.items()}
+
+
+def record_refused(path: Path, failed: Mapping[str, str]) -> int:
+    """Remember the fixtures in `failed` that the adapter refused (reason starts with ValueError); returns how many are new.
+    Network errors and timeouts are not recorded: they are retried."""
+    known = load_refused(path)
+    new = {uid: reason[:200] for uid, reason in failed.items() if reason.startswith("ValueError") and uid not in known}
+    if new:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({**known, **new}, indent=1), encoding="utf-8")
+    return len(new)
+
+
+def list_finished(
+    client: Any, start: date, end: date, leagues: Mapping[int, str] = sportmonks.SCAN_LEAGUES
+) -> list[tuple[str, datetime]]:
     window = (datetime(start.year, start.month, start.day, tzinfo=timezone.utc),
               datetime(end.year, end.month, end.day, tzinfo=timezone.utc))
     listed: list[tuple[str, datetime]] = []
     for page in range(1, MAX_LISTING_PAGES + 1):
-        rows, has_more = sportmonks.finished_fixtures(client.get_json(sportmonks.upcoming_path(*window, page)))
+        rows, has_more = sportmonks.finished_fixtures(client.get_json(sportmonks.upcoming_path(*window, page, leagues)),
+                                                      leagues)
         listed += rows
         if not has_more:
             return listed
@@ -150,17 +181,37 @@ def refresh_incomplete(dsn: str, since: date) -> int:
         conn.close()
 
 
-def run(now: datetime, client: Any, dsn: str, *, dry_run: bool = False, workers: int = DEFAULT_WORKERS) -> ResultsReport:
+def pilot_leagues(client: Any) -> tuple[dict[int, str], list[str]]:
+    """(Sportmonks id -> name for the pilot leagues the plan includes, the ones it does not): one or two requests."""
+    rows: list[Mapping[str, Any]] = []
+    for page in range(1, MAX_LISTING_PAGES + 1):
+        page_rows, has_more = sportmonks.league_rows(client.get_json(f"{sportmonks.LEAGUES_PATH}&page={page}"))
+        rows += page_rows
+        if not has_more:
+            return sportmonks.resolve_leagues(rows)
+    raise ValueError(f"league listing has more than {MAX_LISTING_PAGES} pages")
+
+
+def run(
+    now: datetime, client: Any, dsn: str, *, dry_run: bool = False, workers: int = DEFAULT_WORKERS,
+    leagues: Mapping[int, str] = sportmonks.SCAN_LEAGUES, refused_path: Path | None = None,
+) -> ResultsReport:
+    """With `refused_path` (the pilot), fixtures recorded there are left out of `missing`, and the adapter's new refusals are
+    recorded after the ingest."""
     latest, stored = read_stored(dsn)
     start, end = listing_window(latest, now)
-    listed = list_finished(client, start, end)
-    report = ResultsReport(start, end, listed=len(listed), missing=missing_fixtures(listed, stored))
+    listed = list_finished(client, start, end, leagues)
+    refused = frozenset(load_refused(refused_path)) if refused_path is not None else frozenset()
+    report = ResultsReport(start, end, listed=len(listed),
+                           missing=[uid for uid in missing_fixtures(listed, stored) if uid not in refused])
     if dry_run or not report.missing:
         return report
     slate = ingest(client, dsn, report.missing, workers)
     report.incomplete = refresh_incomplete(dsn, start - timedelta(days=1))
     report.failed = {str(uid): str(error) for uid, error in slate.failed.items()}
     report.failed.update({str(uid): "timed out" for uid in slate.timed_out})
+    if refused_path is not None:
+        record_refused(refused_path, report.failed)
     if slate.merge_error:
         report.failed["merge"] = str(slate.merge_error)
     report.ingested = slate.merge.fixtures_merged if slate.merge is not None else 0
@@ -172,6 +223,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Ingest League One/Two results not yet in the database.")
     parser.add_argument("--dry-run", action="store_true", help="list what is missing; ingest nothing")
+    parser.add_argument("--pilot", action="store_true",
+                        help="the pilot leagues (Scottish Premiership, Scottish Championship, Brazil Serie A) into prop_alpha_pilot")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     args = parser.parse_args(argv)
     from prop_alpha.ingestion.pipeline import build_vendor_client
@@ -181,8 +234,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                "DATA_VENDOR_QUOTA_RESERVE": os.environ.get("DATA_VENDOR_QUOTA_RESERVE", "100")}
     client = build_vendor_client(environ)
     try:
-        report = run(datetime.now(timezone.utc), client, os.environ.get(DSN_ENV, DEFAULT_DSN), dry_run=args.dry_run,
-                     workers=args.workers)
+        if args.pilot:
+            leagues, absent = pilot_leagues(client)
+            if absent:
+                print(f"Not in the Sportmonks plan, not ingested: {', '.join(absent)}")
+            report = run(datetime.now(timezone.utc), client, os.environ.get(PILOT_DSN_ENV, DEFAULT_PILOT_DSN),
+                         dry_run=args.dry_run, workers=args.workers, leagues=leagues, refused_path=PILOT_REFUSED_FILE)
+        else:
+            report = run(datetime.now(timezone.utc), client, os.environ.get(DSN_ENV, DEFAULT_DSN), dry_run=args.dry_run,
+                         workers=args.workers)
     finally:
         client.close()
     print(report.text())

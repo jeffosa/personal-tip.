@@ -30,6 +30,7 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from prop_alpha.alerts.ladder_scan import LEAGUE_GAME_STATE_K  # noqa: E402
 from prop_alpha.alerts.scan import load_slate_inputs  # noqa: E402
 from prop_alpha.config import credential  # noqa: E402
 from prop_alpha.ingestion import oddspapi, pipeline, sportmonks  # noqa: E402
@@ -51,7 +52,8 @@ def upcoming(fixture_id: int) -> UpcomingFixture:
     fx = body["data"]
     home, away = sportmonks._sides(fx)  # noqa: SLF001 - the adapter's own reader
     names = {(p.get("meta") or {}).get("location"): str(p.get("name")) for p in fx.get("participants") or []}
-    league = {8: "Premier League", 9: "Championship"}[int(fx["league_id"])]
+    league = {8: "Premier League", 9: "Championship", 501: "Scottish Premiership", 504: "Scottish Championship",
+              648: "Brazil Serie A"}[int(fx["league_id"])]
     return UpcomingFixture(int(fx["id"]), league, home, away, names["home"], names["away"],
                            datetime.fromisoformat(sportmonks._kickoff(fx)))  # noqa: SLF001
 
@@ -96,7 +98,9 @@ def main() -> int:
     projections, skipped = build_projections(
         fixture, inputs.squad, inputs.history_by_player, inputs.team_recent_fixtures, inputs.league_rates, engine,
         season_levels=inputs.season_levels or None,
-        market_engines={m: QuantEngine(game_state_k=k) for m, k in GAME_STATE_K.items()}, prior_strengths=PRIOR_STRENGTH)
+        market_engines={m: QuantEngine(game_state_k=k)
+                        for m, k in LEAGUE_GAME_STATE_K.get(fixture.league, GAME_STATE_K).items()},
+        prior_strengths=PRIOR_STRENGTH)
     priced = sorted({key[1] for key in projections})
     print(f"squad {len(inputs.squad)}; priced regular starters {len(priced)}; left out {len(skipped)}", flush=True)
 
@@ -105,7 +109,7 @@ def main() -> int:
     markets = requests.get(f"{oddspapi.BASE_URL}/markets", timeout=90,
                            params={"apiKey": credential("ODDSPAPI_KEY", os.environ), "sportId": "10"}).json()
     catalogue = oddspapi.ladder_catalogue(markets)
-    body = bookmaker_reply(bookmaker, 18)
+    body = bookmaker_reply(bookmaker, {**oddspapi.PILOT_TOURNAMENTS, "Championship": 18}.get(fixture.league, 18))
     prices = [p for p in oddspapi.ladder_prices(body, catalogue, bookmaker)
               if abs((p.fixture.kickoff_at - fixture.kickoff_at).total_seconds()) < 900]
     print(f"{bookmaker}: {len(prices)} ladder prices for this match, {len({p.player_ref for p in prices})} players", flush=True)
@@ -153,7 +157,7 @@ def main() -> int:
         print(f"  {r['player']:26s} {r['market']:7s} {r['step']:>3s} price {r['price']:6.2f} implied {r['implied']:.2f} model {r['model']:.2f} EV {r['ev']:+.2f}")
     out = PILOT_DIR / f"compare_{fixture.fixture_id}_{bookmaker}.json"
     out.write_text(json.dumps({"fixture": fixture.name, "kickoff": fixture.kickoff_at.isoformat(), "bookmaker": bookmaker,
-                               "settings": {"game_state_k": GAME_STATE_K, "prior_strength": PRIOR_STRENGTH,
+                               "settings": {"game_state_k": LEAGUE_GAME_STATE_K.get(fixture.league, GAME_STATE_K), "prior_strength": PRIOR_STRENGTH,
                                             "rate_multiplier": None}, "rows": rows,
                                "unmatched": sorted(unmatched)}, indent=1), encoding="utf-8")
     print(f"\nresults: {out}")

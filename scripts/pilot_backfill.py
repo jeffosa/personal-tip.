@@ -1,4 +1,5 @@
-"""Championship / Premier League pilot: seed clubs and backfill finished matches into the PILOT database.
+"""Pilot leagues (Scottish Premiership, Scottish Championship, Brazil Serie A): seed clubs and backfill finished matches
+into the PILOT database.
 
     .venv\\Scripts\\python.exe -u scripts\\pilot_backfill.py [--list] [--seed] [--ingest] [--fix-leagues]
 
@@ -25,7 +26,7 @@ from typing import Any, Final
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from prop_alpha.ingestion import sportmonks  # noqa: E402
+from prop_alpha.ingestion import results, sportmonks  # noqa: E402
 from prop_alpha.ingestion.pipeline import ConcurrentIngestionEngine, build_pool, build_vendor_client, load_kappas  # noqa: E402
 
 PILOT_DSN: Final[str] = "postgresql://postgres@localhost:5432/prop_alpha_pilot"
@@ -33,7 +34,12 @@ START: Final[datetime] = datetime(2025, 7, 1, tzinfo=timezone.utc)
 WINDOW: Final[timedelta] = timedelta(days=90)
 MAX_PAGES: Final[int] = 40
 BATCH: Final[int] = 100
-LEAGUES: Final[dict[int, tuple[str, int]]] = {8: ("Premier League", 1), 9: ("Championship", 2)}
+# Filled by main() from the plan's own league list (sportmonks.PILOT_LEAGUES_WANTED): Sportmonks id -> (database name,
+# tier). The Premier League (8) was this pilot's until 2026-10-11 and its stored matches stay, but it is no longer
+# listed or updated; a wanted league the plan does not include is reported and skipped.
+LEAGUES: Final[dict[int, tuple[str, int]]] = {}
+TIERS: Final[dict[str, int]] = {"Scottish Premiership": 1, "Scottish Championship": 2, "Brazil Serie A": 1}
+COUNTRIES: Final[dict[str, str]] = {"Scottish Premiership": "Scotland", "Scottish Championship": "Scotland", "Brazil Serie A": "Brazil"}
 OUT: Final[Path] = ROOT / ".prop_alpha_state" / "pilot" / "finished_fixtures.json"
 
 
@@ -92,8 +98,9 @@ def seed(fixtures: list[dict[str, Any]]) -> None:
     with conn, conn.cursor() as cur:
         league_ids: dict[int, int] = {}
         for sm_id, (name, tier) in LEAGUES.items():
-            cur.execute("INSERT INTO prop_alpha.leagues (name, country, tier) VALUES (%s, 'England', %s) "
-                        "ON CONFLICT (name) DO UPDATE SET tier = EXCLUDED.tier RETURNING league_id", (name, tier))
+            cur.execute("INSERT INTO prop_alpha.leagues (name, country, tier) VALUES (%s, %s, %s) "
+                        "ON CONFLICT (name) DO UPDATE SET tier = EXCLUDED.tier RETURNING league_id",
+                        (name, COUNTRIES.get(name, "England"), tier))
             row = cur.fetchone()
             if row is None:
                 raise RuntimeError(f"league {name} was not inserted or found")
@@ -129,6 +136,7 @@ def ingest(fixtures: list[dict[str, Any]]) -> None:
                 batch = todo[i:i + BATCH]
                 report = engine.run_slate(batch, job="stats")
                 failed.update(report.failed)
+                results.record_refused(results.PILOT_REFUSED_FILE, {str(u): str(e) for u, e in report.failed.items()})
                 print(f"  batch {i // BATCH + 1}: {len(report.succeeded)}/{len(batch)} ok, merge {report.merge}, "
                       f"{len(report.timed_out)} timed out", flush=True)
     finally:
@@ -156,6 +164,20 @@ def fix_leagues(fixtures: list[dict[str, Any]]) -> None:
     conn.close()
 
 
+def resolve_leagues() -> None:
+    """Fill LEAGUES from the plan's league list (two requests at most)."""
+    from prop_alpha.ingestion.results import pilot_leagues
+
+    c = client(5)
+    try:
+        found, absent = pilot_leagues(c)
+    finally:
+        c.close()
+    LEAGUES.clear()
+    LEAGUES.update({sm_id: (name, TIERS[name]) for sm_id, name in found.items()})
+    print(f"pilot leagues in the plan: {sorted(name for name, _ in LEAGUES.values())}; not in the plan: {absent}", flush=True)
+
+
 def main() -> int:
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
     unknown = flags - {"--list", "--seed", "--ingest", "--fix-leagues"}
@@ -163,6 +185,7 @@ def main() -> int:
         print(__doc__)
         return 2
     everything = not flags
+    resolve_leagues()
     fixtures = list_finished() if everything or "--list" in flags else load_listing()
     if everything or "--seed" in flags:
         seed(fixtures)

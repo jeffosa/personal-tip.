@@ -51,8 +51,9 @@ REPORT_INTERVAL: Final[timedelta] = timedelta(hours=4)
 POLL_STALE_AFTER: Final[timedelta] = timedelta(hours=1)
 # Telegram keeps an update the bot has not read for 24 hours, then drops it: a reply older than that is lost.
 TELEGRAM_UPDATE_RETENTION: Final[timedelta] = timedelta(hours=24)
-# Sportmonks plan seen on 2026-10-02: "Starter - Trialing until 2026-10-16".
-SPORTMONKS_TRIAL_ENDS: Final[date] = date(2026, 10, 16)
+# Sportmonks plan seen on 2026-10-11 (the second account): "Starter - Trialing until 2026-10-25". The first account's trial
+# ended 2026-10-16.
+SPORTMONKS_TRIAL_ENDS: Final[date] = date(2026, 10, 25)
 # An archived OddsPapi reply as alerts/scan.py names it: <run time>_<bookmaker>.json.gz. A malformed reply is archived
 # as <run time>_<bookmaker>.rejected.json.gz and is not counted.
 ARCHIVED_REPLY: Final[re.Pattern[str]] = re.compile(r"([0-9]{8}T[0-9]{6}Z)_([a-z0-9]+)\.json\.gz")

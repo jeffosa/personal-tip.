@@ -12,6 +12,10 @@ DSN_ENV: Final[str] = "PROP_ALPHA_DB_DSN"
 # The working database. prop_alpha_ci is reset by every CI run, so the alerts, ledger and status never read it by
 # default.
 DEFAULT_DSN: Final[str] = "postgresql://postgres@localhost:5432/prop_alpha"
+# The pilot database (Championship and the Scottish leagues): its own results job and scan read and write it, never
+# the working database above.
+PILOT_DSN_ENV: Final[str] = "PROP_ALPHA_PILOT_DSN"
+DEFAULT_PILOT_DSN: Final[str] = "postgresql://postgres@localhost:5432/prop_alpha_pilot"
 
 
 def parse_env_file(text: str) -> dict[str, str]:

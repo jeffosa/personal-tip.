@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Final, Mapping
+from typing import Any, Final, Mapping, Sequence
 
 logger = logging.getLogger("prop_alpha.ingestion.sportmonks")
 
@@ -307,8 +307,40 @@ def lineup_payload(body: Mapping[str, Any]) -> dict[str, Any]:
 
 # Leagues the opportunity scan covers (Sportmonks league id -> prop_alpha.leagues.name).
 SCAN_LEAGUES: Final[Mapping[int, str]] = {12: "League One", 14: "League Two"}
-# The Championship pilot scan (alerts/ladder_scan.py): Sportmonks league id -> name in the pilot database.
-CHAMPIONSHIP_LEAGUES: Final[Mapping[int, str]] = {9: "Championship"}
+# The pilot scan's leagues (alerts/ladder_scan.py), kept in the pilot database `prop_alpha_pilot` and chosen by the
+# maintainer on 2026-10-11 (the plan's five leagues: League One and League Two, which the frozen scan covers, and these
+# three): (country, Sportmonks league name) -> the league's name in that database (unique there). Sportmonks league ids are read
+# from the plan's own league list (`resolve_leagues`) instead of being written down: a league the plan does not
+# include is reported, never guessed.
+PILOT_LEAGUES_WANTED: Final[Mapping[tuple[str, str], str]] = {
+    ("Scotland", "Premiership"): "Scottish Premiership",
+    ("Scotland", "Championship"): "Scottish Championship",
+    ("Brazil", "Serie A"): "Brazil Serie A",
+}
+LEAGUES_PATH: Final[str] = "leagues?include=country&per_page=50"
+
+
+def resolve_leagues(
+    rows: Sequence[Mapping[str, Any]], wanted: Mapping[tuple[str, str], str] = PILOT_LEAGUES_WANTED
+) -> tuple[dict[int, str], list[str]]:
+    """(Sportmonks league id -> database name for each wanted league the plan lists, the wanted names it does not)
+    from the rows of the leagues listing (`LEAGUES_PATH`, which includes the country), all pages together."""
+    found: dict[int, str] = {}
+    for league in rows:
+        country = (league.get("country") or {}).get("name")
+        name = wanted.get((str(country), str(league.get("name"))))
+        if name is not None:
+            found[int(league["id"])] = name
+    return found, sorted(name for name in wanted.values() if name not in found.values())
+
+
+def league_rows(body: Mapping[str, Any]) -> tuple[list[Mapping[str, Any]], bool]:
+    """(the league rows of one `LEAGUES_PATH` page, whether another page follows)."""
+    data = body.get("data")
+    if not isinstance(data, list):
+        raise ValueError("Sportmonks leagues listing has no 'data' list")
+    pagination = body.get("pagination")
+    return data, bool(isinstance(pagination, Mapping) and pagination.get("has_more"))
 UPCOMING_INCLUDE: Final[str] = "participants;state"
 
 
@@ -350,6 +382,24 @@ def upcoming_fixtures(
         })
     pagination = body.get("pagination")
     return fixtures, bool(isinstance(pagination, Mapping) and pagination.get("has_more"))
+
+
+def finished_with_leagues(
+    body: Mapping[str, Any], leagues: Mapping[int, str]
+) -> tuple[list[tuple[str, datetime, str]], bool]:
+    """As finished_fixtures, each fixture with its league's name (`leagues`: Sportmonks id -> name): the pilot scan checks
+    each league's results separately."""
+    data = body.get("data")
+    if not isinstance(data, list):
+        raise ValueError("Sportmonks listing has no 'data' list")
+    finished: list[tuple[str, datetime, str]] = []
+    for fixture in data:
+        state = fixture.get("state")
+        league = leagues.get(fixture.get("league_id"))
+        if league is not None and isinstance(state, Mapping) and state.get("developer_name") in FINAL_STATES:
+            finished.append((str(int(fixture["id"])), datetime.fromisoformat(_kickoff(fixture)), league))
+    pagination = body.get("pagination")
+    return finished, bool(isinstance(pagination, Mapping) and pagination.get("has_more"))
 
 
 def finished_fixtures(

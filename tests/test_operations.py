@@ -147,7 +147,8 @@ def test_a_daily_backup_that_stops_running_is_flagged_after_26_hours() -> None:
 # Script -> (task_health task key, the failed-step names it can report). 2026-10-05: task_health was built but no
 # script called it, so a failing scheduled step still only wrote "STEP FAILED" into a log nobody reads.
 SCHEDULED_SCRIPTS: dict[str, tuple[str, tuple[str, ...]]] = {
-    "telegram_status.cmd": ("status", ("results", "fx-refresh", "status-report", "scan-no-odds", "scan")),
+    "telegram_status.cmd": ("status", ("results", "pilot-results", "fx-refresh", "status-report", "scan-no-odds", "scan",
+                                       "pilot-scan-no-odds", "pilot-scan-stale", "pilot-scan")),
     "ledger_poll.cmd": ("ledger", ("poll", "closing-prices", "lineups", "settle")),
     "backup.cmd": ("backup", ("backup", "github-push")),
 }
@@ -189,6 +190,21 @@ def test_the_status_script_reports_a_scan_without_real_odds_as_its_own_step() ->
     branch = lines[scan_at + 2]
     assert branch.startswith(f'if "%SCAN_RC%"=="{ODDS_UNAVAILABLE_EXIT}" (set RC=1& set "FAILED=%FAILED% scan-no-odds"')
     assert 'else if not "%SCAN_RC%"=="0" (set RC=1& set "FAILED=%FAILED% scan"' in branch
+
+
+def test_the_status_script_runs_the_pilot_results_and_scan_with_their_own_steps() -> None:
+    from prop_alpha.alerts.ladder_scan import STALE_EXIT
+    from prop_alpha.alerts.scan import ODDS_UNAVAILABLE_EXIT
+
+    lines = _commands("telegram_status.cmd")
+    results_at = next(i for i, line in enumerate(lines) if "-m prop_alpha.ingestion.results --pilot" in line)
+    scan_at = next(i for i, line in enumerate(lines) if "-m prop_alpha.alerts.ladder_scan --odds oddspapi --send" in line)
+    assert results_at < scan_at  # the pilot database is refreshed before it is scanned
+    assert lines[scan_at + 1] == "set PILOT_RC=%ERRORLEVEL%"
+    branch = lines[scan_at + 2]
+    assert f'if "%PILOT_RC%"=="{ODDS_UNAVAILABLE_EXIT}" (set RC=1& set "FAILED=%FAILED% pilot-scan-no-odds"' in branch
+    assert f'else if "%PILOT_RC%"=="{STALE_EXIT}" (set RC=1& set "FAILED=%FAILED% pilot-scan-stale"' in branch
+    assert 'else if not "%PILOT_RC%"=="0" (set RC=1& set "FAILED=%FAILED% pilot-scan"' in branch
 
 
 def test_the_backup_script_runs_the_backup_into_its_own_log() -> None:
@@ -279,10 +295,11 @@ def test_absent_prediction_and_lineup_files_are_skipped_safely(tmp_path: Path) -
     first = backup.backup(tmp_path / "backups", state, NOW, runner=_fake_runner(LISTING, []))
     manifest = json.loads((first / "manifest.json").read_text(encoding="utf-8"))
     assert not optional & set(manifest["state"])
-    (state / predictions.PREDICTIONS_NAME).write_text('{"line": 1}\n', encoding="utf-8")
+    for name in optional:
+        (state / name).write_text(f"restored evidence {name}\n", encoding="utf-8")
     second = backup.backup(tmp_path / "backups", state, NOW + timedelta(days=1), runner=_fake_runner(LISTING, []))
     manifest = json.loads((second / "manifest.json").read_text(encoding="utf-8"))
-    assert optional & set(manifest["state"]) == {predictions.PREDICTIONS_NAME}
+    assert optional <= set(manifest["state"])
 
 
 def test_a_dump_missing_table_data_fails_and_is_left_incomplete(tmp_path: Path) -> None:

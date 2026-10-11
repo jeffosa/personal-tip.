@@ -31,7 +31,7 @@ def test_report_states_database_alerts_trial_and_paper_label(tmp_path: Path, mon
     assert "Last merge: 2026-10-03 06:00 UTC" in report
     assert "Incomplete club-matches (a player without an ID played; left out of pricing): 0" in report
     assert "Alerts in the last 4h: 1; open alerted exposure: 200.00" in report
-    assert "Sportmonks trial: 13 days left" in report
+    assert "Sportmonks trial: 22 days left" in report
     assert report.endswith(PAPER_LABEL) and "WARNING" not in report
     assert len(report) < 4096
 
@@ -56,8 +56,8 @@ def test_unreachable_database_is_reported_not_silent(monkeypatch: pytest.MonkeyP
 
 
 def test_trial_expiry_turns_into_a_warning() -> None:
-    after = datetime(2026, 10, 17, tzinfo=timezone.utc)
-    assert "WARNING: Sportmonks trial ended 16 Oct" in status.format_report(after, [], 0, 0.0)
+    after = datetime(2026, 10, 26, tzinfo=timezone.utc)
+    assert "WARNING: Sportmonks trial ended 25 Oct" in status.format_report(after, [], 0, 0.0)
 
 
 def test_default_database_is_never_the_ci_database() -> None:
