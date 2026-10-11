@@ -1,0 +1,19 @@
+# Installed by deploy/VPS_SETUP.md. Runs scripts/run_task.py backup, the portable equivalent of the Windows task's
+# .cmd script (same steps, same failed-step names, same log: .prop_alpha_state/backup.log).
+[Unit]
+Description=prop_alpha daily backup and push to the private GitHub backup repository
+Wants=network-online.target
+After=network-online.target postgresql.service
+StartLimitIntervalSec=3h
+StartLimitBurst=4
+
+[Service]
+Type=oneshot
+User=propalpha
+Group=propalpha
+WorkingDirectory=/opt/prop_alpha
+ExecStart=/opt/prop_alpha/.venv/bin/python scripts/run_task.py backup
+TimeoutStartSec=30min
+# A failed backup is retried 30 minutes later, up to 3 times (as on Windows).
+Restart=on-failure
+RestartSec=30min

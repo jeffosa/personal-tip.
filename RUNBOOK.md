@@ -57,6 +57,8 @@ logged-in user, and retries a failed run. Task Scheduler history is off.
 | `Bet ledger poll` | every 10 minutes | `scripts/ledger_poll.cmd`: reply poll, closing-price capture, T-60 team sheets, settlement, pilot closing prices, pilot paper-bet settlement | `.prop_alpha_state\ledger.log` |
 | `Daily backup` | 03:30 | `scripts/backup.cmd`: `backup.py`, then `backup_push.py` | `.prop_alpha_state\backup.log` |
 
+Moving to an always-on Ubuntu server (maintainer decision 2026-10-11): `deploy/VPS_SETUP.md` (portable runner `scripts/run_task.py`, systemd units in `deploy/systemd/`, restore check `scripts/restore_backup.py`, cut-over order). Never run the tasks on two hosts at once.
+
 Read-only inventory (does not change anything):
 
 ```powershell

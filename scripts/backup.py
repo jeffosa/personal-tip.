@@ -8,7 +8,9 @@ Each run makes one folder `prop_alpha_<UTC stamp>/` holding:
   `pg_restore --list`, which must list the table data of every table in REQUIRED_TABLES;
 - `state/`: a copy of every file in STATE_FILES that exists, above all `placed_bets.jsonl`, the only record of the bets
   placed by hand; each copy is re-read and compared by SHA-256 with its source;
-- `manifest.json`: sizes and SHA-256 of everything above, written last, so a folder without a manifest is incomplete.
+- `manifest.json`: sizes and SHA-256 of everything above, and the row count of every table in REQUIRED_TABLES (counted
+  before and after the dump, which must agree, so a restore can be checked against it), written last, so a folder
+  without a manifest is incomplete.
 
 A run that fails any check exits 1 and leaves its folder named `*.incomplete`; pruning removes only complete backup
 folders (never anything else in the directory), oldest first, and never the one just made.
@@ -18,6 +20,9 @@ losing the disk. Point PROP_ALPHA_BACKUP_DIR (process environment, then .env) at
 an off-machine copy. A folder set there must already exist: a typo or an unmounted drive would otherwise create a new
 local folder and the backups would silently stop leaving the machine. Run daily by scripts/backup.cmd.
 The password comes from pgpass (never from this script, its arguments or the repository).
+
+PostgreSQL's client tools are found in PROP_ALPHA_PG_BIN (process environment) when set, else in the Windows installer's
+folder when it exists, else on PATH (an Ubuntu server: /usr/bin, maintainer decision 2026-10-11 to move to an always-on host).
 """
 
 from __future__ import annotations
@@ -48,7 +53,9 @@ SOURCE_DB: Final[str] = "prop_alpha"
 PILOT_DB: Final[str] = "prop_alpha_pilot"
 PILOT_DUMP_NAME: Final[str] = "prop_alpha_pilot.dump"
 _DATABASE_NAME: Final[re.Pattern[str]] = re.compile(r"^[a-z_][a-z0-9_]*$")
-PG_BIN: Final[Path] = Path(r"C:\Program Files\PostgreSQL\18\bin")
+PG_BIN_ENV: Final[str] = "PROP_ALPHA_PG_BIN"
+# Where the EDB Windows installer puts the client tools (not on PATH there); a Linux server has them on PATH.
+WINDOWS_PG_BIN: Final[Path] = Path(r"C:\Program Files\PostgreSQL\18\bin")
 # The ledger and alert state: losing any of these loses bets, exposure or the reply-to-bet mapping.
 STATE_FILES: Final[tuple[str, ...]] = (
     "placed_bets.jsonl", "sent_alerts.jsonl", "alert_messages.jsonl", "alert_deliveries.jsonl", "ledger_answers.jsonl",
@@ -99,19 +106,70 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def pg_tool(name: str, environ: Mapping[str, str] = os.environ,
+            which: Callable[[str], str | None] = shutil.which) -> str:
+    """The path of a PostgreSQL client tool: PROP_ALPHA_PG_BIN, else the Windows installer's folder, else PATH."""
+    configured = environ.get(PG_BIN_ENV, "").strip()
+    if configured:
+        if not Path(configured).is_dir():
+            raise ValueError(f"{PG_BIN_ENV}={configured!r} is not an existing folder")
+        return str(Path(configured) / name)
+    if WINDOWS_PG_BIN.is_dir():
+        return str(WINDOWS_PG_BIN / name)
+    found = which(name)
+    if found is None:
+        raise ValueError(f"{name} not found: install the PostgreSQL client tools or set {PG_BIN_ENV}")
+    return found
+
+
 def dump_commands(target: Path, database: str = SOURCE_DB) -> tuple[list[str], list[str]]:
     """The pg_dump and pg_restore --list commands; -w never prompts, so a missing pgpass entry fails instead."""
-    return ([str(PG_BIN / "pg_dump"), "-w", "-h", "localhost", "-U", "postgres", "-d", database, "-Fc", "-f",
-             str(target)], [str(PG_BIN / "pg_restore"), "--list", str(target)])
+    return ([pg_tool("pg_dump"), "-w", "-h", "localhost", "-U", "postgres", "-d", database, "-Fc", "-f",
+             str(target)], [pg_tool("pg_restore"), "--list", str(target)])
+
+
+def psql_command(database: str, query: str) -> list[str]:
+    """One read-only psql query, unaligned and tuples-only; -w never prompts."""
+    if _DATABASE_NAME.match(database) is None:
+        raise ValueError(f"{database!r} is not a plain database name")
+    return [pg_tool("psql"), "-w", "-h", "localhost", "-U", "postgres", "-d", database, "-X", "-At", "-F", "|", "-c",
+            query]
+
+
+COUNT_SQL: Final[str] = " UNION ALL ".join(f"SELECT '{table}', count(*) FROM prop_alpha.{table}" for table in REQUIRED_TABLES)
+
+
+def table_counts(database: str, runner: Runner) -> dict[str, int]:
+    """Row count of every table in REQUIRED_TABLES (one read-only query)."""
+    counts: dict[str, int] = {}
+    for line in runner(psql_command(database, COUNT_SQL)).splitlines():
+        if line.strip():
+            table, _, value = line.strip().partition("|")
+            counts[table] = int(value)
+    if sorted(counts) != sorted(REQUIRED_TABLES):
+        raise ValueError(f"row counts of {database} came back for {sorted(counts)}, not {sorted(REQUIRED_TABLES)}")
+    return counts
+
+
+def dump_and_count(database: str, target: Path, runner: Runner) -> dict[str, int]:
+    """Count, dump, check the listing and count again; the two counts must agree (no write during the dump), so the
+    counts in the manifest are the dump's."""
+    before = table_counts(database, runner)
+    dump_command, list_command = dump_commands(target, database)
+    runner(dump_command)
+    check_dump_listing(runner(list_command))
+    after = table_counts(database, runner)
+    if after != before:
+        changed = ", ".join(table for table in REQUIRED_TABLES if before[table] != after[table])
+        raise ValueError(f"{database} changed during the dump ({changed}); run the backup again")
+    return after
 
 
 def database_exists(name: str, runner: Runner) -> bool:
     """Whether the server has a database of this name (one read-only query; the name must be a plain identifier)."""
     if _DATABASE_NAME.match(name) is None:
         raise ValueError(f"{name!r} is not a plain database name")
-    query = f"SELECT 1 FROM pg_database WHERE datname = '{name}'"
-    return runner([str(PG_BIN / "psql"), "-w", "-h", "localhost", "-U", "postgres", "-d", "postgres", "-X", "-At", "-c",
-                   query]).strip() == "1"
+    return runner(psql_command("postgres", f"SELECT 1 FROM pg_database WHERE datname = '{name}'")).strip() == "1"
 
 
 def check_dump_listing(listing: str) -> None:
@@ -168,24 +226,21 @@ def backup(backup_dir: Path, state_dir: Path, now: datetime, keep: int = DEFAULT
         raise ValueError(f"{final.name} already exists")
     work.mkdir(parents=True)
     dump = work / "prop_alpha.dump"
-    dump_command, list_command = dump_commands(dump)
-    runner(dump_command)
-    check_dump_listing(runner(list_command))
+    counts = dump_and_count(SOURCE_DB, dump, runner)
     pilot_entry: dict[str, object] | None = None
     if pilot_db is not None:
         if database_exists(pilot_db, runner):
             pilot_dump = work / PILOT_DUMP_NAME
-            pilot_command, pilot_list = dump_commands(pilot_dump, pilot_db)
-            runner(pilot_command)
-            check_dump_listing(runner(pilot_list))
-            pilot_entry = {"database": pilot_db, "bytes": pilot_dump.stat().st_size, "sha256": sha256(pilot_dump)}
+            pilot_counts = dump_and_count(pilot_db, pilot_dump, runner)
+            pilot_entry = {"database": pilot_db, "bytes": pilot_dump.stat().st_size, "sha256": sha256(pilot_dump),
+                           "counts": pilot_counts}
         else:
             print(f"note: no {pilot_db} database on this server; not dumped")
     state = copy_state(state_dir, work / "state")
     if not (state_dir / "placed_bets.jsonl").is_file():
         print("note: placed_bets.jsonl does not exist yet (no bet recorded); nothing to copy for it")
     manifest = {"created_at": now.astimezone(timezone.utc).isoformat(), "database": SOURCE_DB,
-                "dump": {"bytes": dump.stat().st_size, "sha256": sha256(dump)}, "state": state,
+                "dump": {"bytes": dump.stat().st_size, "sha256": sha256(dump), "counts": counts}, "state": state,
                 **({"pilot_dump": pilot_entry} if pilot_entry is not None else {})}
     (work / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     work.rename(final)

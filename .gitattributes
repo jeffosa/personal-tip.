@@ -3,3 +3,6 @@
 *.sql text eol=lf
 # Windows batch scripts keep CRLF on every checkout (cmd.exe parses LF-only scripts unreliably; tests check it).
 *.cmd text eol=crlf
+# systemd units (deploy/systemd/) are read on Linux: LF only.
+*.service text eol=lf
+*.timer text eol=lf

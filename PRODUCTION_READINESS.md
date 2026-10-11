@@ -29,7 +29,7 @@ Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not e
 - **Monitoring [T]:** pilot heartbeat and a pilot section in the status report.
 - **Scoring [T]:** `scripts/pilot_score.py` column bug fixed; `scripts/gate2_lockbox.py` compares repriced with logged predictions (2,235 in 20 matches: 125 differ, largest 3.7e-03; 4 matches not logged).
 - **Tip layout [T]:** the maintainer's layout (league/market heading, match header with UTC kickoff, pick line, book/minimum/stake line).
-- **Maintainer decisions, not code:** keep tipping paper-only; the data provider after the 2026-10-25 trial; pull requests and GitHub Actions; an always-on host (VPS) instead of a laptop that sleeps.
+- **Maintainer decisions (2026-10-11):** (1) tips stay paper-only until the market settlement rules (`MARKET_CONTRACT.md`) and the model pass the PRD validation gates; (2) Sportmonks continues after the 2026-10-25 trial only if its paid coverage and cost are acceptable; (3) changes go through pull requests and are merged only after GitHub Actions is green, with no more direct pushes to `main`; (4) the scheduled tasks move to an always-on host, but first the Windows-specific scheduling (Task Scheduler, `.cmd` scripts, `run_hidden.py`) and the backup setup are made portable and a restore is tested on that host. Until then the laptop stays plugged in with the tasks set to wake it. Portable runner, systemd units, row-counted backups and a checked restore are built (`deploy/VPS_SETUP.md`); a restore into throwaway databases matched every count on this machine **[T]**; no server has been set up **[U]**.
 
 ## Audit rerun on 2026-10-11
 

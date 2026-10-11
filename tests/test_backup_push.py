@@ -34,6 +34,8 @@ def _make_backup(backup_dir: Path, state: Path, at: datetime) -> Path:
     backup = _load("backup")
 
     def runner(command: Sequence[str]) -> str:
+        if "-c" in command:  # row counts, before and after the dump
+            return "".join(f"{table}|1\n" for table in backup.REQUIRED_TABLES)
         if "--list" in command:
             return "\n".join(f"1; 0 1 TABLE DATA prop_alpha {table} postgres" for table in backup.REQUIRED_TABLES)
         Path(command[command.index("-f") + 1]).write_bytes(b"PGDMP fake dump " + at.isoformat().encode())
@@ -223,8 +225,8 @@ def test_a_pilot_dump_is_verified_and_pushed_like_the_main_dump(tmp_path: Path, 
     backup, push = _load("backup"), _load("backup_push")
 
     def runner(command: Sequence[str]) -> str:
-        if "-c" in command:  # does the pilot database exist?
-            return "1\n"
+        if "-c" in command:  # does the pilot database exist? else row counts
+            return "1\n" if "pg_database" in command[-1] else "".join(f"{t}|1\n" for t in backup.REQUIRED_TABLES)
         if "--list" in command:
             return "\n".join(f"1; 0 1 TABLE DATA prop_alpha {table} postgres" for table in backup.REQUIRED_TABLES)
         Path(command[command.index("-f") + 1]).write_bytes(b"PGDMP " + command[command.index("-d") + 1].encode())

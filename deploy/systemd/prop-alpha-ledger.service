@@ -1,0 +1,15 @@
+# Installed by deploy/VPS_SETUP.md. Runs scripts/run_task.py ledger, the portable equivalent of the Windows task's
+# .cmd script (same steps, same failed-step names, same log: .prop_alpha_state/ledger.log).
+[Unit]
+Description=prop_alpha 10-minute run: reply poll, closing prices, team sheets, settlement, pilot paper bets
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=oneshot
+User=propalpha
+Group=propalpha
+WorkingDirectory=/opt/prop_alpha
+ExecStart=/opt/prop_alpha/.venv/bin/python scripts/run_task.py ledger
+TimeoutStartSec=5min
+# Not retried: a re-run would send the same messages again; the next scheduled run follows.
