@@ -54,6 +54,8 @@ TELEGRAM_UPDATE_RETENTION: Final[timedelta] = timedelta(hours=24)
 # Sportmonks plan seen on 2026-10-11 (the second account): "Starter - Trialing until 2026-10-25". The first account's trial
 # ended 2026-10-16.
 SPORTMONKS_TRIAL_ENDS: Final[date] = date(2026, 10, 25)
+# The status report warns this many days before the trial ends (and every run after).
+TRIAL_WARNING_DAYS: Final[int] = 7
 # An archived OddsPapi reply as alerts/scan.py names it: <run time>_<bookmaker>.json.gz. A malformed reply is archived
 # as <run time>_<bookmaker>.rejected.json.gz and is not counted.
 ARCHIVED_REPLY: Final[re.Pattern[str]] = re.compile(r"([0-9]{8}T[0-9]{6}Z)_([a-z0-9]+)\.json\.gz")
@@ -276,10 +278,15 @@ def fx_section(rate: ExchangeRate | None, now: datetime) -> list[str]:
 def format_report(now: datetime, database_lines: list[str], alerts_in_window: int, open_exposure: float,
                   bet_lines: Sequence[str] = ()) -> str:
     days_left = (SPORTMONKS_TRIAL_ENDS - now.date()).days
-    trial = (
-        f"Sportmonks trial: {days_left} days left (ends {SPORTMONKS_TRIAL_ENDS:%d %b})" if days_left > 0
-        else f"WARNING: Sportmonks trial ended {SPORTMONKS_TRIAL_ENDS:%d %b}; ingestion will fail without a plan"
-    )
+    if days_left <= 0:
+        trial = f"WARNING: Sportmonks trial ended {SPORTMONKS_TRIAL_ENDS:%d %b}; ingestion will fail without a plan"
+    elif days_left <= TRIAL_WARNING_DAYS:
+        # Audit 2026-10-11: the warning came only after the trial had ended. A paid plan (or another vendor) needs a decision
+        # before then, because results, the scans and the lockbox scoring all stop with it.
+        trial = (f"WARNING: Sportmonks trial ends {SPORTMONKS_TRIAL_ENDS:%d %b} ({days_left} days left): results ingestion, the "
+                 "scans and lockbox scoring stop then; choose a paid plan before that day")
+    else:
+        trial = f"Sportmonks trial: {days_left} days left (ends {SPORTMONKS_TRIAL_ENDS:%d %b})"
     return "\n".join([
         f"prop_alpha status {now:%Y-%m-%d %H:%M} UTC",
         *database_lines,

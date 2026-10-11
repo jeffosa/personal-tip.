@@ -55,6 +55,14 @@ def test_unreachable_database_is_reported_not_silent(monkeypatch: pytest.MonkeyP
     ]
 
 
+def test_the_trial_warns_a_week_ahead_not_only_after_it_ended() -> None:
+    far = datetime(2026, 10, 17, tzinfo=timezone.utc)   # 8 days left: plain information
+    near = datetime(2026, 10, 18, tzinfo=timezone.utc)  # 7 days left: a warning
+    assert "Sportmonks trial: 8 days left (ends 25 Oct)" in status.format_report(far, [], 0, 0.0)
+    warning = status.format_report(near, [], 0, 0.0)
+    assert "WARNING: Sportmonks trial ends 25 Oct (7 days left)" in warning and "choose a paid plan" in warning
+
+
 def test_trial_expiry_turns_into_a_warning() -> None:
     after = datetime(2026, 10, 26, tzinfo=timezone.utc)
     assert "WARNING: Sportmonks trial ended 25 Oct" in status.format_report(after, [], 0, 0.0)
