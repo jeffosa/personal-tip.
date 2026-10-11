@@ -52,9 +52,11 @@ from typing import Any, Collection, Final, Mapping, Sequence
 
 import numpy as np
 
-from prop_alpha.alerts import scan
+from prop_alpha.alerts import pilot_ledger, scan
 from prop_alpha.alerts.fx import BOOK_CURRENCY, SUPPORTED_CURRENCIES, ExchangeRate, bankroll_currency, book_to_bankroll
 from prop_alpha.alerts.fx import identity as fx_identity
+from prop_alpha.alerts.ledger import PlacedBetStore
+from prop_alpha.alerts.predictions import PredictionLog
 from prop_alpha.alerts.telegram import (
     PAPER_LABEL,
     AlertContext,
@@ -62,6 +64,7 @@ from prop_alpha.alerts.telegram import (
     MessageIndex,
     SentAlertStore,
     TelegramNotifier,
+    TipLine,
     load_config,
 )
 from prop_alpha.config import DEFAULT_PILOT_DSN, PILOT_DSN_ENV
@@ -126,8 +129,17 @@ PILOT_USAGE: Final[str] = (
 PILOT_STATE_FILE: Final[Path] = scan.STATE_DIR / "pilot_sent_alerts.jsonl"
 PILOT_INDEX_FILE: Final[Path] = scan.STATE_DIR / "pilot_alert_messages.jsonl"
 PILOT_DELIVERY_FILE: Final[Path] = scan.STATE_DIR / "pilot_alert_deliveries.jsonl"
+PILOT_PREDICTIONS_FILE: Final[Path] = scan.STATE_DIR / "pilot_predictions.jsonl"
 PILOT_ODDS_DIR: Final[str] = "pilot"
 LADDER_CATALOGUE_FILE: Final[str] = "ladder_markets.json"
+
+
+def pilot_settings_digest() -> str:
+    """The identity of the pilot's pricing settings, written on every pilot prediction: a prediction made under other
+    settings is never mistaken for one made under these (the pilot has no frozen code, so no source digest)."""
+    settings = {"default_k": DEFAULT_GAME_STATE_K, "k": GAME_STATE_K, "league_k": LEAGUE_GAME_STATE_K,
+                "prior": PRIOR_STRENGTH}
+    return "pilot:" + hashlib.sha256(json.dumps(settings, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
 def pilot_engines(league: str) -> tuple[QuantEngine, dict[str, QuantEngine]]:
@@ -308,10 +320,14 @@ def run_ladder_scan(
     bankroll: float, label: str, max_alerts: int = scan.DEFAULT_MAX_ALERTS, *,
     odds: str = "mock", odds_client: Any | None = None, books: Sequence[str] = DEFAULT_BOOKMAKERS,
     state_dir: Path = scan.STATE_DIR, currency: str, book_rate: ExchangeRate | None = None,
+    predictions: PredictionLog | None = None, paper_bets: PlacedBetStore | None = None,
+    tips_file: Path = pilot_ledger.PILOT_TIPS_FILE,
 ) -> scan.ScanSummary:
     """One scan of the pilot-league matches kicking off in [now, next 4-hour boundary). `store` is the pilot (or mock)
     alert store: exposure is net of its stakes only. A league whose results are missing from the pilot database is
-    skipped and recorded in `summary.failures` (the caller exits STALE_EXIT)."""
+    skipped and recorded in `summary.failures` (the caller exits STALE_EXIT). With `predictions`, every fixture's Gate 2 lines
+    are logged before anything is sent (a failed write raises, so no tip goes out on a price that was not recorded); with
+    `paper_bets`, each tip is recorded as a paper bet just before its message is sent (alerts/pilot_ledger.py)."""
     import psycopg2
 
     if currency not in SUPPORTED_CURRENCIES:
@@ -352,6 +368,7 @@ def run_ladder_scan(
                                               "without them: " + ", ".join(f"{name} {count}" for name, count in sorted(unloadable.items())))
                 for league, missing in sorted(stale.items()):
                     summary.failures.append(stale_message(league, missing))
+                    summary.stale_leagues.append(league)
                 fixtures = [f for f in listed if f.league not in stale]
                 slate = [(fixture, scan.load_slate_inputs(cur, fixture)) for fixture in fixtures]
     finally:
@@ -394,6 +411,8 @@ def run_ladder_scan(
                                                         exposure, market_engines, pricer=price_pilot)
         if report is None:
             continue
+        if predictions is not None and projections:
+            predictions.record(fixture, projections, now, start, digest=pilot_settings_digest())
         if odds == "oddspapi" and fixture.league in TIP_LEAGUES and not quotes and projections:
             summary.unquoted_matches += 1
         summary.players_priced += len({key[1] for key in projections})
@@ -404,9 +423,15 @@ def run_ladder_scan(
         all_descriptions.update(scan.descriptions(fixture, inputs, projections))
     combined.directives.sort(key=lambda d: (-d.ev_per_unit, d.fixture_id, d.player_id, d.market_type, d.line_value))
     if notifier is not None:
+        fixtures_by_id = {f.fixture_id: f for f in fixtures}
+
+        def record_paper_bets(tips: Sequence[TipLine]) -> None:
+            if paper_bets is not None:
+                pilot_ledger.record_tips(paper_bets, tips_file, tips, fixtures_by_id, now)
+
         summary.alerts_sent, _ = notifier.notify_digest(
             combined, all_projections, bankroll_currency=currency, label=label, descriptions=all_descriptions,
-            max_alerts=max_alerts, book_rate=rate, usage=PILOT_USAGE,
+            max_alerts=max_alerts, book_rate=rate, usage=PILOT_USAGE, on_tips=record_paper_bets,
         )
     return summary
 
@@ -445,6 +470,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             float(os.environ.get(scan.BANKROLL_ENV, scan.DEFAULT_BANKROLL)), label,
             int(os.environ.get(scan.MAX_ALERTS_ENV, scan.DEFAULT_MAX_ALERTS)),
             odds=args.odds, odds_client=odds_client, books=books, currency=currency, book_rate=book_rate,
+            # Mock runs keep no record: their tips are not tips. Real runs log predictions and record paper bets.
+            predictions=PredictionLog(PILOT_PREDICTIONS_FILE) if real else None,
+            paper_bets=PlacedBetStore(pilot_ledger.PILOT_BETS_FILE) if real and args.send else None,
         )
     finally:
         client.close()
@@ -455,7 +483,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Every 4 hours most windows have no pilot match: the chat hears about a run only when there was something to say.
     if notifier is not None and (summary.fixtures or summary.failures):
         print(f"summary sent (message_id {notifier.send_message(text)})")
-    if any("skipped, not priced" in failure for failure in summary.failures):
+    if summary.stale_leagues:
         return STALE_EXIT
     return scan.ODDS_UNAVAILABLE_EXIT if real and summary.odds_unavailable else 0
 

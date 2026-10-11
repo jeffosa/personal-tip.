@@ -217,6 +217,9 @@ class ScanSummary:
     odds_unavailable: bool = False
     failures: list[str] = field(default_factory=list)
     odds_notes: list[str] = field(default_factory=list)
+    # Leagues the pilot scan (alerts/ladder_scan.py) skipped because their results were missing: its main() exits STALE_EXIT
+    # on these, not on the wording of a failure line (audit 2026-10-11, finding 12).
+    stale_leagues: list[str] = field(default_factory=list)
 
     def text(self, label: str) -> str:
         lines = [

@@ -140,6 +140,8 @@ def verify_backup(folder: Path) -> None:
     GitHub."""
     manifest: Any = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
     expected = {"prop_alpha.dump": manifest["dump"]["sha256"]}
+    if "pilot_dump" in manifest:  # the pilot database, when backup.py dumped it (audit 2026-10-11)
+        expected["prop_alpha_pilot.dump"] = manifest["pilot_dump"]["sha256"]
     expected.update({f"state/{name}": entry["sha256"] for name, entry in manifest["state"].items()})
     present = {path.relative_to(folder).as_posix() for path in folder.rglob("*") if path.is_file()} - {"manifest.json"}
     if present != set(expected):

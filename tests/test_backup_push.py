@@ -216,3 +216,27 @@ def test_the_manifest_written_by_backup_is_what_the_push_verifies(tmp_path: Path
         push.newest_backup(tmp_path / "state")
     with pytest.raises(ValueError, match="no backup folder"):
         push.newest_backup(tmp_path / "missing")
+
+
+def test_a_pilot_dump_is_verified_and_pushed_like_the_main_dump(tmp_path: Path, state: Path) -> None:
+    """Audit 2026-10-11, finding 5: the pilot database's dump goes off-machine too, checked against the manifest."""
+    backup, push = _load("backup"), _load("backup_push")
+
+    def runner(command: Sequence[str]) -> str:
+        if "-c" in command:  # does the pilot database exist?
+            return "1\n"
+        if "--list" in command:
+            return "\n".join(f"1; 0 1 TABLE DATA prop_alpha {table} postgres" for table in backup.REQUIRED_TABLES)
+        Path(command[command.index("-f") + 1]).write_bytes(b"PGDMP " + command[command.index("-d") + 1].encode())
+        return ""
+
+    folder = Path(backup.backup(tmp_path / "backups", state, NOW, runner=runner, pilot_db=backup.PILOT_DB))
+    push.verify_backup(folder)
+    git = _Git(_bare(tmp_path))
+    push.push_backup(folder, REMOTE, git=git, probe=_private)
+    pushed = subprocess.run(["git", "-c", "safe.bareRepository=all", "--git-dir", str(git.bare), "ls-tree", "-r",
+                             "--name-only", f"backup/{folder.name}"], capture_output=True, text=True, check=True).stdout
+    assert f"{folder.name}/{backup.PILOT_DUMP_NAME}" in pushed.split()
+    (folder / backup.PILOT_DUMP_NAME).write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="does not match its manifest SHA-256"):
+        push.verify_backup(folder)

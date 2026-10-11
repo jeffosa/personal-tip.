@@ -105,6 +105,12 @@ AlertKey = tuple[int, int, str, float, str, str]
 DIGEST_SIZE: Final[int] = 5
 # How a market is named in a tip: the heading ("TACKLE") and the bet line ("tackle over 0.5").
 MARKET_TIP_NAMES: Final[Mapping[str, str]] = {"tackles": "tackle", "fouls": "foul"}
+# A tip message is cut at a complete bet well before Telegram's 4,096-character limit (maintainer, 2026-10-11, on the
+# format recommendation: about 3,500). Every part repeats the heading with its part number and the paper-only line.
+TIP_TARGET_CHARS: Final[int] = 3500
+# Said under every tip that shows the model's numbers: they are unvalidated until a PRD gate passes.
+EXPERIMENT_FOOTNOTE: Final[str] = ("*Experimental: the model's estimates, expected value and survival are unvalidated, and the "
+                                   "bookmaker's settlement rules are unverified.")
 SeedKey = tuple[int, int, str, float, str, str, float]
 DEFAULT_CRITERIA: Final[HighValueCriteria] = HighValueCriteria(loss_floor=MODEL_RISK_LOSS_FLOOR)
 
@@ -571,10 +577,33 @@ def format_digest(
                 + ("" if directive.limit_published else f" | {limit_note(book_rate)}"),
             ]
             if tip.assessment is not None:
-                lines.append(f"       edge held in {tip.assessment.survival_rate:.0%} of "
-                             f"{tip.assessment.n_simulations:,} simulated match conditions")
-    lines += ["", PAPER_LABEL, usage]
+                lines += [
+                    f"       model estimate {tip.assessment.model_win_probability:.0%}* | market implied "
+                    f"{tip.assessment.book_win_probability:.0%} | EV estimate {tip.assessment.ev_per_unit:+.0%}*",
+                    f"       edge held in {tip.assessment.survival_rate:.0%} of {tip.assessment.n_simulations:,} "
+                    "simulated match conditions*",
+                ]
+    shows_model = any(entry[1] is not None for entry in entries)
+    lines += ["", *((EXPERIMENT_FOOTNOTE,) if shows_model else ()), PAPER_LABEL, usage]
     return "\n".join(lines)
+
+
+def split_tips(
+    entries: Sequence[TipEntry], per_message: int, render: Callable[[Sequence[TipEntry]], str],
+    limit: int = TIP_TARGET_CHARS,
+) -> list[list[TipEntry]]:
+    """The entries cut into messages at complete bets: each holds at most `per_message` bets and renders (with `render`) to at
+    most `limit` characters, in order. A single bet that alone exceeds `limit` still gets its own message (the send then
+    refuses it rather than cutting it)."""
+    if per_message < 1 or limit < 1:
+        raise ValueError("per_message and limit must be positive")
+    chunks: list[list[TipEntry]] = []
+    for entry in entries:
+        if chunks and len(chunks[-1]) < per_message and len(render([*chunks[-1], entry])) <= limit:
+            chunks[-1].append(entry)
+        else:
+            chunks.append([entry])
+    return chunks
 
 
 def format_directive(
@@ -754,10 +783,13 @@ class TelegramNotifier:
         per_message: int = DIGEST_SIZE,
         book_rate: ExchangeRate | None = None,
         usage: str = USAGE,
+        on_tips: Callable[[Sequence[TipLine]], None] | None = None,
     ) -> tuple[int, list[int]]:
         """As notify, but the high-value bets go out as tip messages (format_digest): one market per message, at most
         `per_message` bets each (10 tackle bets: two messages of 5), the best first. Returns (bets alerted, message
-        ids). Every bet of a message is recorded before that message is sent."""
+        ids). Every bet of a message is recorded before that message is sent. `on_tips` is called with the message's
+        numbered bets (in the order the message shows them) just before it is sent, so a caller can keep its own record
+        of what was tipped (the pilot scan's paper bets); an exception from it stops the run before that send."""
         if per_message < 1:
             raise ValueError("per_message must be at least 1")
         passing = list(self._high_value(report, projections, criteria, max_alerts))
@@ -767,14 +799,17 @@ class TelegramNotifier:
             by_market.setdefault(directive.market_type, []).append((directive, assessment, context))
         message_ids: list[int] = []
         for market, tips in by_market.items():
-            parts = -(-len(tips) // per_message)
-            for part in range(parts):
-                chunk = tips[part * per_message:(part + 1) * per_message]
+            # Sized with the longest part marker, so adding the real "message 2 of 3" can never push a part over the limit.
+            chunks = split_tips(tips, per_message, lambda e: format_digest(e, 99, 99, label, bankroll_currency, book_rate, usage))
+            parts = len(chunks)
+            for part, chunk in enumerate(chunks):
                 text = format_digest(chunk, part + 1, parts, label, bankroll_currency, book_rate, usage)
                 items = digest_items(chunk)
                 delivery_id = self._begin_delivery("digest", text, items, max(entry[0].expires_at for entry in chunk))
                 for directive, _, _ in chunk:
                     self._record(directive)
+                if on_tips is not None:
+                    on_tips([tip for _, tips_of_match in tip_layout(chunk) for tip in tips_of_match])
                 message_ids.append(self._send_and_confirm(text, delivery_id, items))
                 logger.info("%s tips message %d/%d sent with %d bets", market, part + 1, parts, len(chunk))
         return len(passing), message_ids

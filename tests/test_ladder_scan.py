@@ -222,6 +222,7 @@ def test_a_stale_league_is_skipped_and_named_while_the_others_are_still_scanned(
     assert "ingestion.results --pilot" in failure and "pilot_backfill.py --list --seed --ingest" in failure
     assert summary.players_priced == 2 and notifier.texts == []  # the Scottish fixture only; it is never tipped
     assert "Could not price Brazil Serie A skipped" in ladder_scan.summary_text(summary, "")
+    assert summary.stale_leagues == ["Brazil Serie A"]
 
 
 def test_a_window_with_no_pilot_match_reads_no_database(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -427,3 +428,83 @@ def test_recorded_vendor_refusals_are_not_stale_but_are_reported(tmp_path: Path,
     summary = _run(tmp_path, _Recording(store), store)
     assert summary.failures == [] and summary.players_priced == 4
     assert any("cannot load" in note and "Brazil Serie A 1" in note for note in summary.odds_notes)
+
+
+def test_the_scan_logs_predictions_and_records_every_tip_as_a_paper_bet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Audit 2026-10-11 (finding 3): a pilot tip leaves a prediction log line for every priced line, a paper bet and a tip line."""
+    from prop_alpha.alerts.ledger import PlacedBetStore
+    from prop_alpha.alerts.predictions import PredictionLog, counts_for_lockbox
+
+    _patch_database(monkeypatch, stored={FINISHED_UID})
+    monkeypatch.setattr(ladder_scan, "mock_quotes", _generous_mock_quotes)
+    store = SentAlertStore(tmp_path / "mock.jsonl")
+    notifier = _Recording(store)
+    log, bets, tips_file = PredictionLog(tmp_path / "pred.jsonl"), PlacedBetStore(tmp_path / "bets.jsonl"), tmp_path / "tips.jsonl"
+    summary = _run(tmp_path, notifier, store, odds="mock", predictions=log, paper_bets=bets, tips_file=tips_file)
+    records = log.load()
+    assert records and {r["fixture_id"] for r in records} == {9101, SCOTTISH_ID}  # both leagues are logged, before any tip
+    assert {r["digest"] for r in records} == {ladder_scan.pilot_settings_digest()}
+    assert ladder_scan.pilot_settings_digest().startswith("pilot:")
+    assert not any(counts_for_lockbox(r) for r in records)  # a pilot price never counts towards the frozen lockbox
+    placed = bets.open_bets(NOW)
+    assert len(placed) == summary.alerts_sent >= 1 and all(b.fixture_id == 9101 for b in placed)  # tips: Brazil only
+    assert all(b.odds == 2.6 and b.stake > 0 and b.side == "over" for b in placed)
+    from prop_alpha.alerts.pilot_ledger import load_tips
+
+    tips = load_tips(tips_file)
+    assert set(tips) == {b.bet_id for b in placed} and {t["league"] for t in tips.values()} == {"Brazil Serie A"}
+    assert all(0.6 < t["survival_rate"] <= 1.0 for t in tips.values())  # the screen's own number is kept with the tip
+
+
+def test_a_prediction_that_cannot_be_recorded_stops_the_scan_before_any_tip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from prop_alpha.alerts.predictions import PredictionLog
+
+    _patch_database(monkeypatch, stored={FINISHED_UID})
+    monkeypatch.setattr(ladder_scan, "mock_quotes", _generous_mock_quotes)
+
+    def refuse(self: Any, *args: Any, **kwargs: Any) -> int:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(PredictionLog, "record", refuse)
+    store = SentAlertStore(tmp_path / "mock.jsonl")
+    notifier = _Recording(store)
+    with pytest.raises(OSError, match="disk full"):
+        _run(tmp_path, notifier, store, odds="mock", predictions=PredictionLog(tmp_path / "pred.jsonl"))
+    assert notifier.texts == [] and store.load() == []  # no tip, and nothing counted as alerted
+
+
+def test_no_paper_bet_is_recorded_for_a_run_that_sends_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from prop_alpha.alerts.ledger import PlacedBetStore
+
+    _patch_database(monkeypatch, stored={FINISHED_UID})
+    monkeypatch.setattr(ladder_scan, "mock_quotes", _generous_mock_quotes)
+    bets = PlacedBetStore(tmp_path / "bets.jsonl")
+    _run(tmp_path, None, SentAlertStore(tmp_path / "mock.jsonl"), odds="mock", paper_bets=bets, tips_file=tmp_path / "tips.jsonl")  # type: ignore[arg-type]
+    assert bets.open_bets(NOW) == [] and not (tmp_path / "tips.jsonl").exists()
+
+
+def test_the_stale_exit_code_follows_the_skipped_leagues_not_the_wording_of_a_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Audit 2026-10-11, finding 12: main() used to look for the text "skipped, not priced" in the failure lines."""
+    import prop_alpha.ingestion.pipeline as pipeline
+
+    class _Client:
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(ladder_scan, "bankroll_currency", lambda: "GBP")
+    monkeypatch.setattr(ladder_scan, "book_to_bankroll", lambda currency, day: fx_identity("GBP"))
+    monkeypatch.setattr(pipeline, "build_vendor_client", lambda environ: _Client())
+    outcomes = {"stale": (["reworded failure"], ["Brazil Serie A"]), "other failure": (["Could not price X"], []), "clean": ([], [])}
+    codes: dict[str, int] = {}
+    for name, (failures, stale) in outcomes.items():
+        def fake_run(*args: Any, failures: list[str] = failures, stale: list[str] = stale, **kwargs: Any) -> scan.ScanSummary:
+            return scan.ScanSummary(NOW, NOW, failures=list(failures), stale_leagues=list(stale))
+
+        monkeypatch.setattr(ladder_scan, "run_ladder_scan", fake_run)
+        codes[name] = ladder_scan.main(["--odds", "mock"])
+    capsys.readouterr()
+    assert codes == {"stale": ladder_scan.STALE_EXIT, "other failure": 0, "clean": 0}

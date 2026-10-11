@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
 
-import prop_alpha.scanner.slate
+from prop_alpha.scanner.slate import UpcomingFixture
 
 logger = logging.getLogger("prop_alpha.lineup_capture")
 
@@ -54,7 +54,7 @@ def _require_utc(value: datetime, name: str) -> None:
         raise ValueError(f"{name} must be a timezone-aware UTC datetime")
 
 
-def due_fixtures(fixtures: Sequence[prop_alpha.scanner.slate.UpcomingFixture], handled: frozenset[int], now: datetime) -> list[prop_alpha.scanner.slate.UpcomingFixture]:
+def due_fixtures(fixtures: Sequence[UpcomingFixture], handled: frozenset[int], now: datetime) -> list[UpcomingFixture]:
     """Pure: fixtures between CAPTURE_LATEST and CAPTURE_EARLIEST minutes from kickoff with no outcome yet, earliest
     kickoff first."""
     _require_utc(now, "now")
@@ -79,12 +79,12 @@ def sheet_status(payload: Mapping[str, Any]) -> str:
     return STATUS_CONFIRMED if len(set(everyone)) == len(everyone) else STATUS_INCOMPLETE
 
 
-def is_last_chance(fixture: prop_alpha.scanner.slate.UpcomingFixture, now: datetime) -> bool:
+def is_last_chance(fixture: UpcomingFixture, now: datetime) -> bool:
     """Pure: the next poll would be at or past CAPTURE_LATEST."""
     return fixture.kickoff_at - (now + POLL_INTERVAL) <= CAPTURE_LATEST
 
 
-def record_for(fixture: prop_alpha.scanner.slate.UpcomingFixture, payload: Mapping[str, Any], status: str, captured_at: datetime) -> dict[str, Any]:
+def record_for(fixture: UpcomingFixture, payload: Mapping[str, Any], status: str, captured_at: datetime) -> dict[str, Any]:
     """Pure: the stored line for one captured sheet."""
     _require_utc(captured_at, "captured_at")
     return {

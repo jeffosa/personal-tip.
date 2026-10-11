@@ -1,0 +1,244 @@
+"""Pilot paper ledger: the evidence trail for the pilot scan's tips (alerts/ladder_scan.py).
+
+Audit 2026-10-11 (findings 3 and 4): pilot tips were sent with no record of what was tipped, no settlement and no closing
+price, so they could never show whether the model, or the assumed bookmaker settlement rules, were right. Every pilot tip is
+now a PAPER bet: `record_tips` (called just before each tip message is sent) writes it to `pilot_paper_bets.jsonl`, with the
+odds, book and the stake the system suggested, and a line to `pilot_tips.jsonl` with the match, the league and the
+model's numbers. Nothing here is a bet the maintainer placed: the real ledger (alerts/ledger.py) and its exposure never
+see these files. The paper P&L is "had the tip been taken at the alerted price and stake".
+
+    python -m prop_alpha.alerts.pilot_ledger --settle [--send]   # grade open paper bets from the pilot database
+    python -m prop_alpha.alerts.pilot_ledger --list              # open and settled paper bets, with closing-price value
+    python -m prop_alpha.alerts.pilot_ledger --record 3 won      # the bookmaker's result for paper bet 3 (you read it off the site)
+    python -m prop_alpha.alerts.pilot_ledger --reconcile         # your recorded results v automatic settlement; exit 1 on a discrepancy
+
+Automatic settlement is the assumed market contract (tackles = Sportmonks `tackles_attempted`, fouls = `fouls_committed`, void if
+the player does not play, a whole-line count is a push), read from `prop_alpha_pilot`. It is provisional until bookmaker results
+agree: a `--record` result is the bookmaker's, and `--reconcile` says AGREE or DISCREPANCY for each. Only the AGREE count says anything
+about whether the contract is right (alerts/closing is the League One/Two equivalent). Closing prices come from
+alerts/pilot_closing.py; with a one-sided ladder price the value is price-based: taken odds / closing odds - 1.
+
+I/O: the paper-bet, tip and closing files, one read-only pilot-database transaction (through alerts/ledger), and Telegram for
+`--send`. No exception handler (AGENT.md 1.3).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Final, Mapping, Sequence
+
+from prop_alpha.alerts import ledger
+from prop_alpha.alerts.ledger import PlacedBetStore
+from prop_alpha.alerts.replies import (
+    RESULTS,
+    PlacedBet,
+    Settlement,
+    profit,
+    reconciliation_summary,
+    reconciliation_text,
+    settlement_text,
+)
+from prop_alpha.alerts.telegram import TelegramNotifier, TipLine, load_config
+from prop_alpha.config import DEFAULT_PILOT_DSN, PILOT_DSN_ENV
+from prop_alpha.scanner.slate import UpcomingFixture
+
+logger = logging.getLogger("prop_alpha.pilot_ledger")
+
+STATE_DIR: Final[Path] = ledger.STATE_DIR
+PILOT_BETS_FILE: Final[Path] = STATE_DIR / "pilot_paper_bets.jsonl"
+PILOT_TIPS_FILE: Final[Path] = STATE_DIR / "pilot_tips.jsonl"
+PILOT_CLOSING_FILE: Final[Path] = STATE_DIR / "pilot_closing_quotes.jsonl"
+PILOT_LOCK_FILE: Final[Path] = STATE_DIR / "pilot_ledger.lock"
+SETTLED_HEADER: Final[str] = "PILOT PAPER TIPS SETTLED (provisional: assumed market rules; these were never bets you placed)"
+TIP_FIELDS: Final[tuple[str, ...]] = (
+    "bet_id", "fixture_id", "league", "home_team_uid", "away_team_uid", "home_name", "away_name", "kickoff_at",
+)
+
+
+def paper_bet(tip: TipLine, bet_id: int, now: datetime) -> PlacedBet:
+    """Pure: the paper bet for one tip, at the alerted odds, book and suggested stake (message id 0: not known before sending)."""
+    directive = tip.directive
+    return PlacedBet(
+        bet_id=bet_id, update_id=bet_id, message_id=0, number=tip.number, kind="alert", fixture_id=directive.fixture_id,
+        player_id=directive.player_id, market=directive.market_type, line=directive.line_value,
+        side=directive.side.lower(), odds=directive.decimal_odds, stake=directive.stake, book=directive.sportsbook,
+        min_odds=directive.min_acceptable_odds,
+        match=tip.context.match if tip.context else f"Fixture {directive.fixture_id}",
+        player=tip.context.player if tip.context else f"player {directive.player_id}", placed_at=now,
+    )
+
+
+def tip_record(tip: TipLine, bet: PlacedBet, fixture: UpcomingFixture) -> dict[str, Any]:
+    """Pure: the tip's line in pilot_tips.jsonl: the fixture (to find its closing price later) and the model's numbers."""
+    assessment = tip.assessment
+    return {
+        "bet_id": bet.bet_id, "fixture_id": fixture.fixture_id, "league": fixture.league,
+        "home_team_uid": fixture.home_team_uid, "away_team_uid": fixture.away_team_uid, "home_name": fixture.home_name,
+        "away_name": fixture.away_name, "kickoff_at": fixture.kickoff_at.isoformat(), "label": tip.label,
+        "recorded_at": bet.placed_at.isoformat(),
+        "survival_rate": None if assessment is None else assessment.survival_rate,
+        "model_win_probability": None if assessment is None else assessment.model_win_probability,
+        "book_win_probability": None if assessment is None else assessment.book_win_probability,
+        "ev_per_unit": None if assessment is None else assessment.ev_per_unit,
+    }
+
+
+def record_tips(
+    store: PlacedBetStore, tips_file: Path, tips: Sequence[TipLine], fixtures: Mapping[int, UpcomingFixture], now: datetime,
+) -> list[PlacedBet]:
+    """Record each tip as a paper bet and a tip line. A tip whose fixture is unknown raises: it could never be settled."""
+    bets, _, _, _ = store.load_all()
+    next_id = max(bets, default=0) + 1
+    recorded: list[PlacedBet] = []
+    for tip in tips:
+        fixture = fixtures.get(tip.directive.fixture_id)
+        if fixture is None:
+            raise ValueError(f"tip for fixture {tip.directive.fixture_id} has no fixture to settle against")
+        bet = paper_bet(tip, next_id, now)
+        store.record_bet(bet)
+        tips_file.parent.mkdir(parents=True, exist_ok=True)
+        with tips_file.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(tip_record(tip, bet, fixture)) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        recorded.append(bet)
+        next_id += 1
+    return recorded
+
+
+def load_tips(path: Path) -> dict[int, dict[str, Any]]:
+    """bet id -> tip line. A damaged line raises: an unreadable record is not guessed."""
+    tips: dict[int, dict[str, Any]] = {}
+    if not path.is_file():
+        return tips
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        record: Any = json.loads(line)
+        if not isinstance(record, dict) or any(field not in record for field in TIP_FIELDS):
+            raise ValueError(f"{path.name} line {number} is not a pilot tip record")
+        tips[int(record["bet_id"])] = record
+    return tips
+
+
+def fixture_of(record: Mapping[str, Any]) -> UpcomingFixture:
+    return UpcomingFixture(
+        int(record["fixture_id"]), str(record["league"]), str(record["home_team_uid"]), str(record["away_team_uid"]),
+        str(record["home_name"]), str(record["away_name"]), datetime.fromisoformat(str(record["kickoff_at"])),
+    )
+
+
+def load_closing(path: Path) -> list[dict[str, Any]]:
+    """Every captured closing price: fixture_id, player_id, market, line, book, over, under, captured_at."""
+    records: list[dict[str, Any]] = []
+    if not path.is_file():
+        return records
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        record: Any = json.loads(line)
+        if not isinstance(record, dict) or any(k not in record for k in ("fixture_id", "player_id", "market", "line", "book", "captured_at")):
+            raise ValueError(f"{path.name} line {number} is not a closing price")
+        records.append(record)
+    return records
+
+
+def closing_price(bet: PlacedBet, closing: Sequence[Mapping[str, Any]]) -> tuple[float, str] | None:
+    """Pure: the closing price of the bet's own selection (same fixture, player, market, line and side), preferring the
+    book it was tipped at, then the latest capture; None when none was captured."""
+    side = "over" if bet.side == "over" else "under"
+    candidates = [q for q in closing
+                  if (int(q["fixture_id"]), int(q["player_id"]), str(q["market"]), float(q["line"]))
+                  == (bet.fixture_id, bet.player_id, bet.market, bet.line) and q.get(side) is not None]
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda q: (str(q["book"]).lower() == bet.book.lower(), str(q["captured_at"])))
+    return float(best[side]), str(best["book"])
+
+
+def price_clv(taken_odds: float, closing_odds: float) -> float:
+    """Closing-price value of a one-sided price: taken odds / closing odds - 1 (positive: the price taken beat the close)."""
+    if not (taken_odds > 1.0 and closing_odds > 1.0):
+        raise ValueError("odds must be above 1")
+    return taken_odds / closing_odds - 1.0
+
+
+def clv_summary(bets: Sequence[PlacedBet], closing: Sequence[Mapping[str, Any]]) -> str:
+    values = [price_clv(bet.odds, found[0]) for bet in bets if (found := closing_price(bet, closing)) is not None]
+    if not values:
+        return "no closing price captured yet"
+    return f"mean closing-price value {sum(values) / len(values):+.1%} over {len(values)} paper bet(s) with a closing price"
+
+
+def results_text(settled: Sequence[tuple[PlacedBet, Settlement]], closing: Sequence[Mapping[str, Any]]) -> str:
+    """Count, stake, paper profit and return on stake of the settled paper bets, the confirmed-only split and the CLV."""
+    staked = sum(bet.stake for bet, _ in settled)
+    total = sum(profit(bet, s) for bet, s in settled)
+    by_result = {result: sum(1 for _, s in settled if s.result == result) for result in RESULTS}
+    roi = f", return on stake {total / staked:+.1%}" if staked > 0 else ""
+    confirmed = [(bet, s) for bet, s in settled if s.source != "auto"]
+    return (f"{len(settled)} settled paper bet(s) ({by_result['won']} won, {by_result['lost']} lost, {by_result['void']} void): "
+            f"staked {staked:.2f}, paper profit {total:+.2f}{roi}; {len(settled) - len(confirmed)} provisional (automatic, assumed "
+            f"market rules), {len(confirmed)} with a bookmaker result you recorded; "
+            f"{clv_summary([bet for bet, _ in settled], closing)}")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(description="Paper ledger for the pilot scan's tips (never real bets).")
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--settle", action="store_true", help="grade open paper bets whose match is final in the pilot database")
+    action.add_argument("--list", action="store_true", help="print the open and settled paper bets")
+    action.add_argument("--record", nargs=2, metavar=("BET_ID", "RESULT"), help="the bookmaker's result: won, lost or void")
+    action.add_argument("--reconcile", action="store_true", help="compare recorded bookmaker results with automatic settlement")
+    parser.add_argument("--send", action="store_true", help="with --settle: send the new results to Telegram")
+    args = parser.parse_args(argv)
+    now = datetime.now(timezone.utc)
+    store = PlacedBetStore(PILOT_BETS_FILE)
+    dsn = os.environ.get(PILOT_DSN_ENV, DEFAULT_PILOT_DSN)
+    closing = load_closing(PILOT_CLOSING_FILE)
+    if args.list:
+        for bet in store.open_bets(now):
+            found = closing_price(bet, closing)
+            print(f"#{bet.bet_id} {bet.placed_at:%d %b %H:%M} {bet.match} | {bet.player} | {bet.side.upper()} {bet.line:g} "
+                  f"{bet.market} @ {bet.odds:.2f} stake {bet.stake:g} ({bet.book})"
+                  + ("" if found is None else f" | close {found[0]:.2f} ({price_clv(bet.odds, found[0]):+.1%})"))
+        settled = store.settled_bets()
+        for bet, settlement in settled:
+            print(settlement_text(bet, settlement))
+        print(results_text(settled, closing))
+        return 0
+    if args.record:
+        bet_id, result = int(args.record[0]), str(args.record[1]).lower()
+        if result not in RESULTS:
+            parser.error(f"RESULT must be one of {', '.join(RESULTS)}")
+        bets, cancelled, _, _ = store.load_all()
+        if bet_id not in bets:
+            parser.error(f"no paper bet #{bet_id}")
+        # update_id 0: the settlement is the maintainer's, not a Telegram reply (a manual result needs one).
+        store.record_settlement(Settlement(bet_id, result, "manual", "bookmaker result recorded by hand", now, update_id=0))
+        print(f"recorded {result.upper()} for paper bet #{bet_id} as the bookmaker's result")
+        return 0
+    if args.reconcile:
+        items = ledger.reconcile_settlements(store, dsn, now)
+        lines = [reconciliation_text(bet, item) for bet, item in items if item.outcome != "unconfirmed"]
+        print("\n".join([*lines, reconciliation_summary([item for _, item in items])]))
+        return 1 if any(item.outcome == "discrepancy" for _, item in items) else 0
+    with ledger.ledger_lock(PILOT_LOCK_FILE):
+        settled = ledger.settle(store, dsn, now)
+        lines = [settlement_text(bet, settlement) for bet, settlement in settled]
+        print("\n".join(lines) if lines else "no open paper bet has a final match in the pilot database")
+        if args.send and lines:
+            notice = "\n".join([SETTLED_HEADER, *lines, results_text(store.settled_bets(), closing)])
+            TelegramNotifier(load_config()).send_message(notice)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

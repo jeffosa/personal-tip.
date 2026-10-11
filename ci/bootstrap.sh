@@ -34,7 +34,7 @@ readonly CI_DATABASE_NAME="prop_alpha_ci"
 readonly CI_DATABASE_MARKER="prop_alpha disposable CI database"
 # pyright is not a Python wheel: it runs from npm at this exact version (needs node/npx and the npm registry).
 readonly PYRIGHT_VERSION="1.1.406"
-readonly EXPECTED_TESTS=737
+readonly EXPECTED_TESTS=766
 
 log() { printf '%s [ci] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { log "FATAL: $*" >&2; exit 1; }

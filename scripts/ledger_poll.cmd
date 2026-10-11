@@ -17,5 +17,9 @@ set "FAILED="
 "%PY%" -m prop_alpha.alerts.closing >> "%LOG%" 2>&1 || (set RC=1& set "FAILED=%FAILED% closing-prices"& echo [%date% %time%] STEP FAILED: closing prices>> "%LOG%")
 "%PY%" -m prop_alpha.alerts.lineup_capture >> "%LOG%" 2>&1 || (set RC=1& set "FAILED=%FAILED% lineups"& echo [%date% %time%] STEP FAILED: lineups>> "%LOG%")
 "%PY%" -m prop_alpha.alerts.ledger --settle --send >> "%LOG%" 2>&1 || (set RC=1& set "FAILED=%FAILED% settle"& echo [%date% %time%] STEP FAILED: settle>> "%LOG%")
+rem The pilot scan's paper bets (audit 2026-10-11): closing prices for pilot tips about to kick off (no request unless one is due),
+rem then their settlement from the pilot database. These are never the maintainer's bets and never touch placed_bets.jsonl.
+"%PY%" -m prop_alpha.alerts.pilot_closing >> "%LOG%" 2>&1 || (set RC=1& set "FAILED=%FAILED% pilot-closing"& echo [%date% %time%] STEP FAILED: pilot closing prices>> "%LOG%")
+"%PY%" -m prop_alpha.alerts.pilot_ledger --settle --send >> "%LOG%" 2>&1 || (set RC=1& set "FAILED=%FAILED% pilot-settle"& echo [%date% %time%] STEP FAILED: pilot settle>> "%LOG%")
 "%PY%" -m prop_alpha.alerts.task_health --task ledger --failed "%FAILED%" >> "%LOG%" 2>&1 || (set RC=1& echo [%date% %time%] STEP FAILED: task health>> "%LOG%")
 exit /b %RC%

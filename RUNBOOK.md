@@ -54,7 +54,7 @@ logged-in user, and retries a failed run. Task Scheduler history is off.
 | Task | Schedule | Script | Log |
 |---|---|---|---|
 | `Telegram status` | every 4 hours from 00:00 | `scripts/telegram_status.cmd`: results job, pilot results job, exchange rate, status report, League One/Two scan, pilot-leagues scan | `.prop_alpha_state\status.log` |
-| `Bet ledger poll` | every 10 minutes | `scripts/ledger_poll.cmd`: reply poll, closing-price capture, T-60 team sheets, settlement | `.prop_alpha_state\ledger.log` |
+| `Bet ledger poll` | every 10 minutes | `scripts/ledger_poll.cmd`: reply poll, closing-price capture, T-60 team sheets, settlement, pilot closing prices, pilot paper-bet settlement | `.prop_alpha_state\ledger.log` |
 | `Daily backup` | 03:30 | `scripts/backup.cmd`: `backup.py`, then `backup_push.py` | `.prop_alpha_state\backup.log` |
 
 Read-only inventory (does not change anything):
@@ -76,11 +76,12 @@ a step of `Telegram status`, after `python -m prop_alpha.ingestion.results --pil
   branch `backup/prop_alpha_<stamp>` to the private repository (it refuses a public one) and prunes to the newest 14.
 - **Restore (always into a new database first):**
   1. `createdb -h localhost -U postgres prop_alpha_restore` (the PostgreSQL `bin` folder, `C:\Program Files\PostgreSQL\18\bin`, is not on PATH)
-  2. `pg_restore -w -h localhost -U postgres -d prop_alpha_restore --no-owner prop_alpha.dump` from the backup folder.
+  2. `pg_restore -w -h localhost -U postgres -d prop_alpha_restore --no-owner prop_alpha.dump` from the backup folder. The pilot database, when the backup has `prop_alpha_pilot.dump`, restores the same way into a database of its own.
   3. Compare row counts with `.prop_alpha_state/status.log`'s database line and with `manifest.json`; check each state file's SHA-256 against the manifest.
   4. To go live on the restored data, stop the three tasks, copy the `state/` files back into `.prop_alpha_state/`, point `PROP_ALPHA_DB_DSN`
      at the restored database, run `python -m prop_alpha.alerts.status`, then re-enable the tasks.
   A restore from the off-machine branch was verified once (2026-10-08, counts matched). Pruning against the real repository and a restore from a later branch are not yet shown **[U]**.
+- The repository's GitHub name ends with a dot (`jeffosa/personal-tip.`), so the remote URL `personal-tip..git` is correct.
 - Take a backup before any migration. Applied migrations are immutable; a change is a new higher-numbered file.
 
 ## 6. Monitoring
@@ -92,6 +93,9 @@ a step of `Telegram status`, after `python -m prop_alpha.ingestion.results --pil
   It cannot see a machine that is off, asleep or logged out. State: `.prop_alpha_state/task_health.json`.
 - Delivery review: `python -m prop_alpha.alerts.delivery` lists messages whose delivery outcome is unknown; nothing is re-sent automatically.
 - Settlement check: `python -m prop_alpha.alerts.ledger --reconcile`; prediction log: `python -m prop_alpha.alerts.predictions`.
+- Pilot paper bets (never real bets): `python -m prop_alpha.alerts.pilot_ledger --list`; settle with `--settle [--send]`; after you read a bookmaker's result off the site,
+  `--record <id> won|lost|void` then `--reconcile` (exit 1 on a discrepancy: the assumed settlement rules disagree with the book). `python scripts/pilot_score.py` scores the logged pilot predictions.
+- The trial warning: the status report says WARNING from 7 days before the Sportmonks trial ends.
 
 ## 7. Rollback
 

@@ -15,6 +15,8 @@ from prop_alpha.alerts.replies import USAGE, PlacedBet, PlaceCommand, ReplyError
 from prop_alpha.alerts.telegram import (
     AlertContext,
     DEFAULT_CRITERIA,
+    EXPERIMENT_FOOTNOTE,
+    TIP_TARGET_CHARS,
     MIN_SEND_INTERVAL_S,
     OPEN_POSITION_WINDOW,
     PAPER_LABEL,
@@ -26,6 +28,7 @@ from prop_alpha.alerts.telegram import (
     alert_key,
     demo_case,
     digest_items,
+    split_tips,
     format_digest,
     format_directive,
     load_config,
@@ -407,17 +410,54 @@ def test_tips_group_by_match_and_letter_each_bet() -> None:
     assert text.endswith(USAGE) and PAPER_LABEL in text
 
 
-def test_each_tip_shows_its_survival_percentage() -> None:
+def test_each_tip_shows_its_survival_percentage_and_marks_the_model_numbers_experimental() -> None:
     a, b, _ = _tip_directives()
     passing = HighValueAssessment(0.08, 0.6, 0.5, True, True, 683, 1000, True)
     marginal = HighValueAssessment(0.05, 0.55, 0.5, True, True, 612, 1000, True)
     text = format_digest([(a, passing, None), (b, marginal, None), (replace(b, player_id=99), None, None)])
     lines = text.splitlines()
     first = next(i for i, line in enumerate(lines) if line.startswith("   1a)"))
-    assert lines[first + 2] == "       edge held in 68% of 1,000 simulated match conditions"
-    assert "       edge held in 61% of 1,000 simulated match conditions" in lines
-    # An entry without an assessment shows no survival line rather than a made-up one.
-    assert text.count("simulated match conditions") == 2
+    assert lines[first + 2] == "       model estimate 60%* | market implied 50% | EV estimate +8%*"
+    assert lines[first + 3] == "       edge held in 68% of 1,000 simulated match conditions*"
+    assert "       model estimate 55%* | market implied 50% | EV estimate +5%*" in lines
+    assert "       edge held in 61% of 1,000 simulated match conditions*" in lines
+    # An entry without an assessment shows no numbers rather than made-up ones.
+    assert text.count("simulated match conditions") == 2 and text.count("model estimate") == 2
+    assert text.count(EXPERIMENT_FOOTNOTE) == 1 and text.index(EXPERIMENT_FOOTNOTE) < text.index(PAPER_LABEL)
+    assert EXPERIMENT_FOOTNOTE not in format_digest([(a, None, None)])  # nothing experimental is shown, nothing to footnote
+
+
+def test_tip_messages_are_cut_by_size_at_complete_bets_and_every_part_repeats_its_warning(tmp_path: Path) -> None:
+    """Maintainer, 2026-10-11: about 3,500 characters per message, never mid-bet, part number and paper-only line on each."""
+    notifier, session, bets = _digest_notifier(5, tmp_path)
+    assessment = bets[0][1]
+    long_name = "A Very Long Player Name " * 24  # about 580 characters: five such bets cannot share one 3,500-character message
+    contexts = {(1001, 100 + i, "tackles"): AlertContext("Walsall v Port Vale, Sat 10 Oct 14:00 UTC", f"{long_name}{i} (Walsall)")
+                for i in range(5)}
+    alerted, ids = notifier.notify_digest(AllocationReport(), {}, label="PILOT", descriptions=contexts)
+    texts = [call[1]["text"] for call in session.calls]
+    assert alerted == 5 and len(texts) == len(ids) > 1
+    assert all(len(text) <= TIP_TARGET_CHARS for text in texts), [len(t) for t in texts]
+    for number, text in enumerate(texts, start=1):
+        assert f"TACKLE (message {number} of {len(texts)})" in text.splitlines()[1]
+        assert PAPER_LABEL in text and text.endswith(USAGE)
+        assert EXPERIMENT_FOOTNOTE in text  # the model's numbers are on every part, so is their warning
+    shown = [line for text in texts for line in text.splitlines() if re.match(r"^ +\d+[a-z]\) ", line)]
+    assert len(shown) == 5 and len(set(shown)) == 5  # every bet exactly once: none cut, none repeated
+    assert len(SentAlertStore(tmp_path / "sent.jsonl").load()) == 5
+    assert assessment.survival_rate > 0.6
+
+
+def test_split_tips_respects_both_the_bet_count_and_the_size_and_keeps_order() -> None:
+    a, b, c = _tip_directives()
+    entries = [(replace(a, player_id=i), None, None) for i in range(7)]
+    assert [len(chunk) for chunk in split_tips(entries, 3, lambda e: "x" * 10)] == [3, 3, 1]  # count cap
+    sized = split_tips(entries, 5, lambda e: "x" * (100 * len(e)), limit=250)  # two bets fit, three do not
+    assert [len(chunk) for chunk in sized] == [2, 2, 2, 1] and [e[0].player_id for chunk in sized for e in chunk] == list(range(7))
+    assert [len(chunk) for chunk in split_tips(entries[:2], 5, lambda e: "x" * 9999, limit=100)] == [1, 1]  # one bet alone is never cut
+    assert split_tips([], 5, lambda e: "") == []
+    with pytest.raises(ValueError, match="positive"):
+        split_tips(entries, 0, lambda e: "")
 
 
 def test_a_tip_message_holds_one_market_and_names_fouls() -> None:

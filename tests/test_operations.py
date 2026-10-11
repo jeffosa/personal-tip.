@@ -149,7 +149,7 @@ def test_a_daily_backup_that_stops_running_is_flagged_after_26_hours() -> None:
 SCHEDULED_SCRIPTS: dict[str, tuple[str, tuple[str, ...]]] = {
     "telegram_status.cmd": ("status", ("results", "pilot-results", "fx-refresh", "status-report", "scan-no-odds", "scan",
                                        "pilot-scan-no-odds", "pilot-scan-stale", "pilot-scan")),
-    "ledger_poll.cmd": ("ledger", ("poll", "closing-prices", "lineups", "settle")),
+    "ledger_poll.cmd": ("ledger", ("poll", "closing-prices", "lineups", "settle", "pilot-closing", "pilot-settle")),
     "backup.cmd": ("backup", ("backup", "github-push")),
 }
 
@@ -284,6 +284,19 @@ def test_the_backup_covers_the_prediction_log_and_the_t60_team_sheets(tmp_path: 
         assert hashlib.sha256((folder / "state" / name).read_bytes()).hexdigest() == manifest["state"][name]["sha256"]
 
 
+def test_the_backup_covers_every_pilot_evidence_file() -> None:
+    """Audit 2026-10-11: the pilot scan's alerts, paper bets, tips, predictions, closing prices and refusals are evidence
+    (and the only record of what was tipped), so each file name its module writes must be in the backup list."""
+    from prop_alpha.alerts import ladder_scan, pilot_closing, pilot_ledger
+    from prop_alpha.ingestion import results
+
+    backup = _backup_module()
+    written = {ladder_scan.PILOT_STATE_FILE.name, ladder_scan.PILOT_INDEX_FILE.name, ladder_scan.PILOT_DELIVERY_FILE.name,
+               ladder_scan.PILOT_PREDICTIONS_FILE.name, pilot_ledger.PILOT_BETS_FILE.name, pilot_ledger.PILOT_TIPS_FILE.name,
+               pilot_ledger.PILOT_CLOSING_FILE.name, pilot_closing.HANDLED_FILE.name, results.PILOT_REFUSED_FILE.name}
+    assert written <= set(backup.STATE_FILES), sorted(written - set(backup.STATE_FILES))
+
+
 def test_absent_prediction_and_lineup_files_are_skipped_safely(tmp_path: Path) -> None:
     """Before the first scan or T-60 capture the files do not exist: that is not an error and not in the manifest.
     A later backup picks each up as soon as it exists."""
@@ -389,3 +402,46 @@ def test_the_backup_folder_comes_from_the_environment_then_env_and_must_exist(tm
     with pytest.raises(ValueError, match="not an existing folder"):
         backup.backup_dir_setting({}, env_file)
     assert not (tmp_path / "OneDrive" / "typo").exists()
+
+
+def _pilot_runner(exists: bool, calls: list[list[str]], pilot_listing: str = LISTING) -> Any:
+    def runner(command: Sequence[str]) -> str:
+        calls.append(list(command))
+        if "-c" in command:
+            return "1\n" if exists else ""
+        if "--list" in command:
+            return pilot_listing if "prop_alpha_pilot.dump" in command[-1] else LISTING
+        Path(command[command.index("-f") + 1]).write_bytes(b"PGDMP " + command[command.index("-d") + 1].encode())
+        return ""
+    return runner
+
+
+def test_the_pilot_database_is_dumped_checked_and_listed_in_the_manifest(tmp_path: Path) -> None:
+    """Audit 2026-10-11, finding 5: prop_alpha_pilot was in no backup."""
+    backup = _backup_module()
+    calls: list[list[str]] = []
+    folder = backup.backup(tmp_path / "backups", _state(tmp_path), NOW, runner=_pilot_runner(True, calls),
+                           pilot_db=backup.PILOT_DB)
+    manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    dump = folder / backup.PILOT_DUMP_NAME
+    assert dump.read_bytes() == b"PGDMP prop_alpha_pilot"
+    assert manifest["pilot_dump"] == {"database": "prop_alpha_pilot", "bytes": dump.stat().st_size,
+                                      "sha256": hashlib.sha256(dump.read_bytes()).hexdigest()}
+    assert (folder / "prop_alpha.dump").read_bytes() == b"PGDMP prop_alpha"  # the working dump is unchanged
+    assert sum(1 for call in calls if "-Fc" in call) == 2 and not any("password" in " ".join(c).lower() for c in calls)
+
+
+def test_a_server_without_the_pilot_database_still_backs_up_and_a_bad_pilot_dump_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    backup = _backup_module()
+    folder = backup.backup(tmp_path / "backups", _state(tmp_path), NOW, runner=_pilot_runner(False, []),
+                           pilot_db=backup.PILOT_DB)
+    assert "pilot_dump" not in json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    assert "no prop_alpha_pilot database" in capsys.readouterr().out
+    partial = "\n".join(line for line in LISTING.splitlines() if "player_match_stats" not in line)
+    with pytest.raises(ValueError, match="missing table data for: player_match_stats"):
+        backup.backup(tmp_path / "backups2", _state(tmp_path / "s2"), NOW, runner=_pilot_runner(True, [], partial),
+                      pilot_db=backup.PILOT_DB)
+    with pytest.raises(ValueError, match="plain database name"):
+        backup.database_exists("x'; DROP DATABASE prop_alpha; --", _pilot_runner(True, []))
