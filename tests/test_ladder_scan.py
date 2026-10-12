@@ -622,3 +622,86 @@ def test_the_heartbeat_records_what_the_status_report_shows() -> None:
     assert ladder_scan.heartbeat_record(summary, NOW) == {
         "at": NOW.isoformat(), "window_end": KICKOFF.isoformat(), "fixtures": 2, "players_priced": 40, "quotes": 12,
         "tips": 1, "failures": 1, "stale_leagues": ["Scottish Championship"], "odds_unavailable": True}
+
+
+# ---------------- fixtures given by hand (2026-10-12: the Sportmonks plan stopped listing Brazil Serie A) ----------------
+class _NoSportmonks:
+    def get_json(self, path: str) -> dict[str, Any]:
+        raise AssertionError(f"a run with fixtures given by hand must not call Sportmonks ({path})")
+
+
+def _patch_history(monkeypatch: pytest.MonkeyPatch, latest: Mapping[str, datetime | None]) -> list[tuple[str, Any]]:
+    """Each club's latest stored match (by Sportmonks team id); records every query."""
+    queries: list[tuple[str, Any]] = []
+
+    class _Conn:
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def cursor(self) -> Any:
+            return self
+
+        def execute(self, sql: str, params: Any = None) -> None:
+            queries.append((sql, params))
+
+        def fetchone(self) -> tuple[datetime | None]:
+            return (latest.get(queries[-1][1][0]),)
+
+        def close(self) -> None:
+            return None
+
+    import psycopg2
+
+    monkeypatch.setattr(psycopg2, "connect", lambda *args, **kwargs: _Conn())
+    monkeypatch.setattr(scan, "load_slate_inputs", lambda cur, fixture: _inputs())
+    return queries
+
+
+def test_a_fixture_is_given_by_hand_as_seven_fields() -> None:
+    spec = "Brazil Serie A|19621780|710|3432|Chapecoense|Athletico PR|2026-10-12T22:30:00+00:00"
+    assert ladder_scan.parse_manual_fixture(spec) == UpcomingFixture(
+        19621780, "Brazil Serie A", "710", "3432", "Chapecoense", "Athletico PR", datetime(2026, 10, 12, 22, 30, tzinfo=timezone.utc))
+    with pytest.raises(ValueError, match="7 fields"):
+        ladder_scan.parse_manual_fixture("Brazil Serie A|19621780|710|3432")
+    with pytest.raises(ValueError, match="not a pilot league"):
+        ladder_scan.parse_manual_fixture(spec.replace("Brazil Serie A", "League One"))
+
+
+def test_fixtures_given_by_hand_skip_sportmonks_and_tip_only_for_that_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fresh = NOW - timedelta(days=4)
+    queries = _patch_history(monkeypatch, {"76": fresh, "348": fresh})
+    store = SentAlertStore(tmp_path / "mock.jsonl")
+    notifier = _Recording(store)
+    summary = _run(tmp_path, notifier, store, client=_NoSportmonks(), manual=[FIXTURE], tip_leagues=["Brazil Serie A"])
+    assert ladder_scan.TIP_LEAGUES == frozenset()  # the standing setting is untouched
+    assert (summary.window_start, summary.window_end) == (NOW, KICKOFF + timedelta(minutes=1))
+    assert [params for sql, params in queries if sql == ladder_scan.LATEST_STORED_SQL] == [("76", KICKOFF), ("348", KICKOFF)]
+    text = ladder_scan.summary_text(summary, "")
+    assert "Fixtures given by hand (--fixture)" in text and "history stored to 09 Oct" in text
+    assert "Tipped FOR THIS RUN ONLY (maintainer's choice): tackles in Brazil Serie A; the standing setting is paused" in text
+    assert summary.players_priced >= 1 and summary.quotes >= 1  # tipping on for the run: quotes reach the allocator
+    paused = _run(tmp_path / "p", _Recording(SentAlertStore(tmp_path / "p.jsonl")), SentAlertStore(tmp_path / "p.jsonl"),
+                  client=_NoSportmonks(), manual=[FIXTURE])
+    assert paused.quotes == 0 and "Tipped: nothing (tipping paused" in ladder_scan.summary_text(paused, "")
+
+
+def test_a_fixture_given_by_hand_with_stale_history_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_history(monkeypatch, {"76": NOW - timedelta(days=4), "348": NOW - timedelta(days=11)})
+    store = SentAlertStore(tmp_path / "mock.jsonl")
+    summary = _run(tmp_path, _Recording(store), store, client=_NoSportmonks(), manual=[FIXTURE], tip_leagues=["Brazil Serie A"])
+    assert summary.stale_leagues == ["Brazil Serie A"] and summary.players_priced == 0 and summary.alerts_sent == 0
+    assert "older than 10 days or missing" in summary.failures[0]
+    with pytest.raises(ValueError, match="already kicked off"):
+        _run(tmp_path, _Recording(store), store, client=_NoSportmonks(), manual=[replace(FIXTURE, kickoff_at=NOW)])
+
+
+def test_tip_is_refused_without_fixtures_given_by_hand(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        ladder_scan.main(["--odds", "mock", "--tip", "Brazil Serie A"])
+    assert "--tip is a one-off: it works only with --fixture" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        ladder_scan.main(["--odds", "mock", "--fixture", "Brazil Serie A|1|2"])
+    assert "invalid parse_manual_fixture value: 'Brazil Serie A|1|2'" in capsys.readouterr().err
