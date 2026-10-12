@@ -118,7 +118,8 @@ def test_reconcile_settlements_reads_only_confirmed_bets_and_finds_the_override(
     store = _store(tmp_path)
     asked: list[list[int]] = []
 
-    def rows(dsn: str, bets: Sequence[PlacedBet]) -> dict[tuple[int, int], Any]:
+    def rows(dsn: str, bets: Sequence[PlacedBet], settlement_sql: str = ledger.SETTLEMENT_SQL) -> dict[tuple[int, int], Any]:
+        assert settlement_sql == ledger.SETTLEMENT_SQL  # the League One/Two ledger keeps tackles_attempted
         asked.append([bet.bet_id for bet in bets])
         return {(9001, 7): ("final", 90, 2, 0)}
 
@@ -134,7 +135,7 @@ def test_the_reconcile_command_exits_1_on_a_discrepancy(tmp_path: Path, monkeypa
                                                         capsys: pytest.CaptureFixture[str]) -> None:
     store = _store(tmp_path)
     monkeypatch.setattr(ledger, "PlacedBetStore", lambda: store)
-    monkeypatch.setattr(ledger, "read_settlement_rows", lambda dsn, bets: {(9001, 7): ("final", 90, 2, 0)})
+    monkeypatch.setattr(ledger, "read_settlement_rows", lambda dsn, bets, sql=ledger.SETTLEMENT_SQL: {(9001, 7): ("final", 90, 2, 0)})
     assert ledger.main(["--reconcile"]) == 1
     out = capsys.readouterr().out
     assert "#1 DISCREPANCY" in out and "#2 AGREE" in out and "#3" not in out and "FAIL" in out
