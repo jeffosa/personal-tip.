@@ -355,6 +355,28 @@ def collect_pilot_odds(
     return coverage, notes, True
 
 
+# Fixtures given by hand (--fixture, 2026-10-12: the Sportmonks plan stopped listing Brazil Serie A): each club's latest stored
+# final match must be at most this old, or the fixture is refused as stale (the listing-based freshness check needs Sportmonks).
+MANUAL_HISTORY_MAX_AGE: Final[timedelta] = timedelta(days=10)
+LATEST_STORED_SQL: Final[str] = """
+    SELECT max(f.kickoff_at) FROM prop_alpha.fixtures f
+    JOIN prop_alpha.teams t ON t.team_id IN (f.home_team_id, f.away_team_id)
+    WHERE t.vendor_team_uid = %s AND f.status = 'final' AND f.kickoff_at < %s
+"""
+
+
+def parse_manual_fixture(raw: str) -> UpcomingFixture:
+    """'league|sportmonks fixture id|home team id|away team id|home|away|kickoff (ISO, UTC)' -> UpcomingFixture."""
+    parts = raw.split("|")
+    if len(parts) != 7:
+        raise ValueError(f"--fixture needs 7 fields separated by '|', got {len(parts)}: {raw!r}")
+    league, fixture_id, home_uid, away_uid, home, away, kickoff = (part.strip() for part in parts)
+    if league not in sportmonks.PILOT_LEAGUES_WANTED.values():
+        raise ValueError(f"{league!r} is not a pilot league")
+    return UpcomingFixture(int(fixture_id), league, home_uid, away_uid, home, away,
+                           datetime.fromisoformat(kickoff).astimezone(timezone.utc))
+
+
 def summary_text(summary: scan.ScanSummary, label: str) -> str:
     """The run's one-message summary (not scan.ScanSummary.text, whose wording is the League One/Two scan's)."""
     lines = [
@@ -372,7 +394,11 @@ def summary_text(summary: scan.ScanSummary, label: str) -> str:
         if summary.unquoted_matches:
             lines.append(f"Tip-league matches with no bookmaker price (nothing to qualify against): {summary.unquoted_matches}")
     lines += summary.odds_notes
-    if summary.fixtures:
+    if summary.fixtures and summary.tip_override is not None:
+        lines.append(f"Tipped FOR THIS RUN ONLY (maintainer's choice): {', '.join(sorted(ALERT_MARKETS))} in "
+                     f"{', '.join(summary.tip_override) or 'nothing'}; the standing setting is "
+                     + (", ".join(sorted(TIP_LEAGUES)) if TIP_LEAGUES else "paused"))
+    elif summary.fixtures:
         lines.append(f"Tipped: {', '.join(sorted(ALERT_MARKETS))} in {', '.join(sorted(TIP_LEAGUES))} only (fouls are priced, never tipped)"
                      if TIP_LEAGUES else "Tipped: nothing (tipping paused by the maintainer on 2026-10-12); every pilot league is "
                      "priced and logged for evaluation")
@@ -387,13 +413,18 @@ def run_ladder_scan(
     odds: str = "mock", odds_client: Any | None = None, books: Sequence[str] = DEFAULT_BOOKMAKERS,
     state_dir: Path = scan.STATE_DIR, currency: str, book_rate: ExchangeRate | None = None,
     predictions: PredictionLog | None = None, paper_bets: PlacedBetStore | None = None,
-    tips_file: Path = pilot_ledger.PILOT_TIPS_FILE,
+    tips_file: Path = pilot_ledger.PILOT_TIPS_FILE, manual: Sequence[UpcomingFixture] = (),
+    tip_leagues: Collection[str] | None = None,
 ) -> scan.ScanSummary:
     """One scan of the pilot-league matches kicking off in [now, next 4-hour boundary). `store` is the pilot (or mock)
     alert store: exposure is net of its stakes only. A league whose results are missing from the pilot database is
     skipped and recorded in `summary.failures` (the caller exits STALE_EXIT). With `predictions`, every fixture's Gate 2 lines
     are logged before anything is sent (a failed write raises, so no tip goes out on a price that was not recorded); with
-    `paper_bets`, each tip is recorded as a paper bet just before its message is sent (alerts/pilot_ledger.py)."""
+    `paper_bets`, each tip is recorded as a paper bet just before its message is sent (alerts/pilot_ledger.py).
+
+    With `manual` fixtures (given by hand when the Sportmonks plan does not list their league) nothing is listed through
+    Sportmonks: the window runs from `now` to the last kickoff, and a fixture is refused when either club's latest stored
+    match is older than MANUAL_HISTORY_MAX_AGE. `tip_leagues` replaces TIP_LEAGUES for this run only, and says so."""
     import psycopg2
 
     if currency not in SUPPORTED_CURRENCIES:
@@ -405,37 +436,83 @@ def run_ladder_scan(
     if book_rate.quote != currency or book_rate.base not in (BOOK_CURRENCY, currency):
         raise ValueError(f"rate {book_rate.describe()} does not convert {BOOK_CURRENCY} into {currency}")
     rate = book_rate
-    start, end = scan_window(now)
+    tipping = TIP_LEAGUES if tip_leagues is None else frozenset(tip_leagues)
+    if manual:
+        if any(fixture.kickoff_at <= now for fixture in manual):
+            raise ValueError("a fixture given by hand has already kicked off")
+        start, end = now, max(fixture.kickoff_at for fixture in manual) + timedelta(minutes=1)
+    else:
+        start, end = scan_window(now)
     conversion = "" if rate.identity else f"; book limits converted at {rate.describe()}"
-    summary = scan.ScanSummary(start, end, alert_cap=max_alerts, bankroll=f"{currency} {bankroll:,.2f}{conversion}")
+    summary = scan.ScanSummary(start, end, alert_cap=max_alerts, bankroll=f"{currency} {bankroll:,.2f}{conversion}",
+                               tip_override=None if tip_leagues is None else tuple(sorted(tipping)))
+    if manual:
+        return _scan_slate(now, list(manual), None, dsn, notifier, store, bankroll, label, max_alerts, summary, tipping,
+                           start, end, rate, currency, odds=odds, odds_client=odds_client, books=books, state_dir=state_dir,
+                           predictions=predictions, paper_bets=paper_bets, tips_file=tips_file)
     leagues, absent = pilot_leagues(client)
     if absent:
         summary.odds_notes.append(f"Not in the Sportmonks plan, not scanned: {', '.join(name for name in absent)}")
     if not leagues:
         return summary
     listed = scan.fetch_upcoming(client, start, end, leagues)
-    summary.fixtures = [f"{f.name} {f.kickoff_at:%H:%M} ({f.league})" for f in listed]
     if not listed:
         return summary
+    return _scan_slate(now, listed, finished_listing(client, now, leagues), dsn, notifier, store, bankroll, label, max_alerts,
+                       summary, tipping, start, end, rate, currency, odds=odds, odds_client=odds_client, books=books,
+                       state_dir=state_dir, predictions=predictions, paper_bets=paper_bets, tips_file=tips_file)
+
+
+def _scan_slate(
+    now: datetime, listed: list[UpcomingFixture], finished: Sequence[tuple[str, datetime, str]] | None, dsn: str,
+    notifier: TelegramNotifier | None, store: SentAlertStore, bankroll: float, label: str, max_alerts: int,
+    summary: scan.ScanSummary, tipping: frozenset[str], start: datetime, end: datetime, rate: ExchangeRate, currency: str, *,
+    odds: str, odds_client: Any | None, books: Sequence[str], state_dir: Path, predictions: PredictionLog | None,
+    paper_bets: PlacedBetStore | None, tips_file: Path,
+) -> scan.ScanSummary:
+    """run_ladder_scan from the listed fixtures on. `finished` is the Sportmonks listing of recent finished matches for the
+    freshness check, or None for fixtures given by hand, which are checked club by club instead (MANUAL_HISTORY_MAX_AGE)."""
+    import psycopg2
+
+    summary.fixtures = [f"{f.name} {f.kickoff_at:%H:%M} ({f.league})" for f in listed]
     summary.odds_notes.append("Leagues: " + ", ".join(f"{name} {count}" for name, count in sorted(Counter(f.league for f in listed).items())))
-    finished = finished_listing(client, now, leagues)
+    if finished is None:
+        summary.odds_notes.append("Fixtures given by hand (--fixture): not listed through Sportmonks")
     conn = psycopg2.connect(dsn, options="-c statement_timeout=30000 -c default_transaction_read_only=on",
                             connect_timeout=10)
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT vendor_fixture_uid FROM prop_alpha.fixtures WHERE status = 'final'")
-                stored = {str(row[0]) for row in cur.fetchall()}
-                refused = load_refused(state_dir / PILOT_REFUSED_FILE.name)
-                stale = missing_by_league(finished, stored, now, refused)
-                unloadable = Counter(league for uid, _, league in finished if uid in refused and uid not in stored)
-                if unloadable:
-                    summary.odds_notes.append("Recent matches the data feed cannot load (no tackles or other data defect), priced "
-                                              "without them: " + ", ".join(f"{name} {count}" for name, count in sorted(unloadable.items())))
-                for league, missing in sorted(stale.items()):
-                    summary.failures.append(stale_message(league, missing))
-                    summary.stale_leagues.append(league)
-                fixtures = [f for f in listed if f.league not in stale]
+                if finished is None:
+                    fixtures = []
+                    for fixture in listed:
+                        latest: list[datetime] = []
+                        for team in (fixture.home_team_uid, fixture.away_team_uid):
+                            cur.execute(LATEST_STORED_SQL, (team, fixture.kickoff_at))
+                            found = cur.fetchone()
+                            if found is not None and found[0] is not None:
+                                latest.append(found[0].astimezone(timezone.utc))
+                        if len(latest) < 2 or min(latest) < now - MANUAL_HISTORY_MAX_AGE:
+                            summary.failures.append(f"{fixture.name} skipped, not priced: a club's latest stored match is older "
+                                                    f"than {MANUAL_HISTORY_MAX_AGE.days} days or missing")
+                            summary.stale_leagues.append(fixture.league)
+                        else:
+                            fixtures.append(fixture)
+                            summary.odds_notes.append(f"{fixture.name}: both clubs' history stored to {min(latest):%d %b}")
+                else:
+                    cur.execute("SELECT vendor_fixture_uid FROM prop_alpha.fixtures WHERE status = 'final'")
+                    stored = {str(row[0]) for row in cur.fetchall()}
+                    refused = load_refused(state_dir / PILOT_REFUSED_FILE.name)
+                    stale = missing_by_league(finished, stored, now, refused)
+                    unloadable = Counter(league for uid, _, league in finished if uid in refused and uid not in stored)
+                    if unloadable:
+                        summary.odds_notes.append("Recent matches the data feed cannot load (no tackles or other data defect), "
+                                                  "priced without them: " + ", ".join(f"{name} {count}"
+                                                                                      for name, count in sorted(unloadable.items())))
+                    for league, missing in sorted(stale.items()):
+                        summary.failures.append(stale_message(league, missing))
+                        summary.stale_leagues.append(league)
+                    fixtures = [f for f in listed if f.league not in stale]
                 slate = [(fixture, load_pilot_inputs(cur, fixture)) for fixture in fixtures]
     finally:
         conn.close()
@@ -451,7 +528,7 @@ def run_ladder_scan(
         real_quotes = coverage.quotes
 
         def quotes_for(fixture: UpcomingFixture, projections: Mapping[ProjectionKey, FactorProjection]) -> list[LiveOddsQuote]:
-            if fixture.league not in TIP_LEAGUES:
+            if fixture.league not in tipping:
                 return []
             return scan.in_bankroll_currency([q for q in real_quotes if q.fixture_id == fixture.fixture_id
                                               and q.market_type in ALERT_MARKETS], rate)
@@ -460,7 +537,7 @@ def run_ladder_scan(
         rng = np.random.default_rng(seed)
 
         def quotes_for(fixture: UpcomingFixture, projections: Mapping[ProjectionKey, FactorProjection]) -> list[LiveOddsQuote]:
-            if fixture.league not in TIP_LEAGUES:
+            if fixture.league not in tipping:
                 return []
             return scan.in_bankroll_currency([q for q in mock_quotes(projections, now, rng)
                                               if q.market_type in ALERT_MARKETS], rate)
@@ -486,7 +563,7 @@ def run_ladder_scan(
             continue
         if predictions is not None and projections:
             predictions.record(fixture, projections, now, start, digest=pilot_settings_digest())
-        if odds == "oddspapi" and fixture.league in TIP_LEAGUES and not quotes and projections:
+        if odds == "oddspapi" and fixture.league in tipping and not quotes and projections:
             summary.unquoted_matches += 1
         summary.players_priced += len({key[1] for key in projections})
         summary.quotes += len(quotes)
@@ -528,9 +605,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="oddspapi: real bet365 prices; mock: model price plus noise, labelled MOCK")
     parser.add_argument("--send", action="store_true", help="send tips and the summary to Telegram")
     parser.add_argument("--at", type=datetime.fromisoformat, default=None, help="simulated UTC run time (testing)")
+    parser.add_argument("--fixture", action="append", default=[], metavar="SPEC", type=parse_manual_fixture,
+                        help="scan this fixture instead of the Sportmonks listing (repeatable): "
+                             "'league|sportmonks fixture id|home team id|away team id|home|away|kickoff ISO UTC'")
+    parser.add_argument("--tip", action="append", default=None, metavar="LEAGUE",
+                        help="tip this league for this run only, whatever TIP_LEAGUES says (repeatable; needs --fixture)")
     args = parser.parse_args(argv)
     if args.at is not None and args.odds == "oddspapi":
         parser.error("--at simulates the run time, so it works only with --odds mock; real odds are priced now")
+    if args.tip is not None and not args.fixture:
+        parser.error("--tip is a one-off: it works only with --fixture")
+    manual: list[UpcomingFixture] = args.fixture
     now = args.at.astimezone(timezone.utc) if args.at is not None else datetime.now(timezone.utc)
     currency = bankroll_currency()
     book_rate = book_to_bankroll(currency, now.date())
@@ -557,6 +642,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Mock runs keep no record: their tips are not tips. Real runs log predictions and record paper bets.
             predictions=PredictionLog(PILOT_PREDICTIONS_FILE) if real else None,
             paper_bets=PlacedBetStore(pilot_ledger.PILOT_BETS_FILE) if real and args.send else None,
+            manual=manual, tip_leagues=args.tip,
         )
     finally:
         client.close()
@@ -564,7 +650,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             odds_client.close()
     text = summary_text(summary, label)
     print(text)
-    if real:
+    if real and not manual:  # the heartbeat is the scheduled scan's; a run by hand does not stand in for it
         PILOT_HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
         PILOT_HEARTBEAT_FILE.write_text(json.dumps(heartbeat_record(summary, now)), encoding="utf-8")
     # Every 4 hours most windows have no pilot match: the chat hears about a run only when there was something to say.

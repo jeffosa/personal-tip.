@@ -220,6 +220,9 @@ class ScanSummary:
     # Leagues the pilot scan (alerts/ladder_scan.py) skipped because their results were missing: its main() exits STALE_EXIT
     # on these, not on the wording of a failure line (audit 2026-10-11, finding 12).
     stale_leagues: list[str] = field(default_factory=list)
+    # The pilot scan's leagues tipped for this run only (its --tip, maintainer's per-run choice), when not the standing
+    # setting; None means the standing setting (ladder_scan.TIP_LEAGUES) applied.
+    tip_override: tuple[str, ...] | None = None
 
     def text(self, label: str) -> str:
         lines = [
