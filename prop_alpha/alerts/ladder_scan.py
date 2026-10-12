@@ -16,8 +16,9 @@ It is the League One/Two scan (alerts/scan.py) with these differences, and nothi
   Serie A's own fit; the English Championship's 21.1 for tackles and 1000 for fouls for the Scottish leagues, which have no
   backtest at all). These are NOT the frozen League One/Two settings and are not frozen themselves: the model_freeze
   fingerprint and the League One/Two lockbox are untouched, and no pilot lockbox exists.
-* Tips: only leagues in TIP_LEAGUES can produce a tip (Brazil Serie A, turned on by the maintainer on 2026-10-11 after seeing its
-  backtest). The Scottish leagues are scanned, priced and reported, never tipped.
+* Tips: only leagues in TIP_LEAGUES can produce a tip. It is empty: Brazil Serie A was turned on by the maintainer on 2026-10-11
+  and paused on 2026-10-12 until the gap between the model and the bookmakers' prices is explained. Every pilot league is
+  scanned, priced and logged for evaluation; nothing is tipped.
 * Odds are ladders (oddspapi.ladder_prices) or over/under lines (oddspapi.prop_prices): both parsers read the same
   reply. A "k+" step is the Over of line k - 0.5 on its own; the "0" step is the Under of 0.5. They go through the same
   quote building, allocator and high-value screen as the other scan.
@@ -105,7 +106,9 @@ ALERT_MARKETS: Final[frozenset[str]] = frozenset({"tackles"})
 # backtest (tackles Brier skill +0.06 to +0.08 over the league average, slopes 0.93-1.02, the strict PRD bin test failing) and
 # that the bookmakers' prices run far above the model's counts (mean expected profit about -60%). The Scottish leagues have
 # neither a backtest nor a bookmaker price: they are scanned and priced, never tipped. Adding a league here is a maintainer decision.
-TIP_LEAGUES: Final[frozenset[str]] = frozenset({"Brazil Serie A"})
+# PAUSED by the maintainer on 2026-10-12 ("pause brazil tipping and diagnose the gap"): the model sits at about half the books'
+# level (0.22 v 0.38-0.40), so its few tips were the players it most likely misjudges. Re-adding "Brazil Serie A" restores it.
+TIP_LEAGUES: Final[frozenset[str]] = frozenset()
 BOOKMAKERS_ENV: Final[str] = "LADDER_BOOKMAKERS"
 # Brazil Serie A: Betway lists the tackles and fouls ladders for every fixture seen on 2026-10-11 (7 of 7), bet365 for 4 of 13.
 DEFAULT_BOOKMAKERS: Final[tuple[str, ...]] = ("bet365", "betway")
@@ -310,8 +313,8 @@ def summary_text(summary: scan.ScanSummary, label: str) -> str:
     lines += summary.odds_notes
     if summary.fixtures:
         lines.append(f"Tipped: {', '.join(sorted(ALERT_MARKETS))} in {', '.join(sorted(TIP_LEAGUES))} only (fouls are priced, never tipped)"
-                     if TIP_LEAGUES else "Tipped: nothing yet; every pilot league is priced for evaluation until the maintainer turns "
-                     "a league on after its backtest")
+                     if TIP_LEAGUES else "Tipped: nothing (tipping paused by the maintainer on 2026-10-12); every pilot league is "
+                     "priced and logged for evaluation")
     lines += [f"Could not price {failure}" for failure in summary.failures]
     lines.append(PAPER_LABEL)
     return "\n".join(lines)
