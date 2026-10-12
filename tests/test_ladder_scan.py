@@ -132,12 +132,19 @@ def _run(tmp_path: Path, notifier: _Recording, store: SentAlertStore, **kwargs: 
 
 
 # ---------------- pricing ----------------
-def test_only_brazil_may_tip_and_an_empty_tip_list_says_nothing_is_tipped(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The maintainer turned Brazil Serie A on (2026-10-11); the Scottish leagues have no backtest and no bookmaker price."""
-    assert ladder_scan.TIP_LEAGUES == frozenset({"Brazil Serie A"})
+def _tip_brazil(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tipping is paused (TIP_LEAGUES is empty since 2026-10-12); the tests of the tipping path switch Brazil back on."""
+    monkeypatch.setattr(ladder_scan, "TIP_LEAGUES", frozenset({"Brazil Serie A"}))
+
+
+def test_tipping_is_paused_and_the_summary_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The maintainer turned Brazil Serie A on (2026-10-11) and paused it (2026-10-12) until the model-v-bookmaker gap is
+    explained; the Scottish leagues have no backtest and no bookmaker price."""
+    assert ladder_scan.TIP_LEAGUES == frozenset()
+    assert "Tipped: nothing (tipping paused by the maintainer on 2026-10-12)" in ladder_scan.summary_text(
+        scan.ScanSummary(NOW, NOW, fixtures=["x"]), "")
+    _tip_brazil(monkeypatch)
     assert "Tipped: tackles in Brazil Serie A only" in ladder_scan.summary_text(scan.ScanSummary(NOW, NOW, fixtures=["x"]), "")
-    monkeypatch.setattr(ladder_scan, "TIP_LEAGUES", frozenset())
-    assert "Tipped: nothing yet" in ladder_scan.summary_text(scan.ScanSummary(NOW, NOW, fixtures=["x"]), "")
 
 
 def test_the_pilot_prices_with_its_own_settings_by_league_not_the_frozen_ones() -> None:
@@ -278,6 +285,7 @@ def test_the_ladder_catalogue_cache_round_trips_and_a_damaged_one_is_refused(tmp
 def test_a_mock_scan_tips_tackles_in_the_tip_format_with_the_pilot_label_and_its_own_footer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _tip_brazil(monkeypatch)
     _patch_database(monkeypatch, stored={FINISHED_UID})
     monkeypatch.setattr(ladder_scan, "mock_quotes", _generous_mock_quotes)
     store = SentAlertStore(tmp_path / "mock.jsonl")
@@ -346,6 +354,7 @@ def _names_cache(tmp_path: Path) -> None:
 def test_a_real_ladder_price_above_the_models_becomes_a_pilot_tip_and_is_archived(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _tip_brazil(monkeypatch)
     _patch_database(monkeypatch, stored={FINISHED_UID})
     _names_cache(tmp_path)
     # A juicy ladder for the Scottish Premiership match as well: it is matched, priced and never tipped.
@@ -368,6 +377,22 @@ def test_a_real_ladder_price_above_the_models_becomes_a_pilot_tip_and_is_archive
     # The short-priced Away Starter ladder (1.10 for 1+) is no edge: it is never tipped.
     assert "Away Starter" not in notifier.texts[0] and "Celtic" not in notifier.texts[0]
     assert {alert.key[0] for alert in store.load()} == {9101}
+
+
+def test_while_paused_the_same_juicy_ladder_is_priced_and_archived_but_never_tipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-10-12: with tipping paused, the ladder that tips in the test above is still matched, priced and archived (the
+    evaluation evidence) and its players priced, but nothing is offered to the allocator, sent or recorded."""
+    _patch_database(monkeypatch, stored={FINISHED_UID})
+    _names_cache(tmp_path)
+    odds = _FakeOdds(_ladder_body({"Regular Starter": (2.6, 9.0, 1.45)}))
+    store = SentAlertStore(tmp_path / "pilot.jsonl")
+    notifier = _Recording(store)
+    summary = _run(tmp_path, notifier, store, odds="oddspapi", odds_client=odds)
+    assert summary.players_priced >= 1 and summary.quotes == 0 and odds.requests_sent >= 1  # fetched, not offered for tips
+    assert summary.alerts_sent == 0 and notifier.texts == [] and store.load() == []
+    assert list((tmp_path / ladder_scan.PILOT_ODDS_DIR).glob("*_bet365_pilot.json.gz"))
 
 
 def test_odds_are_not_fetched_below_the_quota_reserve_and_no_tip_is_made(
@@ -394,6 +419,7 @@ def test_a_malformed_ladder_reply_ends_the_run_instead_of_being_guessed(
 
 def test_exposure_is_net_of_pilot_stakes_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Running the same mock scan twice tips each bet once: the first run's alerts are in the store it was given."""
+    _tip_brazil(monkeypatch)
     _patch_database(monkeypatch, stored={FINISHED_UID})
     monkeypatch.setattr(ladder_scan, "mock_quotes", _generous_mock_quotes)
     store = SentAlertStore(tmp_path / "mock.jsonl")
@@ -432,6 +458,7 @@ def test_recorded_vendor_refusals_are_not_stale_but_are_reported(tmp_path: Path,
 
 def test_the_scan_logs_predictions_and_records_every_tip_as_a_paper_bet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Audit 2026-10-11 (finding 3): a pilot tip leaves a prediction log line for every priced line, a paper bet and a tip line."""
+    _tip_brazil(monkeypatch)
     from prop_alpha.alerts.ledger import PlacedBetStore
     from prop_alpha.alerts.predictions import PredictionLog, counts_for_lockbox
 

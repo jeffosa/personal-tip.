@@ -45,6 +45,43 @@ ratios or one match's outcomes.
   **possible, not established**, and a large margin plus longshot shading is an equally live explanation.
 - The 2026-10-08 13:33 UTC archive shows ladders on 3 Championship fixtures (the first archive had 1 of 12).
 
+### 2b. Brazil Serie A ladders against five candidate counts (added 2026-10-12, after tipping was paused)
+
+`scripts/pilot_gap_diagnosis.py` (offline, read-only): the bet365 and Betway tackles ladders archived at 07:35 UTC on
+2026-10-11 (7 Brazil fixtures; 524 player ladders matched to stored players, 394 with 5+ stored starts), against each
+player's own last 20 starts of 70+ minutes in `prop_alpha_pilot`. TA = `tackles_attempted` (what the model prices),
+TW = `tackles_won`, INT = `interceptions`, DP = `dribbled_past` (challenges lost).
+
+| bet365 step | implied | TA | TW | TW+INT | TA+INT | **TA+DP** | implied / TA | implied / TA+DP |
+|---|---|---|---|---|---|---|---|---|
+| 1+ | 0.833 | 0.688 | 0.522 | 0.746 | 0.822 | **0.792** | 1.21 | 1.05 |
+| 2+ | 0.579 | 0.383 | 0.224 | 0.489 | 0.608 | **0.551** | 1.51 | 1.05 |
+| 3+ | 0.372 | 0.193 | 0.079 | 0.283 | 0.408 | **0.358** | 1.93 | 1.04 |
+| 4+ | 0.239 | 0.102 | 0.029 | 0.153 | 0.266 | **0.217** | 2.34 | 1.10 |
+| 5+ | 0.174 | 0.057 | 0.011 | 0.081 | 0.171 | **0.148** | 3.05 | 1.18 |
+
+- **Level.** Under TA+DP, bet365's implied probability is 4-10% above the frequency, rising to 18% at 5+: the pattern of
+  an ordinary margin with longshot shading. Under TA (the model's count) the gap runs from 21% to 205%, which no plausible
+  margin on a 1.20 price explains. Betway is similar (implied / TA+DP 1.02, 0.96, 0.98, 1.16, 1.49).
+- **Shape** (step-to-step ratios, which a margin that scales every price alike does not change): bet365 0.63, 0.58,
+  0.55, 0.57; TA+DP 0.62, 0.56, 0.50, 0.56; TA+INT 0.67, 0.59, 0.56, 0.52; TA 0.47, 0.42, 0.41, 0.42. The book's count
+  falls off far more slowly than TA.
+- **Mean per start** implied by each ladder's shape (Poisson): about 1.9 for both books, against TA 1.3-1.4, TA+DP 2.0-2.1,
+  TA+INT 2.3, TW+INT 1.8.
+
+**Reading (a lead, not a rule):** both books price a count about 45% larger than `tackles_attempted`, closest to
+`tackles_attempted + dribbled_past`, i.e. tackles won plus tackles lost plus challenges lost, which would match an
+Opta-style "tackles attempted" (the bet365 wording in section 1 describes only a won tackle; that is not reconciled).
+TA+INT fits nearly as well on level. Caveats: one snapshot, 7 fixtures; longshot shading is not a scale factor, so the
+shape test is not fully margin-free; no settled result has been compared.
+
+**Why every tip was suspect.** With the model counting about 30% fewer events than the book, almost every line looks
+overpriced to it; the few it called value were players the books priced **below even their own TA history** (Léo
+Pereira 2+ implied 0.23 against 45% of his last 20 starts; Fernando 2+ 0.29 against 50%). The books had a reason the
+model lacks (role, opponent, team style), so the screen selected exactly the players it misjudged. On SportyBet,
+2026-10-11, Léo Pereira and Vitor Roque each made fewer than 2 tackles by that book's count (maintainer's ticket; not a
+bet365 settlement).
+
 ## 3. Evidence table to fill (West Ham United v Queens Park Rangers, 2026-10-09, final 1-1)
 
 Sportmonks counts are filled in from `.prop_alpha_state/pilot/counts_19729059.json`. The last three columns need an
@@ -110,3 +147,5 @@ include players who started, who came on, and who did not play.
 - [ ] Written reply from bet365 support (section 5).
 - [ ] Section 3 filled for at least 5 players, including a substitute and a non-player.
 - [ ] Decision under section 4 recorded, with the date.
+- [ ] Section 2b lead tested against settled results: for named Brazil players, a public Opta-based count (or a bet365
+      settlement) compared with Sportmonks `tackles_attempted`, `+ dribbled_past` and `+ interceptions` for the same match.
