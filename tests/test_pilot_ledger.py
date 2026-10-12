@@ -91,7 +91,7 @@ def test_a_recorded_bookmaker_result_is_reconciled_against_the_automatic_one(
     store, _ = _record(tmp_path)
     monkeypatch.setattr(pilot_ledger, "PILOT_BETS_FILE", store.path)
     monkeypatch.setattr(pilot_ledger, "PILOT_CLOSING_FILE", tmp_path / "closing.jsonl")
-    monkeypatch.setattr(ledger, "read_settlement_rows", lambda dsn, bets: dict(_rows(count=2)))
+    monkeypatch.setattr(ledger, "read_settlement_rows", lambda dsn, bets, sql=ledger.SETTLEMENT_SQL: dict(_rows(count=2)))
     assert pilot_ledger.main(["--record", "1", "won"]) == 0 and pilot_ledger.main(["--record", "2", "lost"]) == 0
     capsys.readouterr()
     items = ledger.reconcile_settlements(store, "postgresql://pilot", NOW)
@@ -128,13 +128,19 @@ def test_reconstructed_paper_bets_are_kept_out_of_the_model_scored_total(tmp_pat
     assert "reconstructed" not in pilot_ledger.results_text(store.settled_bets(), [])
 
 
-def _settle_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sent: list[str], fail: bool = False) -> PlacedBetStore:
+def _settle_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sent: list[str], fail: bool = False,
+                  queries: list[str] | None = None) -> PlacedBetStore:
     store, _ = _record(tmp_path)
     monkeypatch.setattr(pilot_ledger, "PILOT_BETS_FILE", store.path)
     monkeypatch.setattr(pilot_ledger, "PILOT_CLOSING_FILE", tmp_path / "closing.jsonl")
     monkeypatch.setattr(ledger, "DEFAULT_LOCK_FILE", tmp_path / "ledger.lock")  # never the real ledger's lock or queue
     monkeypatch.setattr(ledger, "DEFAULT_ANSWERS_FILE", tmp_path / "answers.jsonl")
-    monkeypatch.setattr(ledger, "read_settlement_rows", lambda dsn, bets: dict(_rows(count=0)))
+    def rows(dsn: str, bets: object, settlement_sql: str = ledger.SETTLEMENT_SQL) -> dict[Any, Any]:
+        if queries is not None:
+            queries.append(settlement_sql)
+        return dict(_rows(count=0))
+
+    monkeypatch.setattr(ledger, "read_settlement_rows", rows)
 
     class _Notifier:
         def __init__(self, config: object) -> None:
@@ -149,6 +155,22 @@ def _settle_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sent: list[st
     monkeypatch.setattr(pilot_ledger, "TelegramNotifier", _Notifier)
     monkeypatch.setattr(pilot_ledger, "load_config", lambda: object())
     return store
+
+
+def test_paper_bets_settle_on_the_pilot_count_and_the_real_ledger_keeps_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-10-12: the pilot prices tackles as tackles attempted plus challenges lost, so its paper bets settle on that count;
+    the League One/Two ledger's query is unchanged."""
+    queries: list[str] = []
+    _settle_setup(tmp_path, monkeypatch, [], queries=queries)
+    assert pilot_ledger.main(["--settle"]) == 0
+    assert queries == [pilot_ledger.PILOT_SETTLEMENT_SQL]
+    assert "(s.tackles_attempted + s.dribbled_past), s.fouls_committed" in pilot_ledger.PILOT_SETTLEMENT_SQL
+    assert "s.minutes_played, s.tackles_attempted, s.fouls_committed" in ledger.SETTLEMENT_SQL
+    for bad in ("SELECT 1", "SELECT s.tackles_attempted, s.tackles_attempted"):
+        with pytest.raises(ValueError, match="exactly one s.tackles_attempted"):
+            pilot_ledger.recount(bad)
 
 
 def test_settle_sends_the_new_results_only_when_asked(

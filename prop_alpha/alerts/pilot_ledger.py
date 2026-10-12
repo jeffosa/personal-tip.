@@ -12,7 +12,8 @@ see these files. The paper P&L is "had the tip been taken at the alerted price a
     python -m prop_alpha.alerts.pilot_ledger --record 3 won      # the bookmaker's result for paper bet 3 (you read it off the site)
     python -m prop_alpha.alerts.pilot_ledger --reconcile         # your recorded results v automatic settlement; exit 1 on a discrepancy
 
-Automatic settlement is the assumed market contract (tackles = Sportmonks `tackles_attempted`, fouls = `fouls_committed`, void if
+Automatic settlement is the assumed market contract (tackles = Sportmonks `tackles_attempted + dribbled_past` since 2026-10-12,
+PILOT_TACKLES_SQL, the count the pilot prices; fouls = `fouls_committed`, void if
 the player does not play, a whole-line count is a push), read from `prop_alpha_pilot`. It is provisional until bookmaker results
 agree: a `--record` result is the bookmaker's, and `--reconcile` says AGREE or DISCREPANCY for each. Only the AGREE count says anything
 about whether the contract is right (alerts/closing is the League One/Two equivalent). Closing prices come from
@@ -47,6 +48,23 @@ from prop_alpha.alerts.replies import (
 from prop_alpha.alerts.telegram import TelegramNotifier, TipLine, load_config
 from prop_alpha.config import DEFAULT_PILOT_DSN, PILOT_DSN_ENV
 from prop_alpha.scanner.slate import UpcomingFixture
+
+# The pilot's tackles count (maintainer, 2026-10-12): tackles attempted plus challenges lost (Sportmonks dribbled_past). The
+# Brazil Serie A bookmakers' ladders price a count about 45% above tackles_attempted alone, and this one fits their level and
+# shape best (MARKET_CONTRACT.md section 2b; a lead, not a verified rule). The pilot prices AND settles on it; the frozen
+# League One/Two model and its ledger keep tackles_attempted.
+PILOT_TACKLES_SQL: Final[str] = "(s.tackles_attempted + s.dribbled_past)"
+
+
+def recount(sql: str) -> str:
+    """`sql` with its one `s.tackles_attempted` replaced by PILOT_TACKLES_SQL; anything else is refused, so a change to the
+    query it copies cannot silently leave the pilot on the other count."""
+    if sql.count("s.tackles_attempted") != 1:
+        raise ValueError(f"expected exactly one s.tackles_attempted in the query, found {sql.count('s.tackles_attempted')}")
+    return sql.replace("s.tackles_attempted", PILOT_TACKLES_SQL)
+
+
+PILOT_SETTLEMENT_SQL: Final[str] = recount(ledger.SETTLEMENT_SQL)
 
 logger = logging.getLogger("prop_alpha.pilot_ledger")
 
@@ -260,14 +278,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"recorded {result.upper()} for paper bet #{bet_id} as the bookmaker's result")
         return 0
     if args.reconcile:
-        items = ledger.reconcile_settlements(store, dsn, now)
+        items = ledger.reconcile_settlements(store, dsn, now, PILOT_SETTLEMENT_SQL)
         lines = [reconciliation_text(bet, item) for bet, item in items if item.outcome != "unconfirmed"]
         print("\n".join([*lines, reconciliation_summary([item for _, item in items])]))
         return 1 if any(item.outcome == "discrepancy" for _, item in items) else 0
     # The real ledger's lock as well: the notice goes through its answer queue (ledger_answers.jsonl), which only one writer
     # may touch at a time.
     with ledger.ledger_lock(lock_for(store)), ledger.ledger_lock(ledger.DEFAULT_LOCK_FILE):
-        settled = ledger.settle(store, dsn, now)
+        settled = ledger.settle(store, dsn, now, PILOT_SETTLEMENT_SQL)
         lines = [settlement_text(bet, settlement) for bet, settlement in settled]
         print("\n".join(lines) if lines else "no open paper bet has a final match in the pilot database")
         if args.send and lines:

@@ -53,8 +53,16 @@ from prop_alpha.modeling.league_level import SeasonTotals, season_of, season_rat
 SEASON_SPLIT: Final[datetime] = datetime.fromisoformat(os.environ.get("BACKTEST_SPLIT", "2026-07-01")).replace(
     tzinfo=timezone.utc)
 LEAGUE_FILTER: Final[str | None] = os.environ.get("BACKTEST_LEAGUE") or None
-LINES: Final[dict[str, tuple[float, ...]]] = {"tackles": (0.5, 1.5, 2.5), "fouls": (0.5, 1.5)}
-COLUMN: Final[dict[str, str]] = {"tackles": "tackles_attempted", "fouls": "fouls_committed"}
+# The tackles count scored (2026-10-12, MARKET_CONTRACT.md section 2b): BACKTEST_TACKLES=attempted (default, what the
+# frozen model prices) or attempted_plus_dribbled_past (tackles attempted plus challenges lost, the pilot ladder count).
+# The wider count is also scored at 3.5, where the bookmakers' ladders still have prices.
+TACKLES_COUNTS: Final[dict[str, str]] = {"attempted": "s.tackles_attempted",
+                                          "attempted_plus_dribbled_past": "(s.tackles_attempted + s.dribbled_past)"}
+TACKLES_COUNT: Final[str] = os.environ.get("BACKTEST_TACKLES", "attempted")
+if TACKLES_COUNT not in TACKLES_COUNTS:
+    raise SystemExit(f"BACKTEST_TACKLES must be one of {', '.join(TACKLES_COUNTS)}, not {TACKLES_COUNT!r}")
+LINES: Final[dict[str, tuple[float, ...]]] = {
+    "tackles": (0.5, 1.5, 2.5) if TACKLES_COUNT == "attempted" else (0.5, 1.5, 2.5, 3.5), "fouls": (0.5, 1.5)}
 OUTFIELD: Final[tuple[str, ...]] = ("DEF", "MID", "ATT")
 PRIOR_STRENGTH_90S: Final[float] = 6.0
 MIN_PRIOR_APPEARANCES: Final[int] = 5
@@ -66,9 +74,9 @@ SEED: Final[int] = 20261004
 SCAN_K: Final[float] = 6.0
 NO_OVERDISPERSION_K: Final[float] = 1000.0
 
-QUERY: Final[str] = """
+QUERY: Final[str] = f"""
     SELECT s.player_id, s.fixture_id, f.kickoff_at, s.started, s.minutes_played,
-           s.tackles_attempted, s.fouls_committed, p.primary_position
+           {TACKLES_COUNTS[TACKLES_COUNT]}, s.fouls_committed, p.primary_position
     FROM prop_alpha.player_match_stats s
     JOIN prop_alpha.fixtures f USING (fixture_id)
     JOIN prop_alpha.players p USING (player_id)
@@ -215,7 +223,9 @@ def main() -> int:
     excluded_positions = sorted({r[7] for r in rows if r[7] not in OUTFIELD})
     results: dict[str, Any] = {"run_at": datetime.now(timezone.utc).isoformat(), "seed": SEED, "level": args.level,
                                "excluded_positions": excluded_positions, "markets": {}}
-    print(f"league level: {'trailing, history scaled' if args.level else 'fixed 2025/26 positional rates'}")
+    results["tackles_count"] = TACKLES_COUNT
+    print(f"league level: {'trailing, history scaled' if args.level else 'fixed 2025/26 positional rates'}; "
+          f"tackles count: {TACKLES_COUNT}")
     print(f"rows {len(rows)}; positions excluded from scoring: {excluded_positions}")
     for market, lines in LINES.items():
         index = 5 if market == "tackles" else 6
@@ -249,7 +259,8 @@ def main() -> int:
             results["markets"][market]["runs"][label] = score_market(
                 market, lines, k, obs_by_position, rates, started_of, all_obs, history_by_player, rng, levels)
     suffix = ("_level" if args.level else "") + (f"_{LEAGUE_FILTER.replace(' ', '')}" if LEAGUE_FILTER else "") \
-        + (f"_from{SEASON_SPLIT:%Y%m%d}" if SEASON_SPLIT != datetime(2026, 7, 1, tzinfo=timezone.utc) else "")
+        + (f"_from{SEASON_SPLIT:%Y%m%d}" if SEASON_SPLIT != datetime(2026, 7, 1, tzinfo=timezone.utc) else "") \
+        + ("" if TACKLES_COUNT == "attempted" else f"_{TACKLES_COUNT}")
     out = ROOT / ".prop_alpha_state" / f"quick_backtest_{datetime.now(timezone.utc):%Y-%m-%d}{suffix}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(results, indent=1, default=float), encoding="utf-8")

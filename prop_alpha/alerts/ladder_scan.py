@@ -12,7 +12,9 @@ It is the League One/Two scan (alerts/scan.py) with these differences, and nothi
 * Leagues: Sportmonks league ids are read from the plan's own league list (sportmonks.PILOT_LEAGUES_WANTED), so a
   league the plan does not include is reported ("not in the Sportmonks plan"), never guessed.
 * Pricing is the pilot's, read from the pilot database `prop_alpha_pilot` (read-only), never from the working
-  `prop_alpha`: prior strength 6, no rate multiplier, and a game-state k per league and market (LEAGUE_GAME_STATE_K: Brazil
+  `prop_alpha`: tackles counted as tackles attempted plus challenges lost (pilot_ledger.PILOT_TACKLES_SQL, 2026-10-12: the
+  bookmakers' ladders fit that count, MARKET_CONTRACT.md section 2b; loaded through PilotCursor so the frozen League One/Two
+  queries are untouched), prior strength 6, no rate multiplier, and a game-state k per league and market (LEAGUE_GAME_STATE_K: Brazil
   Serie A's own fit; the English Championship's 21.1 for tackles and 1000 for fouls for the Scottish leagues, which have no
   backtest at all). These are NOT the frozen League One/Two settings and are not frozen themselves: the model_freeze
   fingerprint and the League One/Two lockbox are untouched, and no pilot lockbox exists.
@@ -47,6 +49,7 @@ import logging
 import os
 import sys
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Collection, Final, Mapping, Sequence
@@ -93,15 +96,25 @@ from prop_alpha.scanner.slate import (
 logger = logging.getLogger("prop_alpha.ladder_scan")
 
 # The pilot's pricing settings. Game-state dispersion k per market: Brazil Serie A has its own, fitted by scripts/quick_backtest.py
-# on its matches before 2026-03-01 (run 2026-10-11, scored on 4,808 starters in 253 matches after that date); a league without
-# its own (the two Scottish leagues, which have no backtest) falls back to the English Championship's fit of 2026-10-08.
+# on its matches before 2026-03-01 and scored on 4,808 starters in 253 matches after that date: tackles 17.312 on the pilot's
+# count (tackles attempted + challenges lost, BACKTEST_TACKLES=attempted_plus_dribbled_past, run 2026-10-12; Brier skill +0.062
+# to +0.086 over lines 0.5-3.5, slopes 0.95-1.00; it was 496.882 on tackles attempted alone), fouls 40.556 (2026-10-11). A league
+# without its own (the two Scottish leagues, which have no backtest) falls back to the English Championship's fit of 2026-10-08,
+# made on tackles attempted alone: a guess twice over.
 DEFAULT_GAME_STATE_K: Final[float] = 6.0
 GAME_STATE_K: Final[Mapping[str, float]] = {"tackles": 21.1, "fouls": 1000.0}
-LEAGUE_GAME_STATE_K: Final[Mapping[str, Mapping[str, float]]] = {"Brazil Serie A": {"tackles": 496.882, "fouls": 40.556}}
+LEAGUE_GAME_STATE_K: Final[Mapping[str, Mapping[str, float]]] = {"Brazil Serie A": {"tackles": 17.312, "fouls": 40.556}}
 PRIOR_STRENGTH: Final[Mapping[str, float]] = {"tackles": 6.0, "fouls": 6.0}
 # Only tackles are tipped, as in the League One/Two scan; fouls are priced but never staked or tipped (the pilot's
 # fouls calibration slopes were 0.86 and 0.89 against the 0.9-1.1 the PRD requires).
 ALERT_MARKETS: Final[frozenset[str]] = frozenset({"tackles"})
+# The guard against implausible edges (maintainer, 2026-10-12): a bookmaker price at which the model's probability, if the
+# player plays, would return more than this per unit staked is left out before the allocator sees it. On the archived Brazil
+# ladders of 2026-10-11 the lines the screen passed reached "+50% to +224%" on the players the books disagreed with most:
+# information the model lacks (role, team-mates, opponent), not edges. A 25% cap is the same as a model probability at most
+# 1.25 times the book's. Shrinking towards the market would not do this: a blended edge is a fraction of the model's, so the
+# outliers would still rank first.
+PLAUSIBLE_EDGE_CAP: Final[float] = 0.25
 # The leagues that may produce a tip. Brazil Serie A was turned on by the maintainer on 2026-10-11 ("yes"), after being shown its
 # backtest (tackles Brier skill +0.06 to +0.08 over the league average, slopes 0.93-1.02, the strict PRD bin test failing) and
 # that the bookmakers' prices run far above the model's counts (mean expected profit about -60%). The Scottish leagues have
@@ -139,11 +152,59 @@ PILOT_ODDS_DIR: Final[str] = "pilot"
 LADDER_CATALOGUE_FILE: Final[str] = "ladder_markets.json"
 
 
+# The frozen scan's two queries that read the tackles count, and the pilot's versions of them (pilot_ledger.PILOT_TACKLES_SQL).
+PILOT_QUERIES: Final[Mapping[str, str]] = {sql: pilot_ledger.recount(sql) for sql in (scan.HISTORY_SQL, scan.LEVEL_SQL)}
+
+
+class PilotCursor:
+    """Runs the pilot's queries in place of the frozen scan's two count queries (PILOT_QUERIES) and passes every other query
+    through, so scan.load_slate_inputs, which is frozen for League One/Two, loads the pilot's history and league levels on
+    the pilot's tackles count without a copy of it."""
+
+    def __init__(self, cur: Any) -> None:
+        self._cur = cur
+
+    def execute(self, sql: str, params: Any = None) -> None:
+        self._cur.execute(PILOT_QUERIES.get(sql, sql), params)
+
+    def fetchall(self) -> list[Any]:
+        return list(self._cur.fetchall())
+
+
+def load_pilot_inputs(cur: Any, fixture: UpcomingFixture) -> scan.SlateInputs:
+    """scan.load_slate_inputs on the pilot's tackles count."""
+    return scan.load_slate_inputs(PilotCursor(cur), fixture)
+
+
+def without_implausible_edges(
+    quotes: Sequence[LiveOddsQuote], projections: Mapping[ProjectionKey, FactorProjection],
+) -> tuple[list[LiveOddsQuote], int]:
+    """Pure: `quotes` with every side whose edge exceeds PLAUSIBLE_EDGE_CAP removed (a quote with no side left is dropped),
+    and how many sides were removed. The edge is p_win / (p_win + p_lose) x price - 1, the model's return if the player
+    plays, under the quote's void rule; a quote without a projection is passed on (the allocator cannot price it)."""
+    kept: list[LiveOddsQuote] = []
+    removed = 0
+    for quote in quotes:
+        projection = projections.get((quote.fixture_id, quote.player_id, quote.market_type))
+        prices: dict[str, float | None] = {"over": quote.over_price, "under": quote.under_price}
+        for side, price in list(prices.items()):
+            if price is None or projection is None:
+                continue
+            probabilities = projection.side_probabilities(quote.line_value, side, quote.void_rule)
+            live = probabilities.p_win + probabilities.p_lose
+            if live > 0.0 and probabilities.p_win / live * price - 1.0 > PLAUSIBLE_EDGE_CAP:
+                prices[side] = None
+                removed += 1
+        if prices["over"] is not None or prices["under"] is not None:
+            kept.append(replace(quote, over_price=prices["over"], under_price=prices["under"]))
+    return kept, removed
+
+
 def pilot_settings_digest() -> str:
     """The identity of the pilot's pricing settings, written on every pilot prediction: a prediction made under other
     settings is never mistaken for one made under these (the pilot has no frozen code, so no source digest)."""
     settings = {"default_k": DEFAULT_GAME_STATE_K, "k": GAME_STATE_K, "league_k": LEAGUE_GAME_STATE_K,
-                "prior": PRIOR_STRENGTH}
+                "prior": PRIOR_STRENGTH, "tackles_count": pilot_ledger.PILOT_TACKLES_SQL, "edge_cap": PLAUSIBLE_EDGE_CAP}
     return "pilot:" + hashlib.sha256(json.dumps(settings, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
@@ -375,7 +436,7 @@ def run_ladder_scan(
                     summary.failures.append(stale_message(league, missing))
                     summary.stale_leagues.append(league)
                 fixtures = [f for f in listed if f.league not in stale]
-                slate = [(fixture, scan.load_slate_inputs(cur, fixture)) for fixture in fixtures]
+                slate = [(fixture, load_pilot_inputs(cur, fixture)) for fixture in fixtures]
     finally:
         conn.close()
     if not fixtures:
@@ -405,6 +466,13 @@ def run_ladder_scan(
                                               if q.market_type in ALERT_MARKETS], rate)
     else:
         raise ValueError(f"unknown odds source {odds!r}")
+    implausible: list[int] = []
+
+    def guarded(fixture: UpcomingFixture, projections: Mapping[ProjectionKey, FactorProjection]) -> list[LiveOddsQuote]:
+        kept, removed = without_implausible_edges(quotes_for(fixture, projections), projections)
+        implausible.append(removed)
+        return kept
+
     manager = InstitutionalAssetManager(bankroll, model_risk_loss_floor=MODEL_RISK_LOSS_FLOOR)
     combined = AllocationReport()
     all_projections: dict[ProjectionKey, FactorProjection] = {}
@@ -412,7 +480,7 @@ def run_ladder_scan(
     exposure = store.exposure(now)
     for fixture, inputs in slate:
         engine, market_engines = pilot_engines(fixture.league)
-        projections, report, quotes = scan.scan_fixture(fixture, inputs, now, quotes_for, manager, engine, summary,
+        projections, report, quotes = scan.scan_fixture(fixture, inputs, now, guarded, manager, engine, summary,
                                                         exposure, market_engines, pricer=price_pilot)
         if report is None:
             continue
@@ -426,6 +494,9 @@ def run_ladder_scan(
         combined.directives.extend(report.directives)
         all_projections.update(projections)
         all_descriptions.update(scan.descriptions(fixture, inputs, projections))
+    if sum(implausible):
+        summary.odds_notes.append(f"Prices left out as implausible (the model above the book by more than "
+                                  f"{PLAUSIBLE_EDGE_CAP:.0%} if the player plays): {sum(implausible)}")
     combined.directives.sort(key=lambda d: (-d.ev_per_unit, d.fixture_id, d.player_id, d.market_type, d.line_value))
     if notifier is not None:
         fixtures_by_id = {f.fixture_id: f for f in fixtures}

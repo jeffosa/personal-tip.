@@ -12,7 +12,7 @@ from typing import Any, Mapping
 
 import pytest
 
-from prop_alpha.alerts import ladder_scan, scan
+from prop_alpha.alerts import ladder_scan, pilot_ledger, scan
 from prop_alpha.alerts.fx import identity as fx_identity
 from prop_alpha.alerts.telegram import SentAlertStore, TelegramConfig, TelegramNotifier
 from prop_alpha.ingestion import oddspapi, sportmonks
@@ -133,8 +133,52 @@ def _run(tmp_path: Path, notifier: _Recording, store: SentAlertStore, **kwargs: 
 
 # ---------------- pricing ----------------
 def _tip_brazil(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Tipping is paused (TIP_LEAGUES is empty since 2026-10-12); the tests of the tipping path switch Brazil back on."""
+    """Tipping is paused (TIP_LEAGUES is empty since 2026-10-12); the tests of the tipping path switch Brazil back on. Their
+    prices are exaggerated to make a tip certain, so they also lift the implausible-edge guard, which has tests of its own."""
     monkeypatch.setattr(ladder_scan, "TIP_LEAGUES", frozenset({"Brazil Serie A"}))
+    monkeypatch.setattr(ladder_scan, "PLAUSIBLE_EDGE_CAP", 100.0)
+
+
+def _quote(over: float | None, under: float | None) -> LiveOddsQuote:
+    return LiveOddsQuote(9101, 1, "tackles", 1.5, over, under, 100.0, "bet365", NOW, "void_if_no_appearance")
+
+
+def test_a_price_more_than_25_percent_above_the_book_is_left_out_side_by_side() -> None:
+    """2026-10-12: on the archived Brazil ladders the screen's tips were the players the books disagreed with most, at
+    'EV +50% to +224%'. A side whose edge (the model's return if the player plays) exceeds the cap never reaches the allocator."""
+    projections, _ = ladder_scan.price_pilot(FIXTURE, _inputs(), *ladder_scan.pilot_engines(FIXTURE.league))
+    over = projections[(9101, 1, "tackles")].side_probabilities(1.5, "over")
+    under = projections[(9101, 1, "tackles")].side_probabilities(1.5, "under")
+    q_over, q_under = over.p_win / (over.p_win + over.p_lose), under.p_win / (under.p_win + under.p_lose)
+    fair_over, fair_under = 1.0 / q_over, 1.0 / q_under
+    assert ladder_scan.PLAUSIBLE_EDGE_CAP == 0.25
+    within = _quote(fair_over * 1.20, fair_under * 1.10)
+    kept, removed = ladder_scan.without_implausible_edges([within], projections)
+    assert kept == [within] and removed == 0
+    too_good = _quote(fair_over * 1.30, fair_under * 1.10)  # the Over is implausible, the Under is not
+    kept, removed = ladder_scan.without_implausible_edges([too_good], projections)
+    assert removed == 1 and kept == [_quote(None, fair_under * 1.10)]
+    both = _quote(fair_over * 1.30, None)
+    assert ladder_scan.without_implausible_edges([both], projections) == ([], 1)  # nothing left: the quote goes
+    unpriced = replace(within, player_id=999)
+    assert ladder_scan.without_implausible_edges([unpriced], projections) == ([unpriced], 0)
+
+
+def test_with_the_guard_on_the_juicy_ladder_is_left_out_and_the_run_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real-odds tip test's 2+ price of 9.00 is far beyond 25% above the model: with tipping on and the guard at its
+    default, nothing is tipped and the summary counts the prices left out."""
+    monkeypatch.setattr(ladder_scan, "TIP_LEAGUES", frozenset({"Brazil Serie A"}))
+    _patch_database(monkeypatch, stored={FINISHED_UID})
+    _names_cache(tmp_path)
+    odds = _FakeOdds(_ladder_body({"Regular Starter": (2.6, 9.0, 1.45)}))
+    store = SentAlertStore(tmp_path / "pilot.jsonl")
+    notifier = _Recording(store)
+    summary = _run(tmp_path, notifier, store, odds="oddspapi", odds_client=odds)
+    assert summary.alerts_sent == 0 and notifier.texts == [] and store.load() == []
+    [note] = [n for n in summary.odds_notes if n.startswith("Prices left out as implausible")]
+    assert "more than 25% if the player plays" in note and int(note.rsplit(": ", 1)[1]) >= 1
 
 
 def test_tipping_is_paused_and_the_summary_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -147,6 +191,41 @@ def test_tipping_is_paused_and_the_summary_says_so(monkeypatch: pytest.MonkeyPat
     assert "Tipped: tackles in Brazil Serie A only" in ladder_scan.summary_text(scan.ScanSummary(NOW, NOW, fixtures=["x"]), "")
 
 
+class _QueryLog:
+    """A cursor that records every query and answers each with no rows."""
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    def execute(self, sql: str, params: Any = None) -> None:
+        self.queries.append(sql)
+
+    def fetchall(self) -> list[Any]:
+        return []
+
+
+def test_the_pilot_loads_history_and_league_levels_on_its_own_tackles_count() -> None:
+    """2026-10-12: the pilot counts tackles attempted plus challenges lost (the bookmakers' ladders fit it, MARKET_CONTRACT.md
+    section 2b) through the frozen loader, which itself still runs the frozen queries for League One/Two."""
+    pilot, frozen = _QueryLog(), _QueryLog()
+    ladder_scan.load_pilot_inputs(pilot, FIXTURE)
+    scan.load_slate_inputs(frozen, FIXTURE)
+    assert scan.HISTORY_SQL in frozen.queries and scan.LEVEL_SQL in frozen.queries
+    assert scan.HISTORY_SQL not in pilot.queries and scan.LEVEL_SQL not in pilot.queries
+    recounted = [sql for sql in pilot.queries if "dribbled_past" in sql]
+    assert recounted == [ladder_scan.PILOT_QUERIES[scan.HISTORY_SQL], ladder_scan.PILOT_QUERIES[scan.LEVEL_SQL]]
+    assert "(s.tackles_attempted + s.dribbled_past), s.fouls_committed" in recounted[0]
+    assert "sum((s.tackles_attempted + s.dribbled_past)), sum(s.fouls_committed)" in recounted[1]
+    assert len(pilot.queries) == len(frozen.queries)  # every other query passes through unchanged
+
+
+def test_the_pilot_digest_names_its_tackles_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A prediction priced on the old count is never mistaken for one priced on the new."""
+    current = ladder_scan.pilot_settings_digest()
+    monkeypatch.setattr(pilot_ledger, "PILOT_TACKLES_SQL", "s.tackles_attempted")
+    assert ladder_scan.pilot_settings_digest() != current
+
+
 def test_the_pilot_prices_with_its_own_settings_by_league_not_the_frozen_ones() -> None:
     inputs = _inputs()
     scottish = replace(FIXTURE, league="Scottish Premiership")
@@ -155,9 +234,9 @@ def test_the_pilot_prices_with_its_own_settings_by_league_not_the_frozen_ones() 
     # A league without its own fit uses the English Championship's: tackles 21.1, fouls 1000.
     assert fallback[(9101, 1, "tackles")].game_state_k == 21.1 and fallback[(9101, 1, "fouls")].game_state_k == 1000.0
     brazil, _ = ladder_scan.price_pilot(FIXTURE, inputs, *ladder_scan.pilot_engines(FIXTURE.league))
-    assert brazil[(9101, 1, "tackles")].game_state_k == 496.882 and brazil[(9101, 1, "fouls")].game_state_k == 40.556
+    assert brazil[(9101, 1, "tackles")].game_state_k == 17.312 and brazil[(9101, 1, "fouls")].game_state_k == 40.556
     frozen, _ = scan.price_fixture(FIXTURE, inputs, *scan.scan_engines())
-    assert frozen[(9101, 1, "tackles")].game_state_k == scan.SCAN_GAME_STATE_K_BY_MARKET["tackles"] not in (21.1, 496.882)
+    assert frozen[(9101, 1, "tackles")].game_state_k == scan.SCAN_GAME_STATE_K_BY_MARKET["tackles"] not in (21.1, 17.312)
     # The pilot applies no rate multiplier and its own prior strength: the same call by hand agrees.
     by_hand, _ = build_projections(FIXTURE, inputs.squad, inputs.history_by_player, inputs.team_recent_fixtures,
                                    RATES, QuantEngine(game_state_k=6.0),

@@ -571,9 +571,10 @@ def _nullable_int(value: Any) -> int | None:
 
 
 def read_settlement_rows(
-    dsn: str, bets: Sequence[PlacedBet],
+    dsn: str, bets: Sequence[PlacedBet], settlement_sql: str = SETTLEMENT_SQL,
 ) -> dict[tuple[int, int], tuple[str, int | None, int | None, int | None] | None]:
-    """One read-only transaction: each bet's fixture status and its player's stored minutes and counts."""
+    """One read-only transaction: each bet's fixture status and its player's stored minutes and counts
+    (`settlement_sql`: SETTLEMENT_SQL, or the pilot's, which counts tackles its own way)."""
     import psycopg2
 
     rows: dict[tuple[int, int], tuple[str, int | None, int | None, int | None] | None] = {}
@@ -585,7 +586,7 @@ def read_settlement_rows(
         with conn:
             with conn.cursor() as cur:
                 for bet in bets:
-                    cur.execute(SETTLEMENT_SQL, (bet.player_id, str(bet.fixture_id)))
+                    cur.execute(settlement_sql, (bet.player_id, str(bet.fixture_id)))
                     found = cur.fetchone()
                     rows[(bet.fixture_id, bet.player_id)] = None if found is None else (
                         str(found[0]), _nullable_int(found[1]), _nullable_int(found[2]), _nullable_int(found[3])
@@ -595,21 +596,23 @@ def read_settlement_rows(
     return rows
 
 
-def settle(store: PlacedBetStore, dsn: str, now: datetime) -> list[tuple[PlacedBet, Settlement]]:
+def settle(store: PlacedBetStore, dsn: str, now: datetime,
+           settlement_sql: str = SETTLEMENT_SQL) -> list[tuple[PlacedBet, Settlement]]:
     """Record an automatic result for every open bet whose match is final in the database."""
     open_bets = store.open_bets(now)
-    settled = settle_open_bets(open_bets, read_settlement_rows(dsn, open_bets), now)
+    settled = settle_open_bets(open_bets, read_settlement_rows(dsn, open_bets, settlement_sql), now)
     for _, settlement in settled:
         store.record_settlement(settlement)
     return settled
 
 
-def reconcile_settlements(store: PlacedBetStore, dsn: str, now: datetime) -> list[tuple[PlacedBet, Reconciliation]]:
+def reconcile_settlements(store: PlacedBetStore, dsn: str, now: datetime,
+                          settlement_sql: str = SETTLEMENT_SQL) -> list[tuple[PlacedBet, Reconciliation]]:
     """Every settled bet compared with automatic settlement on the statistics stored now (replies.reconcile), from one
     read-only transaction. Bets settled only automatically need no query."""
     settled = store.settled_bets()
     confirmed = [bet for bet, settlement in settled if settlement.source == "manual"]
-    rows = read_settlement_rows(dsn, confirmed)
+    rows = read_settlement_rows(dsn, confirmed, settlement_sql)
     automatic = store.automatic_settlements()
     return [(bet, reconcile(bet, settlement, rows.get((bet.fixture_id, bet.player_id)), automatic.get(bet.bet_id), now))
             for bet, settlement in settled]

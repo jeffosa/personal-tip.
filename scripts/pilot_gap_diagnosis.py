@@ -17,6 +17,9 @@ challenges lost). Four views:
 2. Shape: the step-to-step ratio P(k+1)+ / P(k+), which a margin that scales every price alike does not change; the count
    whose ratios match the book's is the best candidate for what the book counts.
 3. The eight tips of 2026-10-11, with each player's own TA history.
+5. Model v book: the matched fixtures re-priced through the real pilot pricing (alerts/ladder_scan.price_pilot) on the old
+   count (TA, k 496.882) and on the pilot's count since 2026-10-12 (TA+DP, ladder_scan.load_pilot_inputs and its k), each
+   line's probability and expected profit against the book's price, and how many lines reach the screen's 4%.
 
 Not identified by any of this: the book's actual margin (no "0" step is quoted beside "1+") and its data provider.
 """
@@ -35,7 +38,7 @@ import numpy as np
 
 ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from prop_alpha.alerts.ladder_scan import LADDER_CATALOGUE_FILE, load_ladder_catalogue  # noqa: E402
+from prop_alpha.alerts.ladder_scan import LADDER_CATALOGUE_FILE, PLAUSIBLE_EDGE_CAP, load_ladder_catalogue  # noqa: E402
 from prop_alpha.ingestion import oddspapi  # noqa: E402
 
 STATE: Final[Path] = ROOT / ".prop_alpha_state"
@@ -139,7 +142,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # (book, player) -> {k: implied probability of k+}
     ladders: dict[tuple[str, int], dict[int, float]] = defaultdict(dict)
-    matched_fixtures: dict[str, tuple[str, str]] = {}
+    matched_fixtures: dict[str, tuple[str, str, datetime]] = {}
+    fixture_of: dict[tuple[str, int], str] = {}
     unmatched_players = 0
     for book in BOOKS:
         body: Any = json.loads(gzip.open(STATE / "pilot" / f"{stamp}_{book}_pilot.json.gz", "rt", encoding="utf-8").read())
@@ -150,12 +154,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             home, away = (club_for(names.get(str(team), ""), list(clubs)) for team in (fixture.home_id, fixture.away_id))
             if home is None or away is None:
                 continue  # another league in the same reply, or a club name that does not match one way
-            matched_fixtures[fixture.odds_fixture_id] = (home, away)
+            matched_fixtures[fixture.odds_fixture_id] = (home, away, fixture.kickoff_at)
             pid = match_player(price.player_name, {**clubs[home], **clubs[away]})
             if pid is None:
                 unmatched_players += 1
                 continue
             ladders[(book, pid)][int(price.step.rstrip("+"))] = 1.0 / price.price
+            fixture_of[(book, pid)] = fixture.odds_fixture_id
     usable = {key: steps for key, steps in ladders.items() if len(starts.get(key[1], [])) >= MIN_STARTS}
     print(f"Brazil fixtures matched: {len(matched_fixtures)}; ladders matched to a stored player: {len(ladders)} "
           f"({unmatched_players} prices unmatched); with {MIN_STARTS}+ stored starts: {len(usable)}")
@@ -219,7 +224,77 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"   {tip['player']}: {k}+ tackles @ {tip['odds']} (implied {1 / float(tip['odds']):.2f}); his last "
               f"{len(rows)} starts of {MIN_MINUTES}+ min: TA {[r[0] for r in rows]} -> TA {k}+ in "
               f"{at_least(rows, COUNTS['TA'], k):.0%}" if rows else f"   {tip['player']}: no stored starts")
+    model_v_book(matched_fixtures, ladders, fixture_of, clubs)
     return 0
+
+
+OLD_TACKLES_K: Final[float] = 496.882  # Brazil's tackles k on tackles_attempted alone (2026-10-11)
+SCREEN_EV: Final[float] = 0.04
+
+
+def model_v_book(fixtures: Mapping[str, tuple[str, str, datetime]], ladders: Mapping[tuple[str, int], Mapping[int, float]],
+                 fixture_of: Mapping[tuple[str, int], str], clubs: Mapping[str, Mapping[int, str]]) -> None:
+    """Section 5: re-price the matched fixtures on both counts (read-only) and compare with the books' ladders."""
+    import psycopg2
+
+    from prop_alpha.alerts import ladder_scan, scan
+    from prop_alpha.modeling.engine import QuantEngine
+    from prop_alpha.scanner.slate import UpcomingFixture
+
+    old_engines = (QuantEngine(game_state_k=ladder_scan.DEFAULT_GAME_STATE_K),
+                   {"tackles": QuantEngine(game_state_k=OLD_TACKLES_K),
+                    "fouls": QuantEngine(game_state_k=ladder_scan.LEAGUE_GAME_STATE_K[LEAGUE]["fouls"])})
+    variants = {"TA (old)": (scan.load_slate_inputs, old_engines),
+                "TA+DP (new)": (ladder_scan.load_pilot_inputs, ladder_scan.pilot_engines(LEAGUE))}
+    # variant -> (odds fixture, player, k) -> (p_win, p_lose)
+    priced: dict[str, dict[tuple[str, int, int], tuple[float, float]]] = {label: {} for label in variants}
+    conn = psycopg2.connect(PILOT_DSN)
+    try:
+        conn.set_session(readonly=True)
+        with conn.cursor() as cur:
+            cur.execute("SELECT t.name, t.vendor_team_uid FROM prop_alpha.teams t JOIN prop_alpha.leagues l USING (league_id) "
+                        "WHERE l.name = %s", (LEAGUE,))
+            uid = {str(name): str(team) for name, team in cur.fetchall()}
+            for n, (odds_id, (home, away, kickoff)) in enumerate(sorted(fixtures.items())):
+                fixture = UpcomingFixture(-(n + 1), LEAGUE, uid[home], uid[away], home, away, kickoff)
+                for label, (loader, engines) in variants.items():
+                    projections, _ = ladder_scan.price_pilot(fixture, loader(cur, fixture), *engines)
+                    for (_, pid, market), projection in projections.items():
+                        if market == "tackles":
+                            for k in STEPS:
+                                side = projection.side_probabilities(k - 0.5, "over")
+                                priced[label][(odds_id, pid, k)] = (side.p_win, side.p_lose)
+    finally:
+        conn.close()
+    names = {pid: name for squad in clubs.values() for pid, name in squad.items()}
+    print("\n5. MODEL V BOOK: the matched fixtures re-priced by the pilot pricing; model P(k+ | plays) v the book's implied "
+          "P(k+),\n   expected profit per unit at the book's price (void if he does not play), lines at or above the screen's "
+          f"{SCREEN_EV:.0%}")
+    for label in variants:
+        for book in BOOKS:
+            rows = []
+            for (b, pid), steps in ladders.items():
+                if b != book:
+                    continue
+                for k, implied in steps.items():
+                    found = priced[label].get((fixture_of[(b, pid)], pid, k))
+                    if found is not None and sum(found) > 0:
+                        p_win, p_lose = found
+                        rows.append((p_win / (p_win + p_lose), implied, p_win * (1 / implied - 1) - p_lose, pid, k))
+            if not rows:
+                continue
+            model_p, book_p = np.array([r[0] for r in rows]), np.array([r[1] for r in rows])
+            ev = np.array([r[2] for r in rows])
+            edge = model_p / book_p - 1.0  # the guard's measure: the model's return if he plays
+            print(f"   {label:12} {book:7} lines {len(rows):4}: model {model_p.mean():.3f} v implied {book_p.mean():.3f} "
+                  f"(ratio {book_p.mean() / model_p.mean():.2f}), correlation {np.corrcoef(model_p, book_p)[0, 1]:.2f}, "
+                  f"mean EV {ev.mean():+.1%}, lines >= {SCREEN_EV:.0%}: {int((ev >= SCREEN_EV).sum())}, of which within the "
+                  f"{PLAUSIBLE_EDGE_CAP:.0%} guard: {int(((ev >= SCREEN_EV) & (edge <= PLAUSIBLE_EDGE_CAP)).sum())}")
+            if label.startswith("TA+DP"):
+                within = [r for r in rows if r[2] >= SCREEN_EV and r[0] / r[1] - 1.0 <= PLAUSIBLE_EDGE_CAP]
+                for p_model, p_book, value, pid, k in sorted(within, key=lambda r: -r[2])[:8]:
+                    print(f"      within the guard: {names.get(pid, pid)} {k}+: model {p_model:.2f} v implied {p_book:.2f}, "
+                          f"EV {value:+.1%}")
 
 
 def poisson_mean_from_shape(steps: Mapping[int, float]) -> float | None:

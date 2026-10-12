@@ -82,6 +82,57 @@ model lacks (role, opponent, team style), so the screen selected exactly the pla
 2026-10-11, Léo Pereira and Vitor Roque each made fewer than 2 tackles by that book's count (maintainer's ticket; not a
 bet365 settlement).
 
+### 2c. The pilot re-targeted, backtested and re-priced (2026-10-12)
+
+The pilot now prices and settles tackles as `tackles_attempted + dribbled_past` (`pilot_ledger.PILOT_TACKLES_SQL`); the
+frozen League One/Two model and its ledger keep `tackles_attempted`.
+
+- **Backtest** (`BACKTEST_TACKLES=attempted_plus_dribbled_past scripts/quick_backtest.py --level`, Brazil Serie A, fit
+  before 2026-03-01, 4,808 starters in 253 matches): Brier skill against the league average +0.071, +0.086, +0.084, +0.062
+  for over 0.5 to 3.5 (90% intervals above 0), calibration slopes 1.00, 0.96, 0.97, 0.95 at the fitted game-state k 17.31
+  (now the pilot's Brazil tackles k). The old count on the same run: +0.077, +0.076, +0.062, slopes 1.02, 0.97, 0.93. The
+  strict PRD bin test fails on every line of both (worst bin 0.06-0.10).
+- **Re-priced against the archived ladders** (`scripts/pilot_gap_diagnosis.py` section 5, the 7 fixtures of 2026-10-11):
+
+  | count | book | lines | model P(k+ given he plays) | implied | mean EV | lines at 4%+ |
+  |---|---|---|---|---|---|---|
+  | TA (old) | bet365 | 674 | 0.286 | 0.485 | -37.4% | 13 |
+  | TA+DP (new) | bet365 | 674 | 0.400 | 0.485 | -13.2% | **136** |
+  | TA (old) | Betway | 622 | 0.262 | 0.439 | -40.7% | 1 |
+  | TA+DP (new) | Betway | 622 | 0.364 | 0.439 | -18.3% | **84** |
+
+**Reading.** The new count closes most of the level gap (book/model 1.69 to 1.21; part of what is left is that the model
+includes substitute appearances, which these books void). But it makes the screen fire ten times as often, and on the same
+players the books disagree with most: Fernando 3+ (model 0.43, bet365 0.13, "EV +224%"), Yago Felipe 3+ (0.52 v 0.18),
+Léo Pereira 2+ (0.49 v 0.23). Expected profits of +50% to +220% against a major book are not edges; they are information the
+model lacks (role, team-mates, opponent, the books' own data). **Tipping stays paused.** Before it can resume: a guard
+against implausible edges (a cap on the model-to-book ratio or the expected profit, or shrinking towards the market), and
+the count confirmed against settled results (section 6).
+
+**Guard added (2026-10-12).** `ladder_scan.PLAUSIBLE_EDGE_CAP` = 0.25: a price at which the model's probability, if the
+player plays, would return more than 25% is left out before the allocator, and the run summary counts it. On the archived
+ladders it keeps 72 of the 136 bet365 lines at 4%+ (Betway 52 of 84), all between +4% and +25%, and removes every one of
+the +50% to +224% outliers. Tipping stays paused: what is left is still an unvalidated model's disagreement with the book.
+
+### 2d. Sportmonks against Opta, and the first settled examples (2026-10-12)
+
+- **Data feed = Opta.** FotMob's match pages carry Opta player ids and Opta counts. For Santos v Flamengo (2026-10-08, 2-2,
+  Sportmonks fixture 19621797) every one of the 29 players who played has the same tackles, interceptions and fouls in
+  Sportmonks as on FotMob, and the same dribbled past for 28 of 29 (Álvaro Barreal: FotMob 1, Sportmonks 0). Sportmonks'
+  `tackles_attempted` is therefore Opta's "Tackles" as FotMob shows it, and `dribbled_past` is Opta's "Dribbled past". Which
+  Opta count a book settles on is still not known.
+- **Settled examples (SportyBet "Player tackles (incl. overtime)", the maintainer's tickets of 2026-10-11, not bet365):**
+
+  | player, match | bet | result | Opta tackles | dribbled past | interceptions |
+  |---|---|---|---|---|---|
+  | Léo Pereira, Flamengo 1-0 Fluminense | 2+ | lost | 1 | 0 | 0 |
+  | Vitor Roque, Palmeiras 4-1 Corinthians (69 min) | 2+ | lost | 1 | 0 | 0 |
+
+  Both lose under every candidate count, so they do not tell the counts apart. Pending: the same ticket's legs on
+  Chapecoense v Athletico PR (2026-10-12 22:30 UTC: Arthur Dias 3+, Doma 2+) and Bragantino v Cruzeiro (2026-10-13 00:00
+  UTC: Fernando 2+, 3+). A leg where tackles alone and tackles plus dribbled past fall on different sides of the line is the
+  first settled example that discriminates. FotMob's pages were read by hand in a browser; nothing scrapes them.
+
 ## 3. Evidence table to fill (West Ham United v Queens Park Rangers, 2026-10-09, final 1-1)
 
 Sportmonks counts are filled in from `.prop_alpha_state/pilot/counts_19729059.json`. The last three columns need an
