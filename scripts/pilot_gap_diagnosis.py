@@ -17,9 +17,10 @@ challenges lost). Four views:
 2. Shape: the step-to-step ratio P(k+1)+ / P(k+), which a margin that scales every price alike does not change; the count
    whose ratios match the book's is the best candidate for what the book counts.
 3. The eight tips of 2026-10-11, with each player's own TA history.
-5. Model v book: the matched fixtures re-priced through the real pilot pricing (alerts/ladder_scan.price_pilot) on the old
-   count (TA, k 496.882) and on the pilot's count since 2026-10-12 (TA+DP, ladder_scan.load_pilot_inputs and its k), each
-   line's probability and expected profit against the book's price, and how many lines reach the screen's 4%.
+5. Model v book: the matched fixtures re-priced through the real pilot pricing (alerts/ladder_scan.price_pilot) on the
+   pilot's count (plain TA again since 2026-10-13, ladder_scan.load_pilot_inputs and its k) and on the count of 2026-10-12
+   only (TA+DP, k 17.312), each line's probability and expected profit against the book's price, and how many lines reach the
+   screen's 4%.
 
 Not identified by any of this: the book's actual margin (no "0" step is quoted beside "1+") and its data provider.
 """
@@ -228,7 +229,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-OLD_TACKLES_K: Final[float] = 496.882  # Brazil's tackles k on tackles_attempted alone (2026-10-11)
+TA_DP_TACKLES_K: Final[float] = 17.312  # Brazil's tackles k on tackles plus challenges lost (2026-10-12)
 SCREEN_EV: Final[float] = 0.04
 
 
@@ -241,11 +242,18 @@ def model_v_book(fixtures: Mapping[str, tuple[str, str, datetime]], ladders: Map
     from prop_alpha.modeling.engine import QuantEngine
     from prop_alpha.scanner.slate import UpcomingFixture
 
-    old_engines = (QuantEngine(game_state_k=ladder_scan.DEFAULT_GAME_STATE_K),
-                   {"tackles": QuantEngine(game_state_k=OLD_TACKLES_K),
-                    "fouls": QuantEngine(game_state_k=ladder_scan.LEAGUE_GAME_STATE_K[LEAGUE]["fouls"])})
-    variants = {"TA (old)": (scan.load_slate_inputs, old_engines),
-                "TA+DP (new)": (ladder_scan.load_pilot_inputs, ladder_scan.pilot_engines(LEAGUE))}
+    from prop_alpha.alerts import pilot_ledger
+
+    wider = {sql: pilot_ledger.recount(sql, pilot_ledger.TACKLES_PLUS_CHALLENGES_LOST_SQL) for sql in ladder_scan.PILOT_QUERIES}
+    wider_engines = (QuantEngine(game_state_k=ladder_scan.DEFAULT_GAME_STATE_K),
+                     {"tackles": QuantEngine(game_state_k=TA_DP_TACKLES_K),
+                      "fouls": QuantEngine(game_state_k=ladder_scan.LEAGUE_GAME_STATE_K[LEAGUE]["fouls"])})
+
+    def load_wider(cur: Any, fixture: UpcomingFixture) -> scan.SlateInputs:
+        return scan.load_slate_inputs(ladder_scan.PilotCursor(cur, wider), fixture)
+
+    variants = {"TA (pilot)": (ladder_scan.load_pilot_inputs, ladder_scan.pilot_engines(LEAGUE)),
+                "TA+DP (12 Oct)": (load_wider, wider_engines)}
     # variant -> (odds fixture, player, k) -> (p_win, p_lose)
     priced: dict[str, dict[tuple[str, int, int], tuple[float, float]]] = {label: {} for label in variants}
     conn = psycopg2.connect(PILOT_DSN)
@@ -290,7 +298,7 @@ def model_v_book(fixtures: Mapping[str, tuple[str, str, datetime]], ladders: Map
                   f"(ratio {book_p.mean() / model_p.mean():.2f}), correlation {np.corrcoef(model_p, book_p)[0, 1]:.2f}, "
                   f"mean EV {ev.mean():+.1%}, lines >= {SCREEN_EV:.0%}: {int((ev >= SCREEN_EV).sum())}, of which within the "
                   f"{PLAUSIBLE_EDGE_CAP:.0%} guard: {int(((ev >= SCREEN_EV) & (edge <= PLAUSIBLE_EDGE_CAP)).sum())}")
-            if label.startswith("TA+DP"):
+            if label == "TA (pilot)":
                 within = [r for r in rows if r[2] >= SCREEN_EV and r[0] / r[1] - 1.0 <= PLAUSIBLE_EDGE_CAP]
                 for p_model, p_book, value, pid, k in sorted(within, key=lambda r: -r[2])[:8]:
                     print(f"      within the guard: {names.get(pid, pid)} {k}+: model {p_model:.2f} v implied {p_book:.2f}, "

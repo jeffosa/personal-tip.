@@ -205,24 +205,29 @@ class _QueryLog:
 
 
 def test_the_pilot_loads_history_and_league_levels_on_its_own_tackles_count() -> None:
-    """2026-10-12: the pilot counts tackles attempted plus challenges lost (the bookmakers' ladders fit it, MARKET_CONTRACT.md
-    section 2b) through the frozen loader, which itself still runs the frozen queries for League One/Two."""
+    """2026-10-13: the pilot is back on plain tackles_attempted (settled results contradicted tackles plus challenges lost,
+    MARKET_CONTRACT.md 2e), so its queries are the frozen ones. The count stays a setting: another count is loaded through
+    the same frozen loader by rewriting its two count queries only."""
+    assert pilot_ledger.PILOT_TACKLES_SQL == "s.tackles_attempted"
     pilot, frozen = _QueryLog(), _QueryLog()
     ladder_scan.load_pilot_inputs(pilot, FIXTURE)
     scan.load_slate_inputs(frozen, FIXTURE)
     assert scan.HISTORY_SQL in frozen.queries and scan.LEVEL_SQL in frozen.queries
-    assert scan.HISTORY_SQL not in pilot.queries and scan.LEVEL_SQL not in pilot.queries
-    recounted = [sql for sql in pilot.queries if "dribbled_past" in sql]
-    assert recounted == [ladder_scan.PILOT_QUERIES[scan.HISTORY_SQL], ladder_scan.PILOT_QUERIES[scan.LEVEL_SQL]]
+    assert pilot.queries == frozen.queries
+    wider = {sql: pilot_ledger.recount(sql, pilot_ledger.TACKLES_PLUS_CHALLENGES_LOST_SQL) for sql in ladder_scan.PILOT_QUERIES}
+    other = _QueryLog()
+    scan.load_slate_inputs(ladder_scan.PilotCursor(other, wider), FIXTURE)
+    recounted = [sql for sql in other.queries if "dribbled_past" in sql]
+    assert recounted == [wider[scan.HISTORY_SQL], wider[scan.LEVEL_SQL]]
     assert "(s.tackles_attempted + s.dribbled_past), s.fouls_committed" in recounted[0]
     assert "sum((s.tackles_attempted + s.dribbled_past)), sum(s.fouls_committed)" in recounted[1]
-    assert len(pilot.queries) == len(frozen.queries)  # every other query passes through unchanged
+    assert len(other.queries) == len(frozen.queries)  # every other query passes through unchanged
 
 
 def test_the_pilot_digest_names_its_tackles_count(monkeypatch: pytest.MonkeyPatch) -> None:
     """A prediction priced on the old count is never mistaken for one priced on the new."""
     current = ladder_scan.pilot_settings_digest()
-    monkeypatch.setattr(pilot_ledger, "PILOT_TACKLES_SQL", "s.tackles_attempted")
+    monkeypatch.setattr(pilot_ledger, "PILOT_TACKLES_SQL", pilot_ledger.TACKLES_PLUS_CHALLENGES_LOST_SQL)
     assert ladder_scan.pilot_settings_digest() != current
 
 
@@ -234,9 +239,9 @@ def test_the_pilot_prices_with_its_own_settings_by_league_not_the_frozen_ones() 
     # A league without its own fit uses the English Championship's: tackles 21.1, fouls 1000.
     assert fallback[(9101, 1, "tackles")].game_state_k == 21.1 and fallback[(9101, 1, "fouls")].game_state_k == 1000.0
     brazil, _ = ladder_scan.price_pilot(FIXTURE, inputs, *ladder_scan.pilot_engines(FIXTURE.league))
-    assert brazil[(9101, 1, "tackles")].game_state_k == 17.312 and brazil[(9101, 1, "fouls")].game_state_k == 40.556
+    assert brazil[(9101, 1, "tackles")].game_state_k == 496.882 and brazil[(9101, 1, "fouls")].game_state_k == 40.556
     frozen, _ = scan.price_fixture(FIXTURE, inputs, *scan.scan_engines())
-    assert frozen[(9101, 1, "tackles")].game_state_k == scan.SCAN_GAME_STATE_K_BY_MARKET["tackles"] not in (21.1, 17.312)
+    assert frozen[(9101, 1, "tackles")].game_state_k == scan.SCAN_GAME_STATE_K_BY_MARKET["tackles"] not in (21.1, 496.882)
     # The pilot applies no rate multiplier and its own prior strength: the same call by hand agrees.
     by_hand, _ = build_projections(FIXTURE, inputs.squad, inputs.history_by_player, inputs.team_recent_fixtures,
                                    RATES, QuantEngine(game_state_k=6.0),

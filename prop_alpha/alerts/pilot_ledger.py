@@ -12,8 +12,8 @@ see these files. The paper P&L is "had the tip been taken at the alerted price a
     python -m prop_alpha.alerts.pilot_ledger --record 3 won      # the bookmaker's result for paper bet 3 (you read it off the site)
     python -m prop_alpha.alerts.pilot_ledger --reconcile         # your recorded results v automatic settlement; exit 1 on a discrepancy
 
-Automatic settlement is the assumed market contract (tackles = Sportmonks `tackles_attempted + dribbled_past` since 2026-10-12,
-PILOT_TACKLES_SQL, the count the pilot prices; fouls = `fouls_committed`, void if
+Automatic settlement is the assumed market contract (tackles = PILOT_TACKLES_SQL, the count the pilot prices: Sportmonks
+`tackles_attempted` again since 2026-10-13; fouls = `fouls_committed`, void if
 the player does not play, a whole-line count is a push), read from `prop_alpha_pilot`. It is provisional until bookmaker results
 agree: a `--record` result is the bookmaker's, and `--reconcile` says AGREE or DISCREPANCY for each. Only the AGREE count says anything
 about whether the contract is right (alerts/closing is the League One/Two equivalent). Closing prices come from
@@ -49,19 +49,24 @@ from prop_alpha.alerts.telegram import TelegramNotifier, TipLine, load_config
 from prop_alpha.config import DEFAULT_PILOT_DSN, PILOT_DSN_ENV
 from prop_alpha.scanner.slate import UpcomingFixture
 
-# The pilot's tackles count (maintainer, 2026-10-12): tackles attempted plus challenges lost (Sportmonks dribbled_past). The
-# Brazil Serie A bookmakers' ladders price a count about 45% above tackles_attempted alone, and this one fits their level and
-# shape best (MARKET_CONTRACT.md section 2b; a lead, not a verified rule). The pilot prices AND settles on it; the frozen
-# League One/Two model and its ledger keep tackles_attempted.
-PILOT_TACKLES_SQL: Final[str] = "(s.tackles_attempted + s.dribbled_past)"
+# The pilot's tackles count: plain `tackles_attempted` (Opta's "Tackles"), as the frozen League One/Two model (maintainer,
+# 2026-10-13). From 2026-10-12 to 2026-10-13 it was tackles attempted plus challenges lost, because the Brazil Serie A ladders
+# price a count about 45% above tackles_attempted and that one fitted their level and shape best (MARKET_CONTRACT.md 2b). The
+# first settled results that tell the counts apart contradict it (section 2e): SportyBet settled Marcinho 2+ LOST with 0 tackles
+# and 3 challenges lost, and Wallace Yan 2+ LOST with 1 tackle and 1 interception, so that book counts neither challenges lost
+# nor interceptions, and the price gap reads as margin. The pilot prices AND settles on this count. It stays a setting (recount,
+# ladder_scan.PilotCursor) so a confirmed bet365 rule can be adopted in one line.
+PILOT_TACKLES_SQL: Final[str] = "s.tackles_attempted"
+# The count of 2026-10-12, kept for the diagnostics that compare the two (scripts/pilot_gap_diagnosis.py).
+TACKLES_PLUS_CHALLENGES_LOST_SQL: Final[str] = "(s.tackles_attempted + s.dribbled_past)"
 
 
-def recount(sql: str) -> str:
-    """`sql` with its one `s.tackles_attempted` replaced by PILOT_TACKLES_SQL; anything else is refused, so a change to the
-    query it copies cannot silently leave the pilot on the other count."""
+def recount(sql: str, count: str = PILOT_TACKLES_SQL) -> str:
+    """`sql` with its one `s.tackles_attempted` replaced by `count`; anything else is refused, so a change to the query it
+    copies cannot silently leave the pilot on another count."""
     if sql.count("s.tackles_attempted") != 1:
         raise ValueError(f"expected exactly one s.tackles_attempted in the query, found {sql.count('s.tackles_attempted')}")
-    return sql.replace("s.tackles_attempted", PILOT_TACKLES_SQL)
+    return sql.replace("s.tackles_attempted", count)
 
 
 PILOT_SETTLEMENT_SQL: Final[str] = recount(ledger.SETTLEMENT_SQL)

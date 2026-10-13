@@ -12,9 +12,9 @@ It is the League One/Two scan (alerts/scan.py) with these differences, and nothi
 * Leagues: Sportmonks league ids are read from the plan's own league list (sportmonks.PILOT_LEAGUES_WANTED), so a
   league the plan does not include is reported ("not in the Sportmonks plan"), never guessed.
 * Pricing is the pilot's, read from the pilot database `prop_alpha_pilot` (read-only), never from the working
-  `prop_alpha`: tackles counted as tackles attempted plus challenges lost (pilot_ledger.PILOT_TACKLES_SQL, 2026-10-12: the
-  bookmakers' ladders fit that count, MARKET_CONTRACT.md section 2b; loaded through PilotCursor so the frozen League One/Two
-  queries are untouched), prior strength 6, no rate multiplier, and a game-state k per league and market (LEAGUE_GAME_STATE_K: Brazil
+  `prop_alpha`: tackles counted as pilot_ledger.PILOT_TACKLES_SQL (plain tackles_attempted since 2026-10-13, after settled
+  results contradicted the 2026-10-12 tackles-plus-challenges-lost count, MARKET_CONTRACT.md 2e; loaded through PilotCursor so the
+  frozen League One/Two queries are untouched), prior strength 6, no rate multiplier, and a game-state k per league and market (LEAGUE_GAME_STATE_K: Brazil
   Serie A's own fit; the English Championship's 21.1 for tackles and 1000 for fouls for the Scottish leagues, which have no
   backtest at all). These are NOT the frozen League One/Two settings and are not frozen themselves: the model_freeze
   fingerprint and the League One/Two lockbox are untouched, and no pilot lockbox exists.
@@ -96,14 +96,14 @@ from prop_alpha.scanner.slate import (
 logger = logging.getLogger("prop_alpha.ladder_scan")
 
 # The pilot's pricing settings. Game-state dispersion k per market: Brazil Serie A has its own, fitted by scripts/quick_backtest.py
-# on its matches before 2026-03-01 and scored on 4,808 starters in 253 matches after that date: tackles 17.312 on the pilot's
-# count (tackles attempted + challenges lost, BACKTEST_TACKLES=attempted_plus_dribbled_past, run 2026-10-12; Brier skill +0.062
-# to +0.086 over lines 0.5-3.5, slopes 0.95-1.00; it was 496.882 on tackles attempted alone), fouls 40.556 (2026-10-11). A league
+# on its matches before 2026-03-01 and scored on 4,808 starters in 253 matches after that date: tackles 496.882 on the pilot's
+# count (plain tackles_attempted, run 2026-10-11 and again 2026-10-12: Brier skill +0.062 to +0.077 over lines 0.5-2.5, slopes
+# 0.93-1.02; it was 17.312 on tackles plus challenges lost, the count of 2026-10-12 only), fouls 40.556 (2026-10-11). A league
 # without its own (the two Scottish leagues, which have no backtest) falls back to the English Championship's fit of 2026-10-08,
 # made on tackles attempted alone: a guess twice over.
 DEFAULT_GAME_STATE_K: Final[float] = 6.0
 GAME_STATE_K: Final[Mapping[str, float]] = {"tackles": 21.1, "fouls": 1000.0}
-LEAGUE_GAME_STATE_K: Final[Mapping[str, Mapping[str, float]]] = {"Brazil Serie A": {"tackles": 17.312, "fouls": 40.556}}
+LEAGUE_GAME_STATE_K: Final[Mapping[str, Mapping[str, float]]] = {"Brazil Serie A": {"tackles": 496.882, "fouls": 40.556}}
 PRIOR_STRENGTH: Final[Mapping[str, float]] = {"tackles": 6.0, "fouls": 6.0}
 # Only tackles are tipped, as in the League One/Two scan; fouls are priced but never staked or tipped (the pilot's
 # fouls calibration slopes were 0.86 and 0.89 against the 0.9-1.1 the PRD requires).
@@ -159,13 +159,14 @@ PILOT_QUERIES: Final[Mapping[str, str]] = {sql: pilot_ledger.recount(sql) for sq
 class PilotCursor:
     """Runs the pilot's queries in place of the frozen scan's two count queries (PILOT_QUERIES) and passes every other query
     through, so scan.load_slate_inputs, which is frozen for League One/Two, loads the pilot's history and league levels on
-    the pilot's tackles count without a copy of it."""
+    the pilot's tackles count without a copy of it. `queries` replaces PILOT_QUERIES (the diagnostics price other counts)."""
 
-    def __init__(self, cur: Any) -> None:
+    def __init__(self, cur: Any, queries: Mapping[str, str] = PILOT_QUERIES) -> None:
         self._cur = cur
+        self._queries = queries
 
     def execute(self, sql: str, params: Any = None) -> None:
-        self._cur.execute(PILOT_QUERIES.get(sql, sql), params)
+        self._cur.execute(self._queries.get(sql, sql), params)
 
     def fetchall(self) -> list[Any]:
         return list(self._cur.fetchall())

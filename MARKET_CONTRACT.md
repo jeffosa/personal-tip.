@@ -133,6 +133,33 @@ the +50% to +224% outliers. Tipping stays paused: what is left is still an unval
   UTC: Fernando 2+, 3+). A leg where tackles alone and tackles plus dribbled past fall on different sides of the line is the
   first settled example that discriminates. FotMob's pages were read by hand in a browser; nothing scrapes them.
 
+### 2e. The first settled results that tell the counts apart (2026-10-13)
+
+Opta counts from FotMob's match pages (read by hand), against SportyBet's settlement of "Player tackles (incl. overtime)" on the
+maintainer's tickets. Every player below took part, so no leg was void.
+
+| player, match (FT) | minutes | Opta tackles | dribbled past | interceptions | SportyBet bet | settled | TA | TA+DP | TA+INT |
+|---|---|---|---|---|---|---|---|---|---|
+| Marcinho, Chapecoense 1-4 Athletico PR (2026-10-12) | 45 | 0 | 3 | 0 | 2+ | **lost** | 0 lose | **3 win** | 0 lose |
+| Wallace Yan, Bragantino 4-2 Cruzeiro (2026-10-13) | 65 | 1 | 0 | 1 | 2+ | **lost** | 1 lose | 1 lose | **2 win** |
+| Doma, Chapecoense 1-4 Athletico PR | 45 | 0 | 0 | 1 | 2+ | lost | lose | lose | lose |
+| Arthur Dias, Chapecoense 1-4 Athletico PR | 45 | 0 | 0 | 1 | 3+ | lost | lose | lose | lose |
+| Fernando, Bragantino 4-2 Cruzeiro | 90 | 0 | 0 | 1 | 2+, 3+ | lost | lose | lose | lose |
+
+**Reading.** Marcinho's leg would have won under tackles plus challenges lost, and Wallace Yan's under tackles plus
+interceptions; both lost. So SportyBet counts **neither challenges lost nor interceptions**: its count agrees with plain
+`tackles_attempted` (Opta "Tackles") on every leg so far (7 of 7 including section 2d). The 45% level gap of section 2b
+therefore reads as **bookmaker margin and longshot shading**, not a wider count. Caveats: SportyBet's data provider is not
+known, so this is SportyBet's rule, not bet365's; two discriminating legs, not a sample. **Decision (maintainer,
+2026-10-13):** the pilot prices and settles on plain `tackles_attempted` again (`pilot_ledger.PILOT_TACKLES_SQL`; Brazil
+tackles k back to 496.882); the count stays a one-line setting. On the archived 2026-10-11 ladders the plain count leaves
+the model at 0.286 against bet365's 0.485 (mean expected profit -37%), with 8 bet365 lines between +4% and the 25% guard:
+the books' overs are expensive, and real edges on them will be rare.
+
+The system's own tips of 2026-10-12 (paper bets 9 and 10, bet365 1+): by the Opta counts Wallace Yan 1+ won (1 tackle) and
+Marcinho 1+ lost (0 tackles; substituted at half-time). Not recorded with `pilot_ledger --record`, which is for bet365's own
+results.
+
 ## 3. Evidence table to fill (West Ham United v Queens Park Rangers, 2026-10-09, final 1-1)
 
 Sportmonks counts are filled in from `.prop_alpha_state/pilot/counts_19729059.json`. The last three columns need an
