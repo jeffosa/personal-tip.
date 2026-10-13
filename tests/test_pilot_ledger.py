@@ -160,13 +160,15 @@ def _settle_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sent: list[st
 def test_paper_bets_settle_on_the_pilot_count_and_the_real_ledger_keeps_its_own(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """2026-10-12: the pilot prices tackles as tackles attempted plus challenges lost, so its paper bets settle on that count;
-    the League One/Two ledger's query is unchanged."""
+    """The pilot's paper bets settle on the count it prices (pilot_ledger.PILOT_TACKLES_SQL: plain tackles_attempted again since
+    2026-10-13), through its own settlement query; the League One/Two ledger's query is unchanged."""
     queries: list[str] = []
     _settle_setup(tmp_path, monkeypatch, [], queries=queries)
     assert pilot_ledger.main(["--settle"]) == 0
     assert queries == [pilot_ledger.PILOT_SETTLEMENT_SQL]
-    assert "(s.tackles_attempted + s.dribbled_past), s.fouls_committed" in pilot_ledger.PILOT_SETTLEMENT_SQL
+    assert pilot_ledger.PILOT_SETTLEMENT_SQL == ledger.SETTLEMENT_SQL  # the same count as League One/Two again
+    wider = pilot_ledger.recount(ledger.SETTLEMENT_SQL, pilot_ledger.TACKLES_PLUS_CHALLENGES_LOST_SQL)
+    assert "(s.tackles_attempted + s.dribbled_past), s.fouls_committed" in wider
     assert "s.minutes_played, s.tackles_attempted, s.fouls_committed" in ledger.SETTLEMENT_SQL
     for bad in ("SELECT 1", "SELECT s.tackles_attempted, s.tackles_attempted"):
         with pytest.raises(ValueError, match="exactly one s.tackles_attempted"):
