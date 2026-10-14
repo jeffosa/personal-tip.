@@ -62,6 +62,7 @@ PURE_MODULES: tuple[str, ...] = (
     "prop_alpha/scanner/value_screen.py",
     # Vendor adapter: response -> transform payload, same no-I/O and determinism rules.
     "prop_alpha/ingestion/sportmonks.py",
+    "prop_alpha/ingestion/thestatsapi.py",
     "prop_alpha/ingestion/oddspapi.py",
     # Scan slate: projections and mock quotes for the 4-hourly opportunity scan.
     "prop_alpha/scanner/slate.py",
