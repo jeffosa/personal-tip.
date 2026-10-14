@@ -21,7 +21,7 @@ import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from typing import Any, Callable, Final, Iterable, Mapping, TypeVar
+from typing import Any, Callable, Final, Iterable, Mapping, Sequence, TypeVar
 from urllib.parse import urlsplit
 
 import psycopg2
@@ -33,7 +33,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from prop_alpha.config import credential
-from prop_alpha.ingestion import oddspapi, sportmonks
+from prop_alpha.ingestion import oddspapi, sportmonks, thestatsapi
 from prop_alpha.ingestion.transform import (
     DEFAULT_KAPPAS,
     STAGING_COLUMNS,
@@ -67,6 +67,9 @@ _NON_NEGATIVE_INT: Final[re.Pattern[str]] = re.compile(r"\d+")
 
 
 PayloadAdapter = Callable[[Mapping[str, Any]], dict[str, Any]]
+# An adapter that needs the fixture's vendor uid as well (TheStatsAPI: the player-stats reply carries no match details, which
+# the adapter takes from the listing by uid).
+FixtureAdapter = Callable[[str, Mapping[str, Any]], dict[str, Any]]
 
 
 class QuotaExhaustedError(RuntimeError):
@@ -183,6 +186,8 @@ class VendorClient:
         lineups_path: str = "fixtures/{uid}/lineups",
         stats_adapter: PayloadAdapter | None = None,
         lineups_adapter: PayloadAdapter | None = None,
+        fixture_adapter: FixtureAdapter | None = None,
+        quota_headers: Sequence[str] = QUOTA_REMAINING_HEADERS,
     ) -> None:
         """Every attempt, retries included, spends vendor quota. `max_requests` caps attempts for this
         client's lifetime; `quota_reserve` stops all further requests once the vendor's remaining-quota
@@ -191,7 +196,11 @@ class VendorClient:
         The key is sent as `{auth_header}: {auth_prefix}{api_key}`, or as the query parameter `auth_query_param`
         when that is set (OddsPapi). Errors never quote the request URL, which may carry the key. The adapters are pure functions from the
         vendor's response to the shapes transform.py parses (e.g. ingestion.sportmonks); they run in the
-        worker before any connection is taken, and the adapted payload is what raw_payloads stores."""
+        worker before any connection is taken, and the adapted payload is what raw_payloads stores. `fixture_adapter`,
+        when set, replaces `stats_adapter` and also receives the fixture's uid. `quota_headers` names the headers that
+        report the vendor's remaining quota (TheStatsAPI's X-RateLimit-Remaining is a per-minute budget, not a quota)."""
+        if stats_adapter is not None and fixture_adapter is not None:
+            raise ValueError("give stats_adapter or fixture_adapter, not both")
         if "{uid}" not in stats_path or "{uid}" not in lineups_path:
             raise ValueError("stats_path and lineups_path must contain {uid}")
         if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
@@ -218,6 +227,8 @@ class VendorClient:
         self.lineups_path = lineups_path
         self.stats_adapter = stats_adapter
         self.lineups_adapter = lineups_adapter
+        self.fixture_adapter = fixture_adapter
+        self.quota_headers = tuple(quota_headers)
         self.requests_sent = 0
         self._quota_stop: str | None = None
         self._quota_lock = threading.Lock()
@@ -256,7 +267,7 @@ class VendorClient:
             self.requests_sent += 1
 
     def _record_remaining_quota(self, headers: Mapping[str, str]) -> None:
-        for name in QUOTA_REMAINING_HEADERS:
+        for name in self.quota_headers:
             value = headers.get(name)
             if value is not None and _NON_NEGATIVE_INT.fullmatch(value.strip()):
                 remaining = int(value.strip())
@@ -331,6 +342,8 @@ class VendorClient:
 
     def get_fixture_feed(self, fixture_vendor_uid: str) -> dict[str, Any]:
         body = self.get_json(self.stats_path.format(uid=fixture_vendor_uid))
+        if self.fixture_adapter is not None:
+            return self.fixture_adapter(fixture_vendor_uid, body)
         return self.stats_adapter(body) if self.stats_adapter is not None else body
 
     def get_lineups(self, fixture_vendor_uid: str) -> dict[str, Any]:
@@ -638,6 +651,32 @@ def build_vendor_client(environ: Mapping[str, str]) -> VendorClient:
     return VendorClient(
         environ["DATA_VENDOR_BASE_URL"], environ["DATA_VENDOR_API_KEY"], limiter,
         max_requests=max_requests, quota_reserve=quota_reserve,
+    )
+
+
+# TheStatsAPI's trial allows 12 requests a minute (the paid Starter plan 120): the default stays under the trial's.
+THESTATSAPI_RPS: Final[float] = 0.19
+
+
+def build_thestatsapi_client(environ: Mapping[str, str], matches: Mapping[str, Mapping[str, Any]] | None = None) -> VendorClient:
+    """TheStatsAPI client: key from THESTATSAPI_KEY (environment or `.env`) as a Bearer token, at most THESTATSAPI_RPS
+    requests a second (THESTATSAPI_RPS in the environment overrides it), the monthly quota read from
+    X-Monthly-Quota-Remaining, DATA_VENDOR_MAX_REQUESTS and DATA_VENDOR_QUOTA_RESERVE as for any vendor. With `matches`
+    (match uid -> its listing row), get_fixture_feed returns transform.py's payload (thestatsapi.fixture_payload); a uid
+    not in it is refused, since the player-stats reply alone has no teams, kickoff or score."""
+    def adapt(uid: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        if matches is None or uid not in matches:
+            raise ValueError(f"match {uid}: not in the listing given to the client")
+        return thestatsapi.fixture_payload(matches[uid], body)
+
+    max_requests = int(environ["DATA_VENDOR_MAX_REQUESTS"]) if environ.get("DATA_VENDOR_MAX_REQUESTS") else None
+    return VendorClient(
+        thestatsapi.BASE_URL, credential(thestatsapi.KEY_NAME, environ),
+        TokenBucketRateLimiter(rate_per_sec=float(environ.get("THESTATSAPI_RPS", THESTATSAPI_RPS)), burst=1),
+        timeout=30.0, max_requests=max_requests, quota_reserve=int(environ.get("DATA_VENDOR_QUOTA_RESERVE", "0")),
+        auth_header="Authorization", auth_prefix="Bearer ",
+        stats_path=thestatsapi.PLAYER_STATS_PATH, lineups_path=thestatsapi.LINEUPS_PATH,
+        fixture_adapter=adapt if matches is not None else None, quota_headers=thestatsapi.QUOTA_HEADERS,
     )
 
 
