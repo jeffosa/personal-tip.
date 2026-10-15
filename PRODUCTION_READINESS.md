@@ -11,7 +11,24 @@ settlements, closing prices) that code cannot produce. They take calendar time a
 
 Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not executed where it will run · **[N]** not built.
 
-## Status on 2026-10-10 (read this first; the rest of the file is the 2026-10-05 history)
+## Status on 2026-10-15 (read this first; the sections below are history)
+
+**Still PAPER ONLY. Settlement and model validation are open (High).** No PRD go-live gate has been passed, and none can be
+passed by code: each needs evidence that only calendar time, bookmaker results or the maintainer can supply. Measured today:
+
+| Gate evidence | State on 2026-10-15 | What closes it, and who |
+|---|---|---|
+| Gate 2 lockbox (League One/Two, frozen model) | **0 lockbox predictions.** The lockbox restarted on 2026-10-17 with the move to TheStatsAPI (`model_freeze.LOCKBOX_START`); all 2,715 logged predictions are earlier and do not count. The phase 3 backtests on TheStatsAPI data confirmed the frozen settings, so FROZEN_DIGEST is unchanged and no re-freeze moved the start again. | Time: the first countable matches are Saturday 17 Oct. At roughly 20 scored starters a match (an estimate from the backtests), 500 per market needs about two full rounds; the calibration criteria may need more. **Blocker (maintainer): TheStatsAPI's trial ends 2026-10-20.** Without results ingestion after that, no lockbox match can be scored. |
+| Settlement contract (`MARKET_CONTRACT.md`) | **Unverified.** bet365's rules pages cannot be opened from here (403). The only settled bookmaker evidence is two SportyBet legs (section 2e), which support plain tackles at that book only. | Maintainer: read the bet365 pages named in `MARKET_CONTRACT.md` section 1 and fill its section 3 table; report real bookmaker results (`settled <id> won|lost|void` for real bets, `pilot_ledger --record <id> won|lost|void` for paper bets). |
+| Settlement reconciliation (Gate 3, criterion 4) | **0 bookmaker results recorded** in either ledger (`ledger --reconcile` and `pilot_ledger --reconcile`: nothing verified). The 10 pilot paper bets were stranded on Sportmonks ids after the vendor move; `scripts/pilot_settle_by_name.py` settled them on 2026-10-15 from TheStatsAPI's counts, matched by club and player name: 1 won, 9 lost, paper profit -88.73 on 95.03 staked, **all provisional** (assumed rules, no bookmaker result). | Needs bookmaker results to compare. Automatic settlement alone cannot verify itself. |
+| Paper trading (Gate 3) | **0 paper bets from the frozen model, 0 closing prices.** No bookmaker has quoted a League One/Two tackles or fouls line (OddsPapi, since 2026-10-03), so the frozen model has nothing to paper-trade against. The 10 pilot paper bets are from the unfrozen pilot (8 reconstructed without model numbers) and do not count. | A bookmaker quoting these markets for League One/Two, or a maintainer decision on which markets and books Gate 3 covers. Per-player `bench_sub_probability` is still **[N]**. |
+| Scope | Card markets (a PRD target) are not priced. | Maintainer decision: build them or scope Gate 2 to tackles and fouls. |
+
+Changes on 2026-10-15 [T]: `replies.AUTO_BASIS` now says TheStatsAPI stats (it still said Sportmonks after the phase 2 switch);
+`scripts/pilot_settle_by_name.py` refuses, rather than voids, any bet not matched to exactly one match and one player
+(`tests/test_pilot_settle_by_name.py`).
+
+## Status on 2026-10-10 (history)
 
 **PAPER / SHADOW ONLY.** Deployment, scheduling, backup, restore, monitoring and rollback are in `RUNBOOK.md`.
 
@@ -46,13 +63,13 @@ Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not e
 
 | # | Item | Status | Blocking a 7/10? |
 |---|---|---|---|
-| 1 | Locked model evaluation (PRD Gate 2) | Frozen; collecting. 0 lockbox outcomes yet | Yes: needs ≥ 500 lockbox predictions per market |
-| 2 | Settlement verified against each bookmaker | Labelled provisional; confirmed-only total added [T]. Not yet verified | Yes: needs real settled examples |
+| 1 | Locked model evaluation (PRD Gate 2) | Frozen; lockbox restarted 2026-10-17 on TheStatsAPI data; 0 lockbox outcomes (2026-10-15) | Yes: needs ≥ 500 lockbox predictions per market |
+| 2 | Settlement verified against each bookmaker | Labelled provisional; confirmed-only total added [T]. Not yet verified: 0 bookmaker results (2026-10-15) | Yes: needs real settled examples |
 | 3 | Database checks mandatory in release CI | Done [T] locally; GitHub workflow [U] | No |
 | 4 | Type diagnostics resolved and gated in CI | Done [T]: pyright 32 → 0, mypy 29 → 0 | No |
 | 5 | Odds-feed failure isolation per bookmaker | Done [T] | No |
 | 6 | Alert-delivery recovery | Done [T] | No |
-| 7 | Paper-trading gate (PRD Gate 3) | Closing capture built; 0 closing prices, 0 paper bets | Yes: no tackles/fouls line has been quoted yet |
+| 7 | Paper-trading gate (PRD Gate 3) | Closing capture built; 0 closing prices, 0 frozen-model paper bets (2026-10-15) | Yes: no tackles/fouls line has been quoted yet |
 
 ## Done in this change
 
