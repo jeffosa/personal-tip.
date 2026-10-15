@@ -256,6 +256,17 @@ class VendorClient:
                 self._sessions.append(session)
         return session
 
+    def _drop_session(self) -> None:
+        """Close and forget this thread's session; the next request opens a fresh one."""
+        session = getattr(self._local, "session", None)
+        if session is None:
+            return
+        self._local.session = None
+        with self._sessions_lock:
+            if session in self._sessions:
+                self._sessions.remove(session)
+        session.close()
+
     def _spend_request(self) -> None:
         """Reserve one request of the budget, or raise without sending anything."""
         with self._quota_lock:
@@ -290,6 +301,10 @@ class VendorClient:
         try:
             return self._session().get(url, params=params, timeout=self.timeout)
         except requests.RequestException as exc:
+            # A failed request may leave the thread's pooled connection broken (2026-10-14/15: after a Wi-Fi dropout the
+            # TheStatsAPI backfill failed every request for about 4 hours with "EOF occurred in violation of protocol" while
+            # fresh connections worked), so the session is dropped and the next request opens a new one.
+            self._drop_session()
             # requests quotes the full URL in its messages; with query authentication that includes the key.
             detail = "details withheld: the URL carries the API key" if params is not None else str(exc)
             raise requests.ConnectionError(f"{type(exc).__name__} ({detail})") from None

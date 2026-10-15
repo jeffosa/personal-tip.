@@ -231,6 +231,9 @@ def test_query_param_key_never_appears_in_errors() -> None:
             assert params is not None
             raise requests.ConnectionError(f"Max retries exceeded with url: /v4/account?apiKey={params['apiKey']}")
 
+        def close(self) -> None:  # a failed request now closes and drops the thread's session
+            return None
+
     client._local.session = Failing()
     with pytest.raises(requests.ConnectionError) as caught:
         client.get_json_value("account")
