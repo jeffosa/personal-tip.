@@ -195,3 +195,116 @@ def test_a_failed_request_drops_the_threads_connection_so_the_next_one_starts_fr
     fresh = client._session()  # noqa: SLF001
     assert fresh is not broken and broken not in client._sessions and client._sessions == [fresh]  # noqa: SLF001
     client.close()
+
+
+# ---------------- phase 2 (2026-10-15): ids, line-ups, club names, listings, settlement ----------------
+def test_a_match_id_round_trips_through_the_integer_the_frozen_code_keys_fixtures_by() -> None:
+    assert thestatsapi.fixture_number("mt_010487045") == 10487045  # 235 of 2,408 listed ids start with a zero
+    assert thestatsapi.match_uid(10487045) == "mt_010487045"
+    assert thestatsapi.match_uid(thestatsapi.fixture_number("mt_986401287")) == "mt_986401287"
+    for bad in ("19621780", "mt_12345", "mt_0104870451", "tm_010487045"):
+        with pytest.raises(ValueError, match="nine digits"):
+            thestatsapi.fixture_number(bad)
+    for number in (-1, 10 ** 9, True):
+        with pytest.raises(ValueError, match="not a TheStatsAPI match number"):
+            thestatsapi.match_uid(number)
+
+
+def _lineups(confirmed: bool = True, home_xi: int = 11, missing_id: bool = False) -> dict[str, Any]:
+    def side(team: str, xi: int) -> dict[str, Any]:
+        starters = [{"id": f"{team}_s{i}", "name": "x", "position": "M", "jersey_number": i} for i in range(xi)]
+        if missing_id and team == "tm_h":
+            starters[0] = {"id": None, "name": "Unknown"}
+        return {"id": team, "name": team, "formation": "4-4-2", "starting_xi": starters,
+                "substitutes": [{"id": f"{team}_b1"}, {"id": None, "name": "no id"}]}
+    return {"data": {"match_id": "mt_000000001", "confirmed": confirmed, "type": "played",
+                     "home": side("tm_h", home_xi), "away": side("tm_a", 11)}}
+
+
+def test_line_ups_become_team_sheets_and_a_predicted_one_is_marked_unconfirmed() -> None:
+    from prop_alpha.alerts import lineup_capture
+
+    payload = thestatsapi.lineup_payload(_lineups())
+    assert payload["fixture"] == {"uid": "mt_000000001", "home_team_uid": "tm_h", "away_team_uid": "tm_a", "confirmed": True}
+    assert len(payload["lineups"]["tm_h"]["starters"]) == 11 and payload["lineups"]["tm_h"]["bench"] == ["tm_h_b1"]
+    assert lineup_capture.sheet_status(payload) == "confirmed"
+    assert lineup_capture.sheet_status(thestatsapi.lineup_payload(_lineups(confirmed=False))) == "incomplete"
+    assert lineup_capture.sheet_status(thestatsapi.lineup_payload(_lineups(home_xi=10))) == "incomplete"
+    with pytest.raises(ValueError, match="starting XI lists a player without an id"):
+        thestatsapi.lineup_payload(_lineups(missing_id=True))
+    with pytest.raises(ValueError, match="expected a data object"):
+        thestatsapi.lineup_payload({"data": []})
+
+
+def test_athletico_paranaense_matches_the_bookmakers_name_and_other_clubs_do_not_change() -> None:
+    """2026-10-15: TheStatsAPI's "Athletico" and OddsPapi's "CA Paranaense PR" shared no word."""
+    from prop_alpha.ingestion.oddspapi import team_tokens
+
+    assert team_tokens("Athletico") & team_tokens("CA Paranaense PR")
+    assert team_tokens("Milton Keynes Dons") == {"milton", "keynes", "dons"}
+    assert not team_tokens("Walsall") & team_tokens("CA Paranaense PR")
+
+
+def test_the_listing_reads_every_page_of_every_competition_soonest_first() -> None:
+    from datetime import date
+
+    from prop_alpha.ingestion.pipeline import list_matches
+
+    class Listing:
+        def __init__(self) -> None:
+            self.paths: list[str] = []
+
+        def get_json(self, path: str) -> dict[str, Any]:
+            self.paths.append(path)
+            page = int(path.split("&page=")[1].split("&")[0])
+            competition = path.split("competition_id=")[1].split("&")[0]
+            day = 20 - page if competition == "comp_4023" else 10 + page
+            row = {**MATCH, "id": f"mt_{len(self.paths):09d}", "competition_id": competition,
+                   "utc_date": f"2026-10-{day:02d}T15:00:00Z"}
+            return {"data": [row], "meta": {"total_pages": 2}}
+
+    client = Listing()
+    rows = list_matches(client, thestatsapi.SCAN_COMPETITIONS, date(2026, 10, 1), date(2026, 10, 31), "finished")
+    assert len(client.paths) == 4 and all("status=finished" in p for p in client.paths)  # 2 competitions x 2 pages
+    assert [r["utc_date"][:10] for r in rows] == ["2026-10-11", "2026-10-12", "2026-10-18", "2026-10-19"]
+
+
+def test_settlement_looks_the_bet_up_by_its_thestatsapi_match_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    import psycopg2
+
+    from prop_alpha.alerts import ledger
+
+    asked: list[tuple[Any, ...]] = []
+
+    class _Conn:
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def cursor(self) -> Any:
+            return self
+
+        def execute(self, sql: str, params: tuple[Any, ...]) -> None:
+            asked.append(params)
+
+        def fetchone(self) -> tuple[Any, ...]:
+            return ("final", 90, 2, 1)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(psycopg2, "connect", lambda *args, **kwargs: _Conn())
+
+    class _Bet:
+        fixture_id, player_id = 10487045, 7
+
+    rows = ledger.read_settlement_rows("postgresql://unused", [_Bet()])  # type: ignore[list-item]
+    assert asked == [(7, "mt_010487045")] and rows[(10487045, 7)] == ("final", 90, 2, 1)
+
+
+def test_an_empty_position_is_stored_as_no_position_not_refused() -> None:
+    """mt_732019591 (Brazil Serie A, 2026-10-07) was refused for one player's position ''."""
+    payload = thestatsapi.fixture_payload(MATCH, _stats(_row("pl_1", "tm_h", True, 90, position="")))
+    assert payload["players"][0]["position"] is None

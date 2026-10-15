@@ -47,10 +47,12 @@ STATE_DIR: Final[Path] = ROOT / ".prop_alpha_state"
 BACKUP_DIR_ENV: Final[str] = "PROP_ALPHA_BACKUP_DIR"
 DEFAULT_BACKUP_DIR: Final[Path] = STATE_DIR / "backups" / "daily"
 DEFAULT_KEEP: Final[int] = 14
-SOURCE_DB: Final[str] = "prop_alpha"
+# The TheStatsAPI databases since 2026-10-15 (the Sportmonks ones, prop_alpha and prop_alpha_pilot, are the archive and
+# are in every backup made before that day). The dump file names stay the same.
+SOURCE_DB: Final[str] = "prop_alpha_tsa"
 # The pilot database (Brazil Serie A and the Scottish leagues; audit 2026-10-11, finding 5): dumped beside the working one when
 # it exists, so the pilot's history does not depend on a vendor plan to be rebuilt.
-PILOT_DB: Final[str] = "prop_alpha_pilot"
+PILOT_DB: Final[str] = "prop_alpha_pilot_tsa"
 PILOT_DUMP_NAME: Final[str] = "prop_alpha_pilot.dump"
 _DATABASE_NAME: Final[re.Pattern[str]] = re.compile(r"^[a-z_][a-z0-9_]*$")
 PG_BIN_ENV: Final[str] = "PROP_ALPHA_PG_BIN"

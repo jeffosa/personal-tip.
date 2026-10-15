@@ -15,7 +15,7 @@ import pytest
 from prop_alpha.alerts import ladder_scan, pilot_ledger, scan
 from prop_alpha.alerts.fx import identity as fx_identity
 from prop_alpha.alerts.telegram import SentAlertStore, TelegramConfig, TelegramNotifier
-from prop_alpha.ingestion import oddspapi, sportmonks
+from prop_alpha.ingestion import oddspapi, thestatsapi
 from prop_alpha.modeling.engine import QuantEngine
 from prop_alpha.scanner.market_scanner import LiveOddsQuote
 from prop_alpha.scanner.slate import (
@@ -31,7 +31,7 @@ NOW = datetime(2026, 10, 13, 16, 30, tzinfo=timezone.utc)
 KICKOFF = datetime(2026, 10, 13, 18, 45, tzinfo=timezone.utc)
 FIXTURE = UpcomingFixture(9101, "Brazil Serie A", "76", "348", "Walsall", "Port Vale", KICKOFF)
 RATES = {(position, market): rate for position in ("DEF", "MID") for market, rate in (("tackles", 1.8), ("fouls", 1.2))}
-FINISHED_UID = "7001"
+FINISHED_UID = "mt_000007001"  # a TheStatsAPI match id (the data vendor since 2026-10-15)
 SCOTTISH_ID = 9103
 
 
@@ -52,35 +52,32 @@ def _inputs() -> scan.SlateInputs:
     return scan.SlateInputs(squad, history, recent, RATES)
 
 
-def _row(fixture_id: int, state: str, kickoff: datetime, league: int = 648,
+BRAZIL, SCOTTISH_PREMIERSHIP, LEAGUE_ONE = "comp_4795", "comp_6387", "comp_0196"
+
+
+def _row(number: int, status: str, kickoff: datetime, competition: str = BRAZIL,
          names: tuple[str, str] = ("Walsall", "Port Vale")) -> dict[str, Any]:
-    return {"id": fixture_id, "league_id": league, "state": {"developer_name": state},
-            "starting_at_timestamp": int(kickoff.timestamp()),
-            "participants": [{"id": 76, "name": names[0], "meta": {"location": "home"}},
-                             {"id": 348, "name": names[1], "meta": {"location": "away"}}]}
+    """A TheStatsAPI match listing row."""
+    return {"id": thestatsapi.match_uid(number), "competition_id": competition, "status": status,
+            "utc_date": kickoff.isoformat().replace("+00:00", "Z"),
+            "home_team": {"id": "76", "name": names[0]}, "away_team": {"id": "348", "name": names[1]}}
 
 
-LEAGUE_LIST = {"data": [{"id": 648, "name": "Serie A", "country": {"name": "Brazil"}},
-                        {"id": 12, "name": "League One", "country": {"name": "England"}},
-                        {"id": 501, "name": "Premiership", "country": {"name": "Scotland"}}],
-               "pagination": {"has_more": False}}
-
-
-class _StubSportmonks:
-    """The plan lists Brazil Serie A and the Scottish Premiership (not the Scottish Championship). Every fixture
-    listing answers with a Brazil Serie A match and a Scottish Premiership match about to start, a League One match, and
-    a finished Brazil Serie A match."""
+class _StubTheStatsAPI:
+    """TheStatsAPI's listing: a Brazil Serie A match and a Scottish Premiership match about to start, a League One match
+    (not the pilot's), and a finished Brazil Serie A match; each listing request gets the rows of its competition and
+    status."""
 
     def __init__(self, finished_kickoff: datetime = NOW - timedelta(days=5)) -> None:
-        self.rows = [_row(9101, "NS", KICKOFF), _row(SCOTTISH_ID, "NS", KICKOFF, 501, ("Celtic", "Rangers")),
-                     _row(9102, "NS", KICKOFF, league=12), _row(int(FINISHED_UID), "FT", finished_kickoff)]
+        self.rows = [_row(9101, "scheduled", KICKOFF), _row(SCOTTISH_ID, "scheduled", KICKOFF, SCOTTISH_PREMIERSHIP,
+                                                             ("Celtic", "Rangers")),
+                     _row(9102, "scheduled", KICKOFF, LEAGUE_ONE), _row(7001, "finished", finished_kickoff)]
         self.paths: list[str] = []
 
     def get_json(self, path: str) -> dict[str, Any]:
         self.paths.append(path)
-        if path.startswith("leagues?"):
-            return LEAGUE_LIST
-        return {"data": self.rows, "pagination": {"has_more": False}}
+        found = [r for r in self.rows if f"competition_id={r['competition_id']}&" in path and f"status={r['status']}" in path]
+        return {"data": found, "meta": {"total_pages": 1}}
 
 
 class _Recording(TelegramNotifier):
@@ -127,7 +124,7 @@ def _patch_database(monkeypatch: pytest.MonkeyPatch, stored: set[str]) -> None:
 
 def _run(tmp_path: Path, notifier: _Recording, store: SentAlertStore, **kwargs: Any) -> scan.ScanSummary:
     options: dict[str, Any] = {"odds": "mock", "state_dir": tmp_path, "currency": "GBP"}
-    return ladder_scan.run_ladder_scan(NOW, kwargs.pop("client", _StubSportmonks()), "postgresql://unused", notifier, store,
+    return ladder_scan.run_ladder_scan(NOW, kwargs.pop("client", _StubTheStatsAPI()), "postgresql://unused", notifier, store,
                                        1000.0, kwargs.pop("label", ladder_scan.PILOT_LABEL), **{**options, **kwargs})
 
 
@@ -252,35 +249,14 @@ def test_the_pilot_prices_with_its_own_settings_by_league_not_the_frozen_ones() 
 
 
 # ---------------- listings ----------------
-PILOT = {648: "Brazil Serie A", 501: "Scottish Premiership"}
-
-
-def test_the_plans_league_list_resolves_the_wanted_leagues_and_reports_the_rest() -> None:
-    rows, more = sportmonks.league_rows(LEAGUE_LIST)
-    found, absent = sportmonks.resolve_leagues(rows)
-    assert not more and found == PILOT and absent == ["Scottish Championship"]
-    # A league is told apart by country; an unwanted league (England's Championship, no longer a focus) is ignored.
-    both = [*rows, {"id": 504, "name": "Championship", "country": {"name": "Scotland"}}]
-    assert sportmonks.resolve_leagues(both) == ({**PILOT, 504: "Scottish Championship"}, [])
-    english = {"id": 9, "name": "Championship", "country": {"name": "England"}}
-    assert sportmonks.resolve_leagues([english, {"id": 648, "name": "Serie A", "country": None}]) == (
-        {}, ["Brazil Serie A", "Scottish Championship", "Scottish Premiership"])
-    with pytest.raises(ValueError, match="no 'data' list"):
-        sportmonks.league_rows({"oops": 1})
-
-
-def test_the_listing_helpers_default_to_league_one_and_two_and_take_the_pilot_leagues() -> None:
-    body = {"data": [_row(1, "NS", KICKOFF, 648), _row(2, "NS", KICKOFF, 12), _row(3, "FT", KICKOFF, 648),
-                     _row(4, "FT", KICKOFF, 501), _row(5, "NS", KICKOFF, 501)], "pagination": {"has_more": False}}
-    rows, _ = sportmonks.upcoming_fixtures(body, PILOT)
-    assert [(r["fixture_id"], r["league"]) for r in rows] == [(1, "Brazil Serie A"), (5, "Scottish Premiership")]
-    assert [r["fixture_id"] for r in sportmonks.upcoming_fixtures(body)[0]] == [2]  # the default is unchanged
-    assert sportmonks.finished_with_leagues(body, PILOT)[0] == [("3", KICKOFF, "Brazil Serie A"),
-                                                                ("4", KICKOFF, "Scottish Premiership")]
-    assert [uid for uid, _ in sportmonks.finished_fixtures(body, PILOT)[0]] == ["3", "4"]
-    assert sportmonks.finished_fixtures(body)[0] == []
-    assert "fixtureLeagues:501,648&" in sportmonks.upcoming_path(NOW, NOW, 1, PILOT)
-    assert "fixtureLeagues:12,14&" in sportmonks.upcoming_path(NOW, NOW, 1)
+def test_the_pilot_competitions_and_the_listing_keep_only_the_pilot_leagues_scheduled_matches() -> None:
+    assert sorted(thestatsapi.PILOT_COMPETITIONS.values()) == ["Brazil Serie A", "Scottish Championship",
+                                                               "Scottish Premiership"]
+    rows = [_row(1, "scheduled", KICKOFF), _row(2, "scheduled", KICKOFF, LEAGUE_ONE), _row(3, "finished", KICKOFF),
+            _row(5, "scheduled", KICKOFF, SCOTTISH_PREMIERSHIP)]
+    fixtures = [f for f in (thestatsapi.upcoming_fixture(r, thestatsapi.PILOT_COMPETITIONS) for r in rows) if f]
+    assert [(f["fixture_id"], f["league"]) for f in fixtures] == [(1, "Brazil Serie A"), (5, "Scottish Premiership")]
+    assert [f["fixture_id"] for f in (thestatsapi.upcoming_fixture(r, thestatsapi.SCAN_COMPETITIONS) for r in rows) if f] == [2]
 
 
 # ---------------- the stale-database gate ----------------
@@ -320,21 +296,13 @@ def test_a_window_with_no_pilot_match_reads_no_database(monkeypatch: pytest.Monk
     import psycopg2
 
     monkeypatch.setattr(psycopg2, "connect", lambda *a, **k: pytest.fail("the database must not be opened"))
-    empty = _StubSportmonks()
-    empty.rows = [_row(9102, "NS", KICKOFF, league=12)]  # League One only: the other scan's
+    empty = _StubTheStatsAPI()
+    empty.rows = [_row(9102, "scheduled", KICKOFF, LEAGUE_ONE)]  # League One only: the other scan's
     summary = _run(tmp_path, _Recording(SentAlertStore(tmp_path / "s.jsonl")), SentAlertStore(tmp_path / "s.jsonl"),
                    client=empty)
     assert summary.fixtures == [] and "Matches in this window: 0" in ladder_scan.summary_text(summary, "")
-    assert all("fixtureLeagues:501,648&" in path for path in empty.paths if not path.startswith("leagues?"))
-
-
-def test_a_token_with_none_of_the_pilot_leagues_scans_nothing_and_says_so(tmp_path: Path) -> None:
-    bare = _StubSportmonks()
-    bare.get_json = lambda path: {"data": [], "pagination": {"has_more": False}}  # type: ignore[method-assign]
-    summary = _run(tmp_path, _Recording(SentAlertStore(tmp_path / "s.jsonl")), SentAlertStore(tmp_path / "s.jsonl"),
-                   client=bare)
-    assert summary.fixtures == []
-    assert "Not in the Sportmonks plan, not scanned: Brazil Serie A, Scottish Championship, Scottish Premiership" in summary.odds_notes[0]
+    asked = {path.split("competition_id=")[1].split("&")[0] for path in empty.paths}
+    assert asked == set(thestatsapi.PILOT_COMPETITIONS)  # only the pilot leagues are listed
 
 
 # ---------------- ladder quotes ----------------
@@ -387,7 +355,6 @@ def test_a_mock_scan_tips_tackles_in_the_tip_format_with_the_pilot_label_and_its
     text = ladder_scan.summary_text(summary, label)
     assert "Pilot leagues scan" in text and "Leagues: Brazil Serie A 1, Scottish Premiership 1" in text
     assert "Tipped: tackles in Brazil Serie A only" in text and "League One" not in text
-    assert "Not in the Sportmonks plan, not scanned: Scottish Championship" in text
 
 
 def _market_catalogue() -> list[dict[str, Any]]:
@@ -608,7 +575,7 @@ def test_the_stale_exit_code_follows_the_skipped_leagues_not_the_wording_of_a_fa
 
     monkeypatch.setattr(ladder_scan, "bankroll_currency", lambda: "GBP")
     monkeypatch.setattr(ladder_scan, "book_to_bankroll", lambda currency, day: fx_identity("GBP"))
-    monkeypatch.setattr(pipeline, "build_vendor_client", lambda environ: _Client())
+    monkeypatch.setattr(pipeline, "build_thestatsapi_client", lambda environ, matches=None: _Client())
     outcomes = {"stale": (["reworded failure"], ["Brazil Serie A"]), "other failure": (["Could not price X"], []), "clean": ([], [])}
     codes: dict[str, int] = {}
     for name, (failures, stale) in outcomes.items():
@@ -666,11 +633,13 @@ def _patch_history(monkeypatch: pytest.MonkeyPatch, latest: Mapping[str, datetim
 
 
 def test_a_fixture_is_given_by_hand_as_seven_fields() -> None:
-    spec = "Brazil Serie A|19621780|710|3432|Chapecoense|Athletico PR|2026-10-12T22:30:00+00:00"
+    spec = "Brazil Serie A|mt_019621780|710|3432|Chapecoense|Athletico PR|2026-10-12T22:30:00+00:00"
     assert ladder_scan.parse_manual_fixture(spec) == UpcomingFixture(
         19621780, "Brazil Serie A", "710", "3432", "Chapecoense", "Athletico PR", datetime(2026, 10, 12, 22, 30, tzinfo=timezone.utc))
     with pytest.raises(ValueError, match="7 fields"):
-        ladder_scan.parse_manual_fixture("Brazil Serie A|19621780|710|3432")
+        ladder_scan.parse_manual_fixture("Brazil Serie A|mt_019621780|710|3432")
+    with pytest.raises(ValueError, match="nine digits"):  # a Sportmonks id is not a TheStatsAPI match id
+        ladder_scan.parse_manual_fixture(spec.replace("mt_019621780", "19621780"))
     with pytest.raises(ValueError, match="not a pilot league"):
         ladder_scan.parse_manual_fixture(spec.replace("Brazil Serie A", "League One"))
 

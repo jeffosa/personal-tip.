@@ -9,13 +9,14 @@ from typing import Final, Mapping
 
 DEFAULT_ENV_FILE: Final[Path] = Path(__file__).resolve().parents[1] / ".env"
 DSN_ENV: Final[str] = "PROP_ALPHA_DB_DSN"
-# The working database. prop_alpha_ci is reset by every CI run, so the alerts, ledger and status never read it by
-# default.
-DEFAULT_DSN: Final[str] = "postgresql://postgres@localhost:5432/prop_alpha"
-# The pilot database (Championship and the Scottish leagues): its own results job and scan read and write it, never
-# the working database above.
+# The working database (League One/Two): built from TheStatsAPI since 2026-10-15 (scripts/tsa_backfill.py); the
+# Sportmonks one, `prop_alpha`, stays as an archive. prop_alpha_ci is reset by every CI run, so the alerts, ledger and
+# status never read it by default.
+DEFAULT_DSN: Final[str] = "postgresql://postgres@localhost:5432/prop_alpha_tsa"
+# The pilot database (Brazil Serie A and the two Scottish leagues), also from TheStatsAPI since 2026-10-15 (the Sportmonks
+# one, `prop_alpha_pilot`, is the archive): its own results job and scan read and write it, never the working one above.
 PILOT_DSN_ENV: Final[str] = "PROP_ALPHA_PILOT_DSN"
-DEFAULT_PILOT_DSN: Final[str] = "postgresql://postgres@localhost:5432/prop_alpha_pilot"
+DEFAULT_PILOT_DSN: Final[str] = "postgresql://postgres@localhost:5432/prop_alpha_pilot_tsa"
 
 
 def parse_env_file(text: str) -> dict[str, str]:

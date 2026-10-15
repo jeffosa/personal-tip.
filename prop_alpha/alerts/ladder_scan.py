@@ -9,8 +9,8 @@ lines. It never places a bet.
 
 It is the League One/Two scan (alerts/scan.py) with these differences, and nothing else:
 
-* Leagues: Sportmonks league ids are read from the plan's own league list (sportmonks.PILOT_LEAGUES_WANTED), so a
-  league the plan does not include is reported ("not in the Sportmonks plan"), never guessed.
+* Leagues: TheStatsAPI's competitions for the pilot leagues (thestatsapi.PILOT_COMPETITIONS; Sportmonks until 2026-10-15,
+  whose plan then listed none of them).
 * Pricing is the pilot's, read from the pilot database `prop_alpha_pilot` (read-only), never from the working
   `prop_alpha`: tackles counted as pilot_ledger.PILOT_TACKLES_SQL (plain tackles_attempted since 2026-10-13, after settled
   results contradicted the 2026-10-12 tackles-plus-challenges-lost count, MARKET_CONTRACT.md 2e; loaded through PilotCursor so the
@@ -72,8 +72,8 @@ from prop_alpha.alerts.telegram import (
     load_config,
 )
 from prop_alpha.config import DEFAULT_PILOT_DSN, PILOT_DSN_ENV
-from prop_alpha.ingestion import oddspapi, sportmonks
-from prop_alpha.ingestion.results import PILOT_REFUSED_FILE, load_refused, pilot_leagues
+from prop_alpha.ingestion import oddspapi, thestatsapi
+from prop_alpha.ingestion.results import PILOT_REFUSED_FILE, load_refused
 from prop_alpha.modeling.engine import FactorProjection, QuantEngine
 from prop_alpha.scanner.market_scanner import (
     MODEL_RISK_LOSS_FLOOR,
@@ -131,9 +131,8 @@ STALE_AFTER: Final[timedelta] = timedelta(days=10)
 STALE_GRACE: Final[timedelta] = timedelta(hours=4)
 # Exit code of a run that skipped a league because its results were missing (the scheduled task reports the step).
 STALE_EXIT: Final[int] = 4
-# Matches Sportmonks refuses to load (vendor data errors, 2026-10-08): never in the pilot database, so never counted
-# as missing. 19427700 and 19431984: goal events do not reproduce the score; 19729100: duels won above duels; 19427583:
-# card counts out of range.
+# Matches Sportmonks refused to load (vendor data errors, 2026-10-08), kept for the Sportmonks archive only; TheStatsAPI's
+# unloadable matches are recorded in PILOT_REFUSED_FILE by the results job.
 KNOWN_VENDOR_ERRORS: Final[frozenset[str]] = frozenset({"19427700", "19431984", "19729100", "19427583"})
 PILOT_LABEL: Final[str] = (
     "PILOT LEAGUES - model not validated for them; bet365's tackle and foul rules are unverified and its prices have run "
@@ -251,16 +250,13 @@ def stale_message(league: str, missing: Sequence[tuple[str, datetime]]) -> str:
             "`scripts/pilot_backfill.py --list --seed --ingest` for a league never loaded.")
 
 
-def finished_listing(client: Any, now: datetime, leagues: Mapping[int, str]) -> list[tuple[str, datetime, str]]:
-    """Finished matches of `leagues` from the last STALE_AFTER, from the Sportmonks listing (at most MAX_LISTING_PAGES)."""
-    finished: list[tuple[str, datetime, str]] = []
-    for page in range(1, scan.MAX_LISTING_PAGES + 1):
-        body = client.get_json(sportmonks.upcoming_path(now - STALE_AFTER, now, page, leagues))
-        rows, has_more = sportmonks.finished_with_leagues(body, leagues)
-        finished += rows
-        if not has_more:
-            return finished
-    raise ValueError(f"finished pilot listing has more than {scan.MAX_LISTING_PAGES} pages; check refused")
+def finished_listing(client: Any, now: datetime, leagues: Mapping[str, str]) -> list[tuple[str, datetime, str]]:
+    """(match uid, kickoff, league) of every finished TheStatsAPI match of `leagues` from the last STALE_AFTER."""
+    from prop_alpha.ingestion.pipeline import list_matches
+
+    rows = list_matches(client, leagues, (now - STALE_AFTER).date(), now.date(), "finished")
+    return [(str(m["id"]), thestatsapi.kickoff(m), leagues[str(m["competition_id"])]) for m in rows
+            if str(m.get("competition_id")) in leagues]
 
 
 def load_ladder_catalogue(path: Path) -> dict[int, oddspapi.LadderMarket]:
@@ -367,14 +363,15 @@ LATEST_STORED_SQL: Final[str] = """
 
 
 def parse_manual_fixture(raw: str) -> UpcomingFixture:
-    """'league|sportmonks fixture id|home team id|away team id|home|away|kickoff (ISO, UTC)' -> UpcomingFixture."""
+    """'league|TheStatsAPI match id (mt_ and nine digits)|home team id|away team id|home|away|kickoff (ISO, UTC)' ->
+    UpcomingFixture."""
     parts = raw.split("|")
     if len(parts) != 7:
         raise ValueError(f"--fixture needs 7 fields separated by '|', got {len(parts)}: {raw!r}")
-    league, fixture_id, home_uid, away_uid, home, away, kickoff = (part.strip() for part in parts)
-    if league not in sportmonks.PILOT_LEAGUES_WANTED.values():
+    league, match_id, home_uid, away_uid, home, away, kickoff = (part.strip() for part in parts)
+    if league not in thestatsapi.PILOT_COMPETITIONS.values():
         raise ValueError(f"{league!r} is not a pilot league")
-    return UpcomingFixture(int(fixture_id), league, home_uid, away_uid, home, away,
+    return UpcomingFixture(thestatsapi.fixture_number(match_id), league, home_uid, away_uid, home, away,
                            datetime.fromisoformat(kickoff).astimezone(timezone.utc))
 
 
@@ -451,11 +448,7 @@ def run_ladder_scan(
         return _scan_slate(now, list(manual), None, dsn, notifier, store, bankroll, label, max_alerts, summary, tipping,
                            start, end, rate, currency, odds=odds, odds_client=odds_client, books=books, state_dir=state_dir,
                            predictions=predictions, paper_bets=paper_bets, tips_file=tips_file)
-    leagues, absent = pilot_leagues(client)
-    if absent:
-        summary.odds_notes.append(f"Not in the Sportmonks plan, not scanned: {', '.join(name for name in absent)}")
-    if not leagues:
-        return summary
+    leagues = thestatsapi.PILOT_COMPETITIONS
     listed = scan.fetch_upcoming(client, start, end, leagues)
     if not listed:
         return summary
@@ -608,7 +601,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--at", type=datetime.fromisoformat, default=None, help="simulated UTC run time (testing)")
     parser.add_argument("--fixture", action="append", default=[], metavar="SPEC", type=parse_manual_fixture,
                         help="scan this fixture instead of the Sportmonks listing (repeatable): "
-                             "'league|sportmonks fixture id|home team id|away team id|home|away|kickoff ISO UTC'")
+                             "'league|TheStatsAPI match id|home team id|away team id|home|away|kickoff ISO UTC'")
     parser.add_argument("--tip", action="append", default=None, metavar="LEAGUE",
                         help="tip this league for this run only, whatever TIP_LEAGUES says (repeatable; needs --fixture)")
     args = parser.parse_args(argv)
@@ -620,11 +613,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     now = args.at.astimezone(timezone.utc) if args.at is not None else datetime.now(timezone.utc)
     currency = bankroll_currency()
     book_rate = book_to_bankroll(currency, now.date())
-    from prop_alpha.ingestion.pipeline import build_odds_client, build_vendor_client
+    from prop_alpha.ingestion.pipeline import build_odds_client, build_thestatsapi_client
 
     environ = {**os.environ, "DATA_VENDOR_MAX_REQUESTS": os.environ.get("DATA_VENDOR_MAX_REQUESTS", "12"),
                "DATA_VENDOR_QUOTA_RESERVE": os.environ.get("DATA_VENDOR_QUOTA_RESERVE", "100")}
-    client = build_vendor_client(environ)
+    client = build_thestatsapi_client(environ)
     real = args.odds == "oddspapi"
     label = PILOT_LABEL if real else f"{scan.MOCK_LABEL}\n{PILOT_LABEL}"
     odds_client = build_odds_client(os.environ) if real else None

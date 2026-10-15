@@ -31,7 +31,7 @@ def test_report_states_database_alerts_trial_and_paper_label(tmp_path: Path, mon
     assert "Last merge: 2026-10-03 06:00 UTC" in report
     assert "Incomplete club-matches (a player without an ID played; left out of pricing): 0" in report
     assert "Alerts in the last 4h: 1; open alerted exposure: 200.00" in report
-    assert "Sportmonks trial: 22 days left" in report
+    assert "TheStatsAPI trial: 17 days left" in report
     assert report.endswith(PAPER_LABEL) and "WARNING" not in report
     assert len(report) < 4096
 
@@ -56,20 +56,21 @@ def test_unreachable_database_is_reported_not_silent(monkeypatch: pytest.MonkeyP
 
 
 def test_the_trial_warns_a_week_ahead_not_only_after_it_ended() -> None:
-    far = datetime(2026, 10, 17, tzinfo=timezone.utc)   # 8 days left: plain information
-    near = datetime(2026, 10, 18, tzinfo=timezone.utc)  # 7 days left: a warning
-    assert "Sportmonks trial: 8 days left (ends 25 Oct)" in status.format_report(far, [], 0, 0.0)
+    far = datetime(2026, 10, 12, tzinfo=timezone.utc)   # 8 days left: plain information
+    near = datetime(2026, 10, 13, tzinfo=timezone.utc)  # 7 days left: a warning
+    assert "TheStatsAPI trial: 8 days left (ends 20 Oct)" in status.format_report(far, [], 0, 0.0)
     warning = status.format_report(near, [], 0, 0.0)
-    assert "WARNING: Sportmonks trial ends 25 Oct (7 days left)" in warning and "choose a paid plan" in warning
+    assert "WARNING: TheStatsAPI trial ends 20 Oct (7 days left)" in warning and "choose a paid plan" in warning
 
 
 def test_trial_expiry_turns_into_a_warning() -> None:
-    after = datetime(2026, 10, 26, tzinfo=timezone.utc)
-    assert "WARNING: Sportmonks trial ended 25 Oct" in status.format_report(after, [], 0, 0.0)
+    after = datetime(2026, 10, 21, tzinfo=timezone.utc)
+    assert "WARNING: TheStatsAPI trial ended 20 Oct" in status.format_report(after, [], 0, 0.0)
 
 
 def test_default_database_is_never_the_ci_database() -> None:
-    assert status.DEFAULT_DSN.endswith("/prop_alpha") and "_ci" not in status.DEFAULT_DSN
+    # The TheStatsAPI working database since 2026-10-15; never the CI one, never the Sportmonks archive.
+    assert status.DEFAULT_DSN.endswith("/prop_alpha_tsa") and "_ci" not in status.DEFAULT_DSN
 
 
 def test_report_lists_open_and_stale_bets_and_settled_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -31,6 +31,7 @@ lacks). A player who did not play has every count 0.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Final, Mapping, Sequence
 
@@ -55,11 +56,75 @@ COMPETITIONS: Final[Mapping[str, str]] = {
 }
 # Which database each league lives in: the working one (League One/Two, the frozen model) or the pilot one.
 WORKING_LEAGUES: Final[frozenset[str]] = frozenset({"League One", "League Two"})
+# The opportunity scan's competitions and the pilot scan's (competition id -> prop_alpha.leagues.name).
+SCAN_COMPETITIONS: Final[Mapping[str, str]] = {c: n for c, n in COMPETITIONS.items() if n in WORKING_LEAGUES}
+PILOT_COMPETITIONS: Final[Mapping[str, str]] = {c: n for c, n in COMPETITIONS.items() if n not in WORKING_LEAGUES}
+# Every listed match id is "mt_" and nine digits (2,408 of 2,408 on 2026-10-13; 235 start with a zero). The frozen pricing
+# code keys a fixture by an integer (slate.UpcomingFixture.fixture_id), so the nine digits are that integer and are padded
+# back to nine to rebuild the id; any other shape is refused rather than guessed.
+MATCH_ID: Final[re.Pattern[str]] = re.compile(r"mt_(\d{9})")
 POSITIONS: Final[Mapping[str, str]] = {"G": "GK", "D": "DEF", "M": "MID", "F": "ATT"}
 STATUSES: Final[Mapping[str, str]] = {"finished": "final", "scheduled": "scheduled", "live": "live", "postponed": "postponed"}
 TACKLES_WON_NOT_PROVIDED: Final[int] = 0
 # Numbers a player who played must carry (as integers); the others default to 0 when null.
 REQUIRED: Final[tuple[tuple[str, str], ...]] = (("defending", "tackles"), ("general", "fouls"))
+
+
+def fixture_number(match_id: str) -> int:
+    """'mt_010487045' -> 10487045 (the integer the frozen pricing code keys a fixture by)."""
+    found = MATCH_ID.fullmatch(match_id)
+    if found is None:
+        raise ValueError(f"match id {match_id!r} is not 'mt_' and nine digits")
+    return int(found.group(1))
+
+
+def match_uid(fixture_number_: int) -> str:
+    """10487045 -> 'mt_010487045' (the vendor uid the databases store)."""
+    if isinstance(fixture_number_, bool) or not isinstance(fixture_number_, int) or not 0 <= fixture_number_ < 10 ** 9:
+        raise ValueError(f"{fixture_number_!r} is not a TheStatsAPI match number")
+    return f"mt_{fixture_number_:09d}"
+
+
+def upcoming_fixture(match: Mapping[str, Any], competitions: Mapping[str, str]) -> dict[str, Any] | None:
+    """A scheduled match of `competitions` as slate.UpcomingFixture's fields; None for any other status or competition."""
+    league = competitions.get(str(match.get("competition_id")))
+    if league is None or match.get("status") != "scheduled":
+        return None
+    home, home_name = _team(match, "home")
+    away, away_name = _team(match, "away")
+    return {"fixture_id": fixture_number(str(match.get("id"))), "league": league, "home_team_uid": home,
+            "away_team_uid": away, "home_name": home_name, "away_name": away_name, "kickoff_at": kickoff(match)}
+
+
+def lineup_payload(body: Mapping[str, Any]) -> dict[str, Any]:
+    """A line-ups reply (`GET /football/matches/{id}/lineups`) as the payload parse_lineup_payload expects, with
+    `fixture.confirmed` from the reply: TheStatsAPI also serves predicted line-ups before the clubs announce theirs, and
+    only a confirmed sheet is a team sheet. A starter without an id refuses the sheet; a substitute without one is left out."""
+    data = body.get("data")
+    if not isinstance(data, Mapping):
+        raise ValueError("malformed TheStatsAPI line-ups reply (expected a data object)")
+    uid = str(data.get("match_id"))
+    sheets: dict[str, dict[str, list[str]]] = {}
+    sides: list[str] = []
+    for side in ("home", "away"):
+        team = data.get(side)
+        if not isinstance(team, Mapping) or not isinstance(team.get("id"), str):
+            raise ValueError(f"match {uid}: line-ups have no {side} team")
+        starters: list[str] = []
+        bench: list[str] = []
+        for group, target in (("starting_xi", starters), ("substitutes", bench)):
+            for player in team.get(group) or []:
+                pid = player.get("id") if isinstance(player, Mapping) else None
+                if not isinstance(pid, str):
+                    if group == "starting_xi":
+                        raise ValueError(f"match {uid}: {side} starting XI lists a player without an id")
+                    continue
+                target.append(pid)
+        sheets[str(team["id"])] = {"starters": starters, "bench": bench}
+        sides.append(str(team["id"]))
+    return {"fixture": {"uid": uid, "home_team_uid": sides[0], "away_team_uid": sides[1],
+                        "confirmed": data.get("confirmed") is True},
+            "lineups": sheets}
 
 
 def matches_path(competition_id: str, date_from: str, date_to: str, page: int, status: str | None = None) -> str:
@@ -198,7 +263,8 @@ def fixture_payload(match: Mapping[str, Any], player_stats: Mapping[str, Any]) -
             "fouls_drawn": count(general, "was_fouled"), "yellow_cards": count(general, "yellow_cards"),
             "red_cards": count(general, "red_cards"),
         }
-        position = row.get("position")
+        # An empty position means none was given (mt_732019591, 2026-10-07): stored as no position, like a missing one.
+        position = row.get("position") or None
         if position is not None and position not in POSITIONS:
             raise ValueError(f"{where}: unknown position {position!r}")
         # general.player_subbed_on / player_subbed_off name the OTHER player of a substitution (an id, not a minute), so

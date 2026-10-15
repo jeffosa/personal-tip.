@@ -80,8 +80,9 @@ def fixture_payload() -> Callable[..., dict[str, Any]]:
 
 
 # Variables that carry credentials or the bankroll currency; a test that needs one sets it itself.
-CREDENTIAL_VARIABLES = ("SPORTMONKS_API_TOKEN", "ODDSPAPI_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
-                        "PROP_ALPHA_CURRENCY", "DATA_VENDOR", "DATA_VENDOR_API_KEY", "PROP_ALPHA_DB_DSN")
+CREDENTIAL_VARIABLES = ("SPORTMONKS_API_TOKEN", "THESTATSAPI_KEY", "ODDSPAPI_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+                        "PROP_ALPHA_CURRENCY", "DATA_VENDOR", "DATA_VENDOR_API_KEY", "PROP_ALPHA_DB_DSN",
+                        "PROP_ALPHA_PILOT_DSN")
 
 
 @pytest.fixture(autouse=True)

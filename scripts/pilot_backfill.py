@@ -165,12 +165,17 @@ def fix_leagues(fixtures: list[dict[str, Any]]) -> None:
 
 
 def resolve_leagues() -> None:
-    """Fill LEAGUES from the plan's league list (two requests at most)."""
-    from prop_alpha.ingestion.results import pilot_leagues
-
+    """Fill LEAGUES from the Sportmonks plan's league list (a few requests). This is the Sportmonks archive's backfill: the
+    pilot database is built from TheStatsAPI since 2026-10-15 (scripts/tsa_backfill.py)."""
     c = client(5)
     try:
-        found, absent = pilot_leagues(c)
+        rows: list[Any] = []
+        for page in range(1, 6):
+            page_rows, has_more = sportmonks.league_rows(c.get_json(f"{sportmonks.LEAGUES_PATH}&page={page}"))
+            rows += page_rows
+            if not has_more:
+                break
+        found, absent = sportmonks.resolve_leagues(rows)
     finally:
         c.close()
     LEAGUES.clear()
