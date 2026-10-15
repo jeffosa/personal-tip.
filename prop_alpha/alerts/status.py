@@ -46,7 +46,7 @@ from prop_alpha.ingestion import oddspapi
 logger = logging.getLogger("prop_alpha.status")
 
 STATUS_NOTE: Final[str] = (
-    "No PRD go-live gate passed. Bets are settled from Sportmonks under assumed market rules (provisional); closing "
+    "No PRD go-live gate passed. Bets are settled from TheStatsAPI counts under assumed market rules (provisional); closing "
     "prices are captured 0-15 min before kickoff; the database bet ledger is not built."
 )
 REPORT_INTERVAL: Final[timedelta] = timedelta(hours=4)

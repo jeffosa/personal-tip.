@@ -70,6 +70,9 @@ class ResultsReport:
     rejected_rows: int = 0
     incomplete: int = 0
     skipped_refused: int = 0
+    # Matches TheStatsAPI holds no statistics for (STATS_NOT_AVAILABLE): recorded as refused and reported, but not a failure
+    # of the run (2026-10-15: the first run on TheStatsAPI raised a TASK FAILING alert over one such Scottish match).
+    unavailable: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -80,6 +83,9 @@ class ResultsReport:
                 f"stored, {self.ingested} ingested")
         if self.skipped_refused:
             line += f" ({self.skipped_refused} refused earlier, not retried)"
+        if self.unavailable:
+            line += (f", {len(self.unavailable)} with no statistics at the source, recorded and not retried "
+                     f"({', '.join(sorted(self.unavailable))})")
         if self.failed:
             line += f", {len(self.failed)} FAILED ({', '.join(sorted(self.failed))})"
         if self.rejected_rows:
@@ -214,6 +220,9 @@ def run(
     report.failed = {str(uid): str(error) for uid, error in slate.failed.items()}
     report.failed.update({str(uid): "timed out" for uid in slate.timed_out})
     record_refused(refused_path, report.failed)
+    report.unavailable = sorted(uid for uid, reason in report.failed.items() if STATS_NOT_AVAILABLE in reason)
+    for uid in report.unavailable:
+        del report.failed[uid]
     if slate.merge_error:
         report.failed["merge"] = str(slate.merge_error)
     report.ingested = slate.merge.fixtures_merged if slate.merge is not None else 0

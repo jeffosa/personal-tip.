@@ -28,6 +28,37 @@ Changes on 2026-10-15 [T]: `replies.AUTO_BASIS` now says TheStatsAPI stats (it s
 `scripts/pilot_settle_by_name.py` refuses, rather than voids, any bet not matched to exactly one match and one player
 (`tests/test_pilot_settle_by_name.py`).
 
+### Release gate and live path, 2026-10-15 (after the external audit scoring readiness 2.5/10)
+
+- **Release gate [T]:** `bash ci/bootstrap.sh --release` against the disposable `prop_alpha_ci` passed at 11:56 UTC on
+  Python 3.14.6: 848 passed, 0 skipped, mypy and pyright clean, schema install, re-apply and upgrade path passed. The tree it
+  tested is `main` at `b5e067e` (the Telegram bot commands, committed and pushed to `main` directly during the run) plus the
+  then uncommitted source-gap change and status wording below, so that change still has to be committed, merged and seen
+  green on GitHub Actions **[U]**.
+- **Observed live on TheStatsAPI [T]:** the League One/Two results job (10:16 and 13:00 BST runs: 24 finished, 0 missing);
+  the pilot results job recording a match the source has no statistics for (mt_156353671) so it is not requested again; the
+  status report and both scan summaries sent (0 matches in those windows); the 10-minute ledger task clean on every run;
+  Saturday's lockbox logging path checked in code: the real `--send` scan logs every priced fixture's predictions before and
+  regardless of odds (`scan.run_scan`).
+- **Defects found and fixed here [T]:** a match with no statistics at the source failed the run that first met it and raised a
+  TASK FAILING alert (now recorded and reported, not a failure: `results.ResultsReport.unavailable`); the status footer still
+  said bets are settled from Sportmonks.
+- **Operational risk seen [T]:** at 13:00 BST the pilot results job failed on a dropped connection to TheStatsAPI (the
+  laptop's Wi-Fi). The task retries and alerts, but an always-on host (`deploy/VPS_SETUP.md`, not set up **[U]**) removes the
+  cause.
+- **Not yet observed on TheStatsAPI [U]:** a real-odds scan with matches in the window, a prediction logged for a lockbox match
+  (first: Saturday 17 Oct), a captured T-60 team sheet, a settlement of a real bet, a backup and restore of the `*_tsa`
+  databases.
+
+**What closes the remaining gates, and who:** (1) TheStatsAPI access past 2026-10-20: the maintainer (paid plan or another
+feed with the five leagues). (2) The lockbox: calendar time from 2026-10-17, no model change in response to its results.
+(3) Settlement rules and reconciliation: the maintainer reads the bookmaker rules (`MARKET_CONTRACT.md`) and records real
+bookmaker results. (4) Paper trading: a bookmaker quoting League One/Two tackles or fouls, or a maintainer decision on which
+markets and books Gate 3 covers. (5) Scope: a maintainer decision on card markets; `bench_sub_probability` changes prices, so
+building it re-freezes the model and restarts the lockbox, and must be decided before 2026-10-17 or deferred to a planned
+re-freeze. (6) Live path: Saturday's runs, then a restore test of the `*_tsa` databases. (7) Release: commit, pull request,
+green Actions.
+
 ## Status on 2026-10-10 (history)
 
 **PAPER / SHADOW ONLY.** Deployment, scheduling, backup, restore, monitoring and rollback are in `RUNBOOK.md`.
