@@ -22,19 +22,24 @@ The test baseline is `EXPECTED_TESTS` in `ci/bootstrap.sh`, the single source of
 | Variable | Purpose |
 |---|---|
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Alerts, status and the bet-recording replies (only that chat is read) |
-| `SPORTMONKS_API_TOKEN` | Player statistics, fixtures, line-ups and results |
+| `THESTATSAPI_KEY` | Active results, scans and team-sheet capture; TheStatsAPI trial is recorded as ending 2026-10-20 |
+| `THESTATSAPI_RPS` | Optional TheStatsAPI request rate; default is 0.19 requests/second |
+| `SPORTMONKS_API_TOKEN` | Legacy Sportmonks ingestion only; not used by the current scheduled results and scan paths |
 | `ODDSPAPI_KEY` | Bookmaker prices (read-only aggregator) |
 | `PROP_ALPHA_CURRENCY` | Required bankroll currency: `GBP` or `USD` |
 | `PROP_ALPHA_BANKROLL`, `PROP_ALPHA_MAX_ALERTS` | Bankroll and tips per run (optional; defaults in `alerts/scan.py`) |
-| `PROP_ALPHA_DB_DSN` | Working database (never contains a password; the password is in `%APPDATA%\postgresql\pgpass.conf`) |
-| `PROP_ALPHA_PILOT_DSN` | Championship pilot database `prop_alpha_pilot` (optional) |
-| `ODDS_BOOKMAKERS`, `LADDER_BOOKMAKERS` | Bookmakers asked for League One/Two prices and for Championship ladders (optional) |
-| `DATA_VENDOR`, `DATA_VENDOR_MAX_REQUESTS`, `DATA_VENDOR_QUOTA_RESERVE`, `DATA_VENDOR_RPS` | Vendor selection and request budget |
+| `PROP_ALPHA_DB_DSN` | Active working database `prop_alpha_tsa` (never contains a password; the password is in `%APPDATA%\postgresql\pgpass.conf`) |
+| `PROP_ALPHA_PILOT_DSN` | Active pilot database `prop_alpha_pilot_tsa` (optional) |
+| `ODDS_BOOKMAKERS`, `LADDER_BOOKMAKERS` | Bookmakers asked for League One/Two prices and for pilot ladders (optional) |
+| `DATA_VENDOR`, `DATA_VENDOR_MAX_REQUESTS`, `DATA_VENDOR_QUOTA_RESERVE`, `DATA_VENDOR_RPS` | Legacy callers of `build_vendor_client` select Sportmonks (default) or generic; request-budget controls |
 | `PROP_ALPHA_BACKUP_DIR` | Backup folder (must already exist when set) |
 | `PROP_ALPHA_BACKUP_GIT_REMOTE` | Private repository that holds only backups |
 | `PROP_ALPHA_PYTHON`, `PROP_ALPHA_CI_DATABASE_URL` | CI only: interpreter for `ci/bootstrap.sh`, and the disposable database for stage 6 |
 
 Never print, log or commit values. `.env.example` is the template and holds no credentials.
+The active scheduled workflows use TheStatsAPI through the listing-aware `build_thestatsapi_client`; they do not select
+TheStatsAPI through `DATA_VENDOR`. `build_vendor_client` remains the Sportmonks/generic compatibility path, and its
+default has not changed. The TheStatsAPI databases are separate from the archived Sportmonks databases.
 
 ## 3. Install
 
@@ -42,7 +47,10 @@ Never print, log or commit values. `.env.example` is the template and holds no c
    `.venv\Scripts\python.exe -m pip install --only-binary=:all: -r requirements.txt`.
 2. Install PostgreSQL 15 or newer. A fresh database gets `schema.sql` only (it already contains every migration). Never
    apply `migrations/002_staging_and_indexes.sql` to a v3.2 or newer schema. Upgrades apply the numbered migrations in order.
-3. Create `.env` from `.env.example`. Seed the clubs (`vendor_team_uid` = the Sportmonks team id) before the first ingestion.
+3. Create `.env` from `.env.example` and set `THESTATSAPI_KEY` for the active jobs. Ensure any team rows used by the
+   TheStatsAPI databases have `vendor_team_uid` values from TheStatsAPI, not Sportmonks IDs; vendor IDs are not
+   interchangeable. TheStatsAPI's match-stat adapter also requires each match's listing row, which the active results,
+   scan and team-sheet paths provide.
 4. Run the release gate (section 8) before relying on a checkout.
 
 ## 4. Scheduled tasks
@@ -99,7 +107,8 @@ a step of `Telegram status`, after `python -m prop_alpha.ingestion.results --pil
 - Settlement check: `python -m prop_alpha.alerts.ledger --reconcile`; prediction log: `python -m prop_alpha.alerts.predictions`.
 - Pilot paper bets (never real bets): `python -m prop_alpha.alerts.pilot_ledger --list`; settle with `--settle [--send]`; after you read a bookmaker's result off the site,
   `--record <id> won|lost|void` then `--reconcile` (exit 1 on a discrepancy: the assumed settlement rules disagree with the book). `python scripts/pilot_score.py` scores the logged pilot predictions.
-- The trial warning: the status report says WARNING from 7 days before the Sportmonks trial ends.
+- The trial warning: the status report warns from 7 days before the TheStatsAPI trial end recorded in
+  `CLAUDE.md` (2026-10-20). Confirm current access and plan terms in the vendor account before relying on ingestion.
 
 ## 7. Rollback
 
@@ -125,10 +134,9 @@ npx --yes pyright@1.1.406
 ## 9. Unresolved evidence and open blockers
 
 - **Market contract unverified** (`MARKET_CONTRACT.md`): which statistic and provider settle bet365's "player tackles" and "player fouls",
-  and the void rule, are not identified. The model's counts have sat well below the prices at bet365 on the Championship; a definition
-  mismatch is possible, not established. Championship tackles and fouls stay unsupported, and the Championship scan is a pilot.
-- **No lockbox evidence:** the model is frozen; 2,715 prediction lines were logged on 2026-10-10 (543 per market and line, 20 fixtures), none is scored; Gate 2 needs at least 500 scored predictions per market.
-- **No tackles or fouls price at a League One/Two bookmaker has been seen**, so no alert, closing price or paper bet exists.
-- **Vendor and leagues:** the active Sportmonks plan (second account, trial to 2026-10-25, seen 2026-10-11) lists League One, League Two, Scottish Premiership, Scottish Championship and Brazil Serie A, the maintainer's five focus leagues. Without a paid plan, ingestion stops when the trial ends.
-- **Pilot leagues are unvalidated:** only Brazil Serie A is tipped (`ladder_scan.TIP_LEAGUES`, the maintainer's decision of 2026-10-11). Brazil Serie A has tackles and fouls ladders at bet365 and Betway and a backtest with positive skill, but bookmaker prices run far above the model's counts (mean expected profit about -60%), so the settlement definition is the open question. No bookmaker price has been seen for either Scottish league, and Sportmonks has no per-player tackles for 24 recent Scottish Championship matches.
+  and the void rule, are not identified. Championship tackles and fouls remain unsupported and are outside the current scan plan.
+- **No new-data lockbox evidence:** the lockbox restarts on 2026-10-17 for TheStatsAPI data; the current status notes report that the new lockbox has not started yet. Gate 2 still requires at least 500 eligible, scored predictions per target market.
+- **No tackles or fouls price at a League One/Two bookmaker has been seen**, so no League One/Two alert, closing price or paper bet exists.
+- **Vendor and leagues:** current scheduled paths use TheStatsAPI with databases `prop_alpha_tsa` (League One/Two) and `prop_alpha_pilot_tsa` (Brazil Serie A and the Scottish leagues). The trial is recorded as ending 2026-10-20; confirm current plan and quota before that date. The 2026-10-15 backfill status is in `CLAUDE.md`; the Sportmonks databases remain an archive.
+- **Pilot leagues are unvalidated and tipping is paused:** `ladder_scan.TIP_LEAGUES` is empty. The project notes report Brazil Serie A ladders at bet365 and Betway, but the settlement definition and model-vs-market evidence remain unresolved. No bookmaker price has been seen for either Scottish league.
 - **Never run:** migration 002 on a real v2 database; the live T-60 line-up path; the 14-branch pruning of the backup repository.

@@ -647,9 +647,11 @@ VENDORS: Final[tuple[str, ...]] = ("sportmonks", "generic")
 
 
 def build_vendor_client(environ: Mapping[str, str]) -> VendorClient:
-    """DATA_VENDOR=sportmonks (the default) reads SPORTMONKS_API_TOKEN from the environment or `.env`;
+    """Legacy DATA_VENDOR=sportmonks (the default) reads SPORTMONKS_API_TOKEN from the environment or `.env`;
     DATA_VENDOR=generic uses DATA_VENDOR_BASE_URL and DATA_VENDOR_API_KEY with a Bearer header and payloads
-    already in transform.py's shape. Quota: DATA_VENDOR_MAX_REQUESTS (per run) and DATA_VENDOR_QUOTA_RESERVE."""
+    already in transform.py's shape. Current scheduled TheStatsAPI workflows call `build_thestatsapi_client` with a
+    match listing; this builder is not their runtime path. Quota: DATA_VENDOR_MAX_REQUESTS (per run) and
+    DATA_VENDOR_QUOTA_RESERVE."""
     vendor = environ.get("DATA_VENDOR", "sportmonks")
     if vendor not in VENDORS:
         raise ValueError(f"DATA_VENDOR must be one of {VENDORS}, got {vendor!r}")
