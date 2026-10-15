@@ -124,7 +124,7 @@ def test_market_benchmark_detects_information_beyond_the_market() -> None:
 
 
 def test_the_scan_saves_its_fixtures_for_closing_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from test_scan import _patch_database, _StubSportmonks
+    from test_scan import _patch_database, _StubTheStatsAPI
 
     _patch_database(monkeypatch)
 
@@ -132,7 +132,7 @@ def test_the_scan_saves_its_fixtures_for_closing_capture(tmp_path: Path, monkeyp
         pass
 
     store = scan.SentAlertStore(tmp_path / "sent.jsonl")
-    scan.run_scan(KICKOFF - timedelta(hours=2), _StubSportmonks(), "postgresql://unused", None, store, 1000.0, "",
+    scan.run_scan(KICKOFF - timedelta(hours=2), _StubTheStatsAPI(), "postgresql://unused", None, store, 1000.0, "",
                   currency="GBP", odds="oddspapi", odds_client=OneBook(left=200, odds=_odds()),
                   books=("bet365", "skybet"), state_dir=tmp_path)
     raw = json.loads((tmp_path / closing.SCAN_FIXTURES_NAME).read_text(encoding="utf-8"))

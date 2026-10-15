@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import date
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Callable, Final, Iterable, Mapping, Sequence, TypeVar
@@ -691,8 +692,30 @@ def build_thestatsapi_client(environ: Mapping[str, str], matches: Mapping[str, M
         timeout=30.0, max_requests=max_requests, quota_reserve=int(environ.get("DATA_VENDOR_QUOTA_RESERVE", "0")),
         auth_header="Authorization", auth_prefix="Bearer ",
         stats_path=thestatsapi.PLAYER_STATS_PATH, lineups_path=thestatsapi.LINEUPS_PATH,
-        fixture_adapter=adapt if matches is not None else None, quota_headers=thestatsapi.QUOTA_HEADERS,
+        fixture_adapter=adapt if matches is not None else None, lineups_adapter=thestatsapi.lineup_payload,
+        quota_headers=thestatsapi.QUOTA_HEADERS,
     )
+
+
+# More pages than this for one competition and one window means something is wrong: refused rather than half-listed.
+MAX_TSA_PAGES: Final[int] = 30
+
+
+def list_matches(client: Any, competitions: Mapping[str, str], date_from: date, date_to: date,
+                 status: str) -> list[Mapping[str, Any]]:
+    """Every TheStatsAPI match of `competitions` with `status` between two dates (inclusive), soonest first; one request
+    per competition and page of 100. A listing longer than MAX_TSA_PAGES pages raises."""
+    rows: list[Mapping[str, Any]] = []
+    for competition in sorted(competitions):
+        page, pages = 1, 1
+        while page <= pages:
+            if page > MAX_TSA_PAGES:
+                raise ValueError(f"{competitions[competition]}: match listing has more than {MAX_TSA_PAGES} pages")
+            found, pages = thestatsapi.match_rows(client.get_json(thestatsapi.matches_path(
+                competition, f"{date_from:%Y-%m-%d}", f"{date_to:%Y-%m-%d}", page, status=status)))
+            rows += found
+            page += 1
+    return sorted(rows, key=lambda m: (str(m.get("utc_date")), str(m.get("id"))))
 
 
 def build_odds_client(environ: Mapping[str, str]) -> VendorClient:

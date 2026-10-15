@@ -54,9 +54,10 @@ REPORT_INTERVAL: Final[timedelta] = timedelta(hours=4)
 POLL_STALE_AFTER: Final[timedelta] = timedelta(hours=1)
 # Telegram keeps an update the bot has not read for 24 hours, then drops it: a reply older than that is lost.
 TELEGRAM_UPDATE_RETENTION: Final[timedelta] = timedelta(hours=24)
-# Sportmonks plan seen on 2026-10-11 (the second account): "Starter - Trialing until 2026-10-25". The first account's trial
-# ended 2026-10-16.
-SPORTMONKS_TRIAL_ENDS: Final[date] = date(2026, 10, 25)
+# The data vendor and the end of its trial: TheStatsAPI since 2026-10-15 ("Stats API free trial", Starter plan, ending
+# 2026-10-20; then $50 a month). Sportmonks' plans had become its free one. Update both when a paid plan starts.
+DATA_VENDOR_NAME: Final[str] = "TheStatsAPI"
+DATA_TRIAL_ENDS: Final[date] = date(2026, 10, 20)
 # The status report warns this many days before the trial ends (and every run after).
 TRIAL_WARNING_DAYS: Final[int] = 7
 # An archived OddsPapi reply as alerts/scan.py names it: <run time>_<bookmaker>.json.gz. A malformed reply is archived
@@ -314,16 +315,16 @@ def fx_section(rate: ExchangeRate | None, now: datetime) -> list[str]:
 
 def format_report(now: datetime, database_lines: list[str], alerts_in_window: int, open_exposure: float,
                   bet_lines: Sequence[str] = ()) -> str:
-    days_left = (SPORTMONKS_TRIAL_ENDS - now.date()).days
+    days_left = (DATA_TRIAL_ENDS - now.date()).days
     if days_left <= 0:
-        trial = f"WARNING: Sportmonks trial ended {SPORTMONKS_TRIAL_ENDS:%d %b}; ingestion will fail without a plan"
+        trial = f"WARNING: {DATA_VENDOR_NAME} trial ended {DATA_TRIAL_ENDS:%d %b}; ingestion will fail without a plan"
     elif days_left <= TRIAL_WARNING_DAYS:
         # Audit 2026-10-11: the warning came only after the trial had ended. A paid plan (or another vendor) needs a decision
         # before then, because results, the scans and the lockbox scoring all stop with it.
-        trial = (f"WARNING: Sportmonks trial ends {SPORTMONKS_TRIAL_ENDS:%d %b} ({days_left} days left): results ingestion, the "
-                 "scans and lockbox scoring stop then; choose a paid plan before that day")
+        trial = (f"WARNING: {DATA_VENDOR_NAME} trial ends {DATA_TRIAL_ENDS:%d %b} ({days_left} days left): results ingestion, "
+                 "the scans and lockbox scoring stop then; choose a paid plan before that day")
     else:
-        trial = f"Sportmonks trial: {days_left} days left (ends {SPORTMONKS_TRIAL_ENDS:%d %b})"
+        trial = f"{DATA_VENDOR_NAME} trial: {days_left} days left (ends {DATA_TRIAL_ENDS:%d %b})"
     return "\n".join([
         f"prop_alpha status {now:%Y-%m-%d %H:%M} UTC",
         *database_lines,

@@ -434,10 +434,10 @@ def test_the_pilot_database_is_dumped_checked_and_listed_in_the_manifest(tmp_pat
                            pilot_db=backup.PILOT_DB)
     manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
     dump = folder / backup.PILOT_DUMP_NAME
-    assert dump.read_bytes() == b"PGDMP prop_alpha_pilot"
-    assert manifest["pilot_dump"] == {"database": "prop_alpha_pilot", "bytes": dump.stat().st_size,
+    assert dump.read_bytes() == f"PGDMP {backup.PILOT_DB}".encode()
+    assert manifest["pilot_dump"] == {"database": backup.PILOT_DB, "bytes": dump.stat().st_size,
                                       "sha256": hashlib.sha256(dump.read_bytes()).hexdigest(), "counts": COUNTS}
-    assert (folder / "prop_alpha.dump").read_bytes() == b"PGDMP prop_alpha"  # the working dump is unchanged
+    assert (folder / "prop_alpha.dump").read_bytes() == f"PGDMP {backup.SOURCE_DB}".encode()  # the working dump is unchanged
     assert sum(1 for call in calls if "-Fc" in call) == 2 and not any("password" in " ".join(c).lower() for c in calls)
 
 
@@ -448,7 +448,7 @@ def test_a_server_without_the_pilot_database_still_backs_up_and_a_bad_pilot_dump
     folder = backup.backup(tmp_path / "backups", _state(tmp_path), NOW, runner=_pilot_runner(False, []),
                            pilot_db=backup.PILOT_DB)
     assert "pilot_dump" not in json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
-    assert "no prop_alpha_pilot database" in capsys.readouterr().out
+    assert f"no {backup.PILOT_DB} database" in capsys.readouterr().out
     partial = "\n".join(line for line in LISTING.splitlines() if "player_match_stats" not in line)
     with pytest.raises(ValueError, match="missing table data for: player_match_stats"):
         backup.backup(tmp_path / "backups2", _state(tmp_path / "s2"), NOW, runner=_pilot_runner(True, [], partial),

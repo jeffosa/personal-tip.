@@ -13,7 +13,7 @@ from prop_alpha.alerts import scan
 from prop_alpha.alerts.fx import ExchangeRate
 from prop_alpha.alerts.fx import identity as fx_identity
 from prop_alpha.alerts.telegram import SentAlertStore, TelegramConfig, TelegramNotifier
-from prop_alpha.ingestion import sportmonks
+from prop_alpha.ingestion import thestatsapi
 from prop_alpha.modeling.engine import QuantEngine
 from prop_alpha.scanner.market_scanner import (
     MODEL_RISK_LOSS_FLOOR,
@@ -106,17 +106,23 @@ def test_mock_quotes_are_labelled_two_way_and_reproducible() -> None:
         assert 1.0 / quote.over_price + 1.0 / quote.under_price == pytest.approx(1.06, abs=0.01)
 
 
-def test_upcoming_listing_keeps_scan_leagues_and_not_started_fixtures() -> None:
-    def fixture(fid: int, league: int, state: str) -> dict[str, Any]:
-        return {"id": fid, "league_id": league, "state": {"developer_name": state},
-                "starting_at_timestamp": int(KICKOFF.timestamp()),
-                "participants": [{"id": 76, "name": "Walsall", "meta": {"location": "home"}},
-                                 {"id": 348, "name": "Port Vale", "meta": {"location": "away"}}]}
-    body = {"data": [fixture(1, 14, "NS"), fixture(2, 14, "FT"), fixture(3, 8, "NS")], "pagination": {"has_more": False}}
-    rows, more = sportmonks.upcoming_fixtures(body)
-    assert [r["fixture_id"] for r in rows] == [1] and not more
+def _tsa_match(number: int, competition: str = "comp_4023", status: str = "scheduled",
+               kickoff: datetime = KICKOFF) -> dict[str, Any]:
+    """A TheStatsAPI match listing row (the data vendor since 2026-10-15)."""
+    return {"id": thestatsapi.match_uid(number), "competition_id": competition, "status": status,
+            "utc_date": kickoff.isoformat().replace("+00:00", "Z"),
+            "home_team": {"id": "76", "name": "Walsall"}, "away_team": {"id": "348", "name": "Port Vale"}}
+
+
+def test_upcoming_listing_keeps_scan_leagues_and_scheduled_matches() -> None:
+    rows = [thestatsapi.upcoming_fixture(m, thestatsapi.SCAN_COMPETITIONS) for m in (
+        _tsa_match(1), _tsa_match(2, status="finished"), _tsa_match(3, competition="comp_4795"))]
+    assert rows[1:] == [None, None]  # a finished match, and a Brazil Serie A one: not the scan's
+    assert rows[0] is not None and rows[0]["fixture_id"] == 1 and rows[0]["league"] == "League Two"
     assert UpcomingFixture(**rows[0]).name == "Walsall v Port Vale"
-    assert "fixtureLeagues:12,14" in sportmonks.upcoming_path(KICKOFF, KICKOFF, 1)
+    assert thestatsapi.matches_path("comp_4023", "2026-10-03", "2026-10-03", 1, "scheduled").startswith(
+        "football/matches?competition_id=comp_4023&date_from=2026-10-03&date_to=2026-10-03")
+    assert sorted(thestatsapi.SCAN_COMPETITIONS.values()) == ["League One", "League Two"]
 
 
 def test_a_usd_bankroll_needs_a_rate_and_converts_book_limits(tmp_path: Path) -> None:
@@ -125,7 +131,7 @@ def test_a_usd_bankroll_needs_a_rate_and_converts_book_limits(tmp_path: Path) ->
     for currency, book_rate, message in (("EUR", None, "not supported"), ("USD", None, "needs a GBP->USD rate"),
                                          ("GBP", rate, "does not convert")):
         with pytest.raises(ValueError, match=message):
-            scan.run_scan(KICKOFF, _StubSportmonks(), "postgresql://unused", None, store, 1000.0, "",
+            scan.run_scan(KICKOFF, _StubTheStatsAPI(), "postgresql://unused", None, store, 1000.0, "",
                           currency=currency, book_rate=book_rate)
     quote = LiveOddsQuote(9001, 1, "tackles", 1.5, 2.0, 1.8, 50.0, "bet365", KICKOFF, "void_if_no_appearance")
     [converted] = scan.in_bankroll_currency([quote], rate)
@@ -134,9 +140,7 @@ def test_a_usd_bankroll_needs_a_rate_and_converts_book_limits(tmp_path: Path) ->
 
 
 def test_a_fixture_listing_longer_than_the_page_limit_refuses_the_scan() -> None:
-    row = {"id": 1, "league_id": 14, "state": {"developer_name": "NS"}, "starting_at_timestamp": int(KICKOFF.timestamp()),
-           "participants": [{"id": 76, "name": "Walsall", "meta": {"location": "home"}},
-                            {"id": 348, "name": "Port Vale", "meta": {"location": "away"}}]}
+    from prop_alpha.ingestion.pipeline import MAX_TSA_PAGES
 
     class Listing:
         def __init__(self, pages: int) -> None:
@@ -144,14 +148,15 @@ def test_a_fixture_listing_longer_than_the_page_limit_refuses_the_scan() -> None
 
         def get_json(self, path: str) -> dict[str, Any]:
             self.calls += 1
-            return {"data": [dict(row, id=self.calls)], "pagination": {"has_more": self.calls < self.pages}}
+            return {"data": [_tsa_match(self.calls)], "meta": {"total_pages": self.pages}}
 
     start, end = KICKOFF - timedelta(hours=1), KICKOFF + timedelta(hours=1)
-    assert len(scan.fetch_upcoming(Listing(scan.MAX_LISTING_PAGES), start, end)) == scan.MAX_LISTING_PAGES
-    truncated = Listing(scan.MAX_LISTING_PAGES + 1)
+    league_two = {"comp_4023": "League Two"}
+    assert len(scan.fetch_upcoming(Listing(MAX_TSA_PAGES), start, end, league_two)) == MAX_TSA_PAGES
+    truncated = Listing(MAX_TSA_PAGES + 1)
     with pytest.raises(ValueError, match="more than"):
-        scan.fetch_upcoming(truncated, start, end)
-    assert truncated.calls == scan.MAX_LISTING_PAGES
+        scan.fetch_upcoming(truncated, start, end, league_two)
+    assert truncated.calls == MAX_TSA_PAGES
 
 
 def _mock_source(now: datetime, seed: int) -> scan.QuoteSource:
@@ -222,13 +227,12 @@ def test_notify_max_alerts_must_be_non_negative(tmp_path: Path) -> None:
         notifier.notify(AllocationReport(), {}, max_alerts=-1)
 
 
-class _StubSportmonks:
+class _StubTheStatsAPI:
+    """TheStatsAPI's listing: one scheduled League Two match (Walsall v Port Vale, fixture 9001), nothing in League One."""
+
     def get_json(self, path: str) -> dict[str, Any]:
-        row = {"id": 9001, "league_id": 14, "state": {"developer_name": "NS"},
-               "starting_at_timestamp": int(KICKOFF.timestamp()),
-               "participants": [{"id": 76, "name": "Walsall", "meta": {"location": "home"}},
-                                {"id": 348, "name": "Port Vale", "meta": {"location": "away"}}]}
-        return {"data": [row], "pagination": {"has_more": False}}
+        rows = [_tsa_match(9001)] if "competition_id=comp_4023" in path and "status=scheduled" in path else []
+        return {"data": rows, "meta": {"total_pages": 1}}
 
 
 class _FailingOdds:
@@ -271,7 +275,7 @@ def test_odds_outage_is_reported_in_the_summary_not_fatal(
     store = SentAlertStore(tmp_path / "sent.jsonl")
     notifier = _RecordingNotifier(store)
     with caplog.at_level(logging.ERROR, logger="prop_alpha.scan"):
-        summary = scan.run_scan(KICKOFF - timedelta(hours=2), _StubSportmonks(), "postgresql://unused", notifier,
+        summary = scan.run_scan(KICKOFF - timedelta(hours=2), _StubTheStatsAPI(), "postgresql://unused", notifier,
                                 store, 1000.0, "", currency="GBP", odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path)
     assert summary.fixtures == ["Walsall v Port Vale 14:00"]
     assert summary.quotes == 0 and summary.alerts_sent == 0
@@ -407,7 +411,7 @@ def test_boards_are_off_by_default_and_nothing_below_the_benchmark_is_sent(
     _patch_database(monkeypatch)
     store = SentAlertStore(tmp_path / "sent.jsonl")
     notifier = _RecordingNotifier(store)
-    summary = scan.run_scan(KICKOFF - timedelta(hours=2), _StubSportmonks(), "postgresql://unused", notifier, store,
+    summary = scan.run_scan(KICKOFF - timedelta(hours=2), _StubTheStatsAPI(), "postgresql://unused", notifier, store,
                             1000.0, "", currency="GBP", odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path)
     assert summary.alerts_sent == 0 and summary.boards_sent == 0 and notifier.texts == []
     assert not (tmp_path / scan.BOARD_STATE_NAME).exists()  # nothing was marked as boarded
@@ -421,7 +425,7 @@ def test_board_is_sent_once_per_match_and_never_for_mock_or_quoted_runs(
     store = SentAlertStore(tmp_path / "sent.jsonl")
     first, again = _RecordingNotifier(store), _RecordingNotifier(store)
     now = KICKOFF - timedelta(hours=2)
-    summary = scan.run_scan(now, _StubSportmonks(), "postgresql://unused", first, store, 1000.0, "", currency="GBP",
+    summary = scan.run_scan(now, _StubTheStatsAPI(), "postgresql://unused", first, store, 1000.0, "", currency="GBP",
                             odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path)
     assert summary.boards_sent == 1
     board_text = "\n".join(first.texts)
@@ -429,11 +433,11 @@ def test_board_is_sent_once_per_match_and_never_for_mock_or_quoted_runs(
     assert "Walsall v Port Vale, Sat 10 Oct 14:00 UTC" in board_text
     assert "Regular Starter (Walsall)" in board_text and ">= " in board_text
     assert "Rarely Plays" not in board_text  # not a regular starter, so never priced
-    retry = scan.run_scan(now, _StubSportmonks(), "postgresql://unused", again, store, 1000.0, "", currency="GBP",
+    retry = scan.run_scan(now, _StubTheStatsAPI(), "postgresql://unused", again, store, 1000.0, "", currency="GBP",
                           odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path)
     assert retry.boards_sent == 0 and not [t for t in again.texts if scan.BOARD_HEADER in t]
     mock_store = SentAlertStore(tmp_path / "mock.jsonl")
-    mocked = scan.run_scan(now, _StubSportmonks(), "postgresql://unused", _RecordingNotifier(mock_store), mock_store,
+    mocked = scan.run_scan(now, _StubTheStatsAPI(), "postgresql://unused", _RecordingNotifier(mock_store), mock_store,
                            1000.0, scan.MOCK_LABEL, currency="GBP", odds="mock", state_dir=tmp_path / "mock_state")
     assert mocked.boards_sent == 0
 
@@ -477,7 +481,7 @@ def test_fouls_are_priced_but_never_staked_or_alerted(tmp_path: Path, monkeypatc
         return original(self, projections, quotes, **kwargs)
 
     monkeypatch.setattr(scan.InstitutionalAssetManager, "allocate", spy)
-    summary = scan.run_scan(KICKOFF - timedelta(hours=2), _StubSportmonks(), "postgresql://unused",
+    summary = scan.run_scan(KICKOFF - timedelta(hours=2), _StubTheStatsAPI(), "postgresql://unused",
                             _RecordingNotifier(store), store, 1000.0, scan.MOCK_LABEL, currency="GBP", odds="mock",
                             state_dir=tmp_path)
     assert seen and set(seen) == {"tackles"}
@@ -502,7 +506,7 @@ def test_a_real_odds_run_logs_its_predictions_before_it_sends_anything(
     notifier = _RecordingNotifier(store)
     log = PredictionLog(tmp_path / "predictions.jsonl")
     now = KICKOFF - timedelta(hours=2)
-    scan.run_scan(now, _StubSportmonks(), "postgresql://unused", notifier, store, 1000.0, "", currency="GBP",
+    scan.run_scan(now, _StubTheStatsAPI(), "postgresql://unused", notifier, store, 1000.0, "", currency="GBP",
                   odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path, predictions=log)
     records = log.load()
     assert records and {r["fixture_id"] for r in records} == {9001}
@@ -525,7 +529,7 @@ def test_a_prediction_that_cannot_be_logged_stops_the_run_before_any_alert(
 
     monkeypatch.setattr(PredictionLog, "record", refuse)
     with pytest.raises(OSError, match="disk full"):
-        scan.run_scan(KICKOFF - timedelta(hours=2), _StubSportmonks(), "postgresql://unused", notifier, store, 1000.0,
+        scan.run_scan(KICKOFF - timedelta(hours=2), _StubTheStatsAPI(), "postgresql://unused", notifier, store, 1000.0,
                       "", currency="GBP", odds="oddspapi", odds_client=_FailingOdds(), state_dir=tmp_path,
                       predictions=PredictionLog(tmp_path / "predictions.jsonl"))
     assert notifier.texts == []
@@ -534,7 +538,7 @@ def test_a_prediction_that_cannot_be_logged_stops_the_run_before_any_alert(
 def test_a_mock_run_never_writes_the_prediction_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_database(monkeypatch)
     store = SentAlertStore(tmp_path / "sent.jsonl")
-    scan.run_scan(KICKOFF - timedelta(hours=2), _StubSportmonks(), "postgresql://unused", _RecordingNotifier(store),
+    scan.run_scan(KICKOFF - timedelta(hours=2), _StubTheStatsAPI(), "postgresql://unused", _RecordingNotifier(store),
                   store, 1000.0, scan.MOCK_LABEL, currency="GBP", odds="mock", state_dir=tmp_path)
     assert not (tmp_path / "predictions.jsonl").exists()
 

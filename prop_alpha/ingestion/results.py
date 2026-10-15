@@ -4,12 +4,15 @@ lockbox fills. Runs first in scripts/telegram_status.cmd, every 4 hours.
 
     python -m prop_alpha.ingestion.results              # list, then ingest what is missing
     python -m prop_alpha.ingestion.results --dry-run    # list only (one or two vendor requests)
-    python -m prop_alpha.ingestion.results --pilot      # the pilot leagues into prop_alpha_pilot (alerts/ladder_scan.py)
+    python -m prop_alpha.ingestion.results --pilot      # the pilot leagues into the pilot database (alerts/ladder_scan.py)
+
+Data: TheStatsAPI since 2026-10-15 (it was Sportmonks): one listing request per competition and page, then one player-stats
+request per missing match through ingestion/thestatsapi.py.
 
 The listing covers [latest stored final kickoff - LOOKBACK, today], at most MAX_SPAN per run, so a job that has
 not run for weeks catches up over several runs. Fixtures already final in the database are skipped; the rest go
 through ConcurrentIngestionEngine (job "stats"), which does all writes. Every listing page and every fixture spends
-one Sportmonks request (DATA_VENDOR_MAX_REQUESTS, default DEFAULT_MAX_REQUESTS). A listing longer than
+one TheStatsAPI request (DATA_VENDOR_MAX_REQUESTS, default DEFAULT_MAX_REQUESTS). A listing longer than
 MAX_LISTING_PAGES raises rather than ingest part of it. Exit code 1 when any fixture failed or was refused.
 """
 
@@ -26,7 +29,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Final, Mapping, Sequence
 
 from prop_alpha.config import DEFAULT_DSN, DEFAULT_ENV_FILE, DEFAULT_PILOT_DSN, DSN_ENV, PILOT_DSN_ENV
-from prop_alpha.ingestion import sportmonks
+from prop_alpha.ingestion import thestatsapi
 
 logger = logging.getLogger("prop_alpha.results")
 
@@ -41,6 +44,8 @@ DEFAULT_WORKERS: Final[int] = 4
 # counted as stale by alerts/ladder_scan.py; a network error is never recorded, so it is retried.
 PILOT_REFUSED_FILE: Final[Path] = DEFAULT_ENV_FILE.parent / ".prop_alpha_state" / "pilot_refused.json"
 
+# TheStatsAPI's answer for a match it holds no player statistics for (HTTP 404): a permanent gap, recorded as refused.
+STATS_NOT_AVAILABLE: Final[str] = "STATS_NOT_AVAILABLE_AT_SOURCE"
 LATEST_FINAL_SQL: Final[str] = "SELECT max(kickoff_at) FROM prop_alpha.fixtures WHERE status = 'final'"
 # Final fixtures from a day before the listing window starts (kickoff dates are listed in UTC).
 REFRESH_INCOMPLETE_SQL: Final[str] = "SELECT prop_alpha.refresh_incomplete_team_matches(%s)"
@@ -101,10 +106,12 @@ def load_refused(path: Path) -> dict[str, str]:
 
 
 def record_refused(path: Path, failed: Mapping[str, str]) -> int:
-    """Remember the fixtures in `failed` that the adapter refused (reason starts with ValueError); returns how many are new.
-    Network errors and timeouts are not recorded: they are retried."""
+    """Remember the fixtures in `failed` that cannot load (the adapter refused them, a reason starting with ValueError, or
+    TheStatsAPI has no statistics for them, STATS_NOT_AVAILABLE_AT_SOURCE); returns how many are new. Network errors and
+    timeouts are not recorded: they are retried."""
     known = load_refused(path)
-    new = {uid: reason[:200] for uid, reason in failed.items() if reason.startswith("ValueError") and uid not in known}
+    new = {uid: reason[:200] for uid, reason in failed.items()
+           if (reason.startswith("ValueError") or STATS_NOT_AVAILABLE in reason) and uid not in known}
     if new:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({**known, **new}, indent=1), encoding="utf-8")
@@ -112,18 +119,12 @@ def record_refused(path: Path, failed: Mapping[str, str]) -> int:
 
 
 def list_finished(
-    client: Any, start: date, end: date, leagues: Mapping[int, str] = sportmonks.SCAN_LEAGUES
-) -> list[tuple[str, datetime]]:
-    window = (datetime(start.year, start.month, start.day, tzinfo=timezone.utc),
-              datetime(end.year, end.month, end.day, tzinfo=timezone.utc))
-    listed: list[tuple[str, datetime]] = []
-    for page in range(1, MAX_LISTING_PAGES + 1):
-        rows, has_more = sportmonks.finished_fixtures(client.get_json(sportmonks.upcoming_path(*window, page, leagues)),
-                                                      leagues)
-        listed += rows
-        if not has_more:
-            return listed
-    raise ValueError(f"results listing {start}..{end} has more than {MAX_LISTING_PAGES} pages; nothing ingested")
+    client: Any, start: date, end: date, leagues: Mapping[str, str] = thestatsapi.SCAN_COMPETITIONS
+) -> list[Mapping[str, Any]]:
+    """The finished TheStatsAPI match rows of `leagues` (competition id -> name) kicking off between two dates."""
+    from prop_alpha.ingestion.pipeline import list_matches
+
+    return list_matches(client, leagues, start, end, "finished")
 
 
 def read_stored(dsn: str) -> tuple[datetime | None, frozenset[str]]:
@@ -181,26 +182,20 @@ def refresh_incomplete(dsn: str, since: date) -> int:
         conn.close()
 
 
-def pilot_leagues(client: Any) -> tuple[dict[int, str], list[str]]:
-    """(Sportmonks id -> name for the pilot leagues the plan includes, the ones it does not): one or two requests."""
-    rows: list[Mapping[str, Any]] = []
-    for page in range(1, MAX_LISTING_PAGES + 1):
-        page_rows, has_more = sportmonks.league_rows(client.get_json(f"{sportmonks.LEAGUES_PATH}&page={page}"))
-        rows += page_rows
-        if not has_more:
-            return sportmonks.resolve_leagues(rows)
-    raise ValueError(f"league listing has more than {MAX_LISTING_PAGES} pages")
-
-
 def run(
     now: datetime, client: Any, dsn: str, *, dry_run: bool = False, workers: int = DEFAULT_WORKERS,
-    leagues: Mapping[int, str] = sportmonks.SCAN_LEAGUES, refused_path: Path | None = None,
+    leagues: Mapping[str, str] = thestatsapi.SCAN_COMPETITIONS, refused_path: Path | None = None,
+    listing: dict[str, Mapping[str, Any]] | None = None,
 ) -> ResultsReport:
     """With `refused_path` (the pilot), fixtures recorded there are left out of `missing`, and the adapter's new refusals are
-    recorded after the ingest."""
+    recorded after the ingest. `listing` is the client's match table (pipeline.build_thestatsapi_client): the listed rows
+    are added to it, since the player-stats reply alone has no teams, kickoff or score."""
     latest, stored = read_stored(dsn)
     start, end = listing_window(latest, now)
-    listed = list_finished(client, start, end, leagues)
+    rows = list_finished(client, start, end, leagues)
+    if listing is not None:
+        listing.update({str(m["id"]): m for m in rows})
+    listed = [(str(m["id"]), thestatsapi.kickoff(m)) for m in rows]
     refused = frozenset(load_refused(refused_path)) if refused_path is not None else frozenset()
     report = ResultsReport(start, end, listed=len(listed),
                            missing=[uid for uid in missing_fixtures(listed, stored) if uid not in refused])
@@ -227,22 +222,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="the pilot leagues (Scottish Premiership, Scottish Championship, Brazil Serie A) into prop_alpha_pilot")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     args = parser.parse_args(argv)
-    from prop_alpha.ingestion.pipeline import build_vendor_client
+    from prop_alpha.ingestion.pipeline import build_thestatsapi_client
 
     environ = {**os.environ,
                "DATA_VENDOR_MAX_REQUESTS": os.environ.get("DATA_VENDOR_MAX_REQUESTS", str(DEFAULT_MAX_REQUESTS)),
                "DATA_VENDOR_QUOTA_RESERVE": os.environ.get("DATA_VENDOR_QUOTA_RESERVE", "100")}
-    client = build_vendor_client(environ)
+    listing: dict[str, Mapping[str, Any]] = {}
+    client = build_thestatsapi_client(environ, listing)
     try:
         if args.pilot:
-            leagues, absent = pilot_leagues(client)
-            if absent:
-                print(f"Not in the Sportmonks plan, not ingested: {', '.join(absent)}")
             report = run(datetime.now(timezone.utc), client, os.environ.get(PILOT_DSN_ENV, DEFAULT_PILOT_DSN),
-                         dry_run=args.dry_run, workers=args.workers, leagues=leagues, refused_path=PILOT_REFUSED_FILE)
+                         dry_run=args.dry_run, workers=args.workers, leagues=thestatsapi.PILOT_COMPETITIONS,
+                         refused_path=PILOT_REFUSED_FILE, listing=listing)
         else:
             report = run(datetime.now(timezone.utc), client, os.environ.get(DSN_ENV, DEFAULT_DSN), dry_run=args.dry_run,
-                         workers=args.workers)
+                         workers=args.workers, listing=listing)
     finally:
         client.close()
     print(report.text())

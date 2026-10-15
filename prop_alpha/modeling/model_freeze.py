@@ -20,7 +20,11 @@ from pathlib import Path
 from typing import Final, Mapping
 
 FROZEN_ON: Final[date] = date(2026, 10, 5)
-LOCKBOX_START: Final[datetime] = datetime(2026, 10, 6, tzinfo=timezone.utc)
+# Restarted (maintainer, 2026-10-15) with the move from Sportmonks to TheStatsAPI: the pricing code is unchanged (same
+# FROZEN_DIGEST), but its input data now come from another vendor whose counts differ (tackles for about 1 player in 8),
+# so matches priced on Sportmonks data (from 2026-10-06) no longer count. Only matches from this date, priced and scored
+# on TheStatsAPI data (prop_alpha_tsa), count towards Gate 2.
+LOCKBOX_START: Final[datetime] = datetime(2026, 10, 17, tzinfo=timezone.utc)
 # Lines scored per market: the lines the selection backtests reported, fixed before any lockbox match.
 GATE2_LINES: Final[Mapping[str, tuple[float, ...]]] = {"tackles": (0.5, 1.5, 2.5), "fouls": (0.5, 1.5)}
 # Every top-level definition that decides a price ("*" = the whole module). Odds matching, alerts, mock prices and

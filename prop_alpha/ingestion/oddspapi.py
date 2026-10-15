@@ -324,6 +324,12 @@ def normalise(name: str) -> str:
     return " ".join(re.sub(r"[^a-z ]", "", ascii_name.lower().replace("-", " ")).split())
 
 
+# Words a club is also known by, where two feeds share no word of its name: TheStatsAPI lists Athletico Paranaense as
+# "Athletico" and OddsPapi as "CA Paranaense PR" (2026-10-15, the only miss among the 2026-10-11 Brazil Serie A fixtures).
+_TOKEN_ALIASES: Final[Mapping[str, frozenset[str]]] = {"athletico": frozenset({"paranaense"})}
+
+
 def team_tokens(name: str) -> frozenset[str]:
-    """Distinctive words of a club name ("Milton Keynes Dons" -> {milton, keynes, dons})."""
-    return frozenset(word for word in normalise(name).split() if word not in _COMMON_TEAM_WORDS)
+    """Distinctive words of a club name ("Milton Keynes Dons" -> {milton, keynes, dons}), with their known aliases."""
+    words = frozenset(word for word in normalise(name).split() if word not in _COMMON_TEAM_WORDS)
+    return words.union(*(_TOKEN_ALIASES.get(word, frozenset()) for word in words))
