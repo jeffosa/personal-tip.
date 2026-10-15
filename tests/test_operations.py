@@ -303,6 +303,7 @@ def test_the_backup_covers_every_pilot_evidence_file() -> None:
     written = {ladder_scan.PILOT_STATE_FILE.name, ladder_scan.PILOT_INDEX_FILE.name, ladder_scan.PILOT_DELIVERY_FILE.name,
                ladder_scan.PILOT_PREDICTIONS_FILE.name, pilot_ledger.PILOT_BETS_FILE.name, pilot_ledger.PILOT_TIPS_FILE.name,
                pilot_ledger.PILOT_CLOSING_FILE.name, pilot_closing.HANDLED_FILE.name, results.PILOT_REFUSED_FILE.name,
+               results.REFUSED_FILE.name,
                ladder_scan.PILOT_HEARTBEAT_FILE.name}
     assert written <= set(backup.STATE_FILES), sorted(written - set(backup.STATE_FILES))
 

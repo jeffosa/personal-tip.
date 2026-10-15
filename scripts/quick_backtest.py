@@ -107,7 +107,7 @@ def positional_rates(rows: Sequence[tuple[Any, ...]], market: str) -> dict[str, 
     counts: dict[str, float] = defaultdict(float)
     minutes: dict[str, float] = defaultdict(float)
     for row in rows:
-        if row[2] < SEASON_SPLIT and float(row[4]) > 0.0:
+        if row[2] < SEASON_SPLIT and float(row[4]) > 0.0 and row[7] is not None:  # no position: not a bucket
             counts[row[7]] += int(row[index])
             minutes[row[7]] += float(row[4])
     return {pos: 90.0 * counts[pos] / minutes[pos] for pos in minutes if minutes[pos] > 0.0}
@@ -220,7 +220,7 @@ def main() -> int:
     args = parser.parse_args()
     rows = load_rows()
     rng = np.random.default_rng(SEED)
-    excluded_positions = sorted({r[7] for r in rows if r[7] not in OUTFIELD})
+    excluded_positions = sorted({str(r[7]) for r in rows if r[7] not in OUTFIELD})  # str: a missing position is None
     results: dict[str, Any] = {"run_at": datetime.now(timezone.utc).isoformat(), "seed": SEED, "level": args.level,
                                "excluded_positions": excluded_positions, "markets": {}}
     results["tackles_count"] = TACKLES_COUNT

@@ -43,6 +43,10 @@ DEFAULT_WORKERS: Final[int] = 4
 # tackles in any line-up): fixture id -> reason. They are not retried, not counted as missing by this job, and not
 # counted as stale by alerts/ladder_scan.py; a network error is never recorded, so it is retried.
 PILOT_REFUSED_FILE: Final[Path] = DEFAULT_ENV_FILE.parent / ".prop_alpha_state" / "pilot_refused.json"
+# The same record for League One/Two (the working database), since 2026-10-15: before it, a League One/Two match that can
+# never load (e.g. the backfill's ambiguous League Two matches, where both starting XIs list 10) stayed missing, was
+# re-requested on every run and failed the job until the listing window moved past it.
+REFUSED_FILE: Final[Path] = DEFAULT_ENV_FILE.parent / ".prop_alpha_state" / "refused.json"
 
 # TheStatsAPI's answer for a match it holds no player statistics for (HTTP 404): a permanent gap, recorded as refused.
 STATS_NOT_AVAILABLE: Final[str] = "STATS_NOT_AVAILABLE_AT_SOURCE"
@@ -65,6 +69,7 @@ class ResultsReport:
     failed: dict[str, str] = field(default_factory=dict)
     rejected_rows: int = 0
     incomplete: int = 0
+    skipped_refused: int = 0
 
     @property
     def ok(self) -> bool:
@@ -73,6 +78,8 @@ class ResultsReport:
     def text(self) -> str:
         line = (f"Results {self.start:%d %b}-{self.end:%d %b}: {self.listed} finished, {len(self.missing)} not yet "
                 f"stored, {self.ingested} ingested")
+        if self.skipped_refused:
+            line += f" ({self.skipped_refused} refused earlier, not retried)"
         if self.failed:
             line += f", {len(self.failed)} FAILED ({', '.join(sorted(self.failed))})"
         if self.rejected_rows:
@@ -184,11 +191,11 @@ def refresh_incomplete(dsn: str, since: date) -> int:
 
 def run(
     now: datetime, client: Any, dsn: str, *, dry_run: bool = False, workers: int = DEFAULT_WORKERS,
-    leagues: Mapping[str, str] = thestatsapi.SCAN_COMPETITIONS, refused_path: Path | None = None,
+    leagues: Mapping[str, str] = thestatsapi.SCAN_COMPETITIONS, refused_path: Path,
     listing: dict[str, Mapping[str, Any]] | None = None,
 ) -> ResultsReport:
-    """With `refused_path` (the pilot), fixtures recorded there are left out of `missing`, and the adapter's new refusals are
-    recorded after the ingest. `listing` is the client's match table (pipeline.build_thestatsapi_client): the listed rows
+    """Fixtures recorded in `refused_path` (REFUSED_FILE, or PILOT_REFUSED_FILE for the pilot; required, so no caller can
+    leave it out) are left out of `missing`, and the new permanent refusals are recorded after the ingest. `listing` is the client's match table (pipeline.build_thestatsapi_client): the listed rows
     are added to it, since the player-stats reply alone has no teams, kickoff or score."""
     latest, stored = read_stored(dsn)
     start, end = listing_window(latest, now)
@@ -196,17 +203,17 @@ def run(
     if listing is not None:
         listing.update({str(m["id"]): m for m in rows})
     listed = [(str(m["id"]), thestatsapi.kickoff(m)) for m in rows]
-    refused = frozenset(load_refused(refused_path)) if refused_path is not None else frozenset()
-    report = ResultsReport(start, end, listed=len(listed),
-                           missing=[uid for uid in missing_fixtures(listed, stored) if uid not in refused])
+    refused = frozenset(load_refused(refused_path))
+    not_stored = missing_fixtures(listed, stored)
+    report = ResultsReport(start, end, listed=len(listed), missing=[uid for uid in not_stored if uid not in refused],
+                           skipped_refused=sum(uid in refused for uid in not_stored))
     if dry_run or not report.missing:
         return report
     slate = ingest(client, dsn, report.missing, workers)
     report.incomplete = refresh_incomplete(dsn, start - timedelta(days=1))
     report.failed = {str(uid): str(error) for uid, error in slate.failed.items()}
     report.failed.update({str(uid): "timed out" for uid in slate.timed_out})
-    if refused_path is not None:
-        record_refused(refused_path, report.failed)
+    record_refused(refused_path, report.failed)
     if slate.merge_error:
         report.failed["merge"] = str(slate.merge_error)
     report.ingested = slate.merge.fixtures_merged if slate.merge is not None else 0
@@ -236,7 +243,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                          refused_path=PILOT_REFUSED_FILE, listing=listing)
         else:
             report = run(datetime.now(timezone.utc), client, os.environ.get(DSN_ENV, DEFAULT_DSN), dry_run=args.dry_run,
-                         workers=args.workers, listing=listing)
+                         workers=args.workers, refused_path=REFUSED_FILE, listing=listing)
     finally:
         client.close()
     print(report.text())

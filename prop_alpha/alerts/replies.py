@@ -47,7 +47,7 @@ RESULTS: Final[tuple[str, ...]] = ("won", "lost", "void")
 SETTLEMENT_SOURCES: Final[frozenset[str]] = frozenset({"auto", "manual"})
 # The stored count each market settles on (ingestion/oddspapi.py market contract, assumed until checked).
 SETTLEMENT_COLUMNS: Final[Mapping[str, str]] = {"tackles": "tackles_attempted", "fouls": "fouls_committed"}
-AUTO_BASIS: Final[str] = "Sportmonks stats, assumed market rules (not yet checked against the bookmaker)"
+AUTO_BASIS: Final[str] = "TheStatsAPI stats, assumed market rules (not yet checked against the bookmaker)"
 UNKNOWN_BOOK: Final[str] = "unknown"
 ITEM_KINDS: Final[frozenset[str]] = frozenset({"alert", "board"})
 SIDES: Final[tuple[str, ...]] = ("over", "under")

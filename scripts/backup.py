@@ -66,6 +66,8 @@ STATE_FILES: Final[tuple[str, ...]] = (
     # The evaluation evidence (audit 2026-10-10: both were documented as backed up, and neither was): the model's
     # logged prospective predictions (Gate 2 lockbox) and the T-60 team sheets.
     "predictions.jsonl", "lineups_t60.jsonl", "lineups_t60_handled.json",
+    # League One/Two matches the data feed can never load (results.REFUSED_FILE, 2026-10-15).
+    "refused.json",
     # The pilot scan's evidence (audit 2026-10-11): its alerts, paper bets, tips, logged predictions, closing prices and the
     # matches the data feed refused. The pilot database itself is not dumped here.
     "pilot_sent_alerts.jsonl", "pilot_alert_messages.jsonl", "pilot_alert_deliveries.jsonl", "pilot_paper_bets.jsonl",

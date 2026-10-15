@@ -14,9 +14,8 @@ It is the League One/Two scan (alerts/scan.py) with these differences, and nothi
 * Pricing is the pilot's, read from the pilot database `prop_alpha_pilot` (read-only), never from the working
   `prop_alpha`: tackles counted as pilot_ledger.PILOT_TACKLES_SQL (plain tackles_attempted since 2026-10-13, after settled
   results contradicted the 2026-10-12 tackles-plus-challenges-lost count, MARKET_CONTRACT.md 2e; loaded through PilotCursor so the
-  frozen League One/Two queries are untouched), prior strength 6, no rate multiplier, and a game-state k per league and market (LEAGUE_GAME_STATE_K: Brazil
-  Serie A's own fit; the English Championship's 21.1 for tackles and 1000 for fouls for the Scottish leagues, which have no
-  backtest at all). These are NOT the frozen League One/Two settings and are not frozen themselves: the model_freeze
+  frozen League One/Two queries are untouched), prior strength 6, no rate multiplier, and a game-state k per league and market (LEAGUE_GAME_STATE_K: each
+  league's own fit on TheStatsAPI data, 2026-10-15); Scottish Championship tackles are not priced (UNPRICED_MARKETS). These are NOT the frozen League One/Two settings and are not frozen themselves: the model_freeze
   fingerprint and the League One/Two lockbox are untouched, and no pilot lockbox exists.
 * Tips: only leagues in TIP_LEAGUES can produce a tip. It is empty: Brazil Serie A was turned on by the maintainer on 2026-10-11
   and paused on 2026-10-12 until the gap between the model and the bookmakers' prices is explained. Every pilot league is
@@ -95,15 +94,31 @@ from prop_alpha.scanner.slate import (
 
 logger = logging.getLogger("prop_alpha.ladder_scan")
 
-# The pilot's pricing settings. Game-state dispersion k per market: Brazil Serie A has its own, fitted by scripts/quick_backtest.py
-# on its matches before 2026-03-01 and scored on 4,808 starters in 253 matches after that date: tackles 496.882 on the pilot's
-# count (plain tackles_attempted, run 2026-10-11 and again 2026-10-12: Brier skill +0.062 to +0.077 over lines 0.5-2.5, slopes
-# 0.93-1.02; it was 17.312 on tackles plus challenges lost, the count of 2026-10-12 only), fouls 40.556 (2026-10-11). A league
-# without its own (the two Scottish leagues, which have no backtest) falls back to the English Championship's fit of 2026-10-08,
-# made on tackles attempted alone: a guess twice over.
+# The pilot's pricing settings. Game-state dispersion k per league and market, refitted on TheStatsAPI data (prop_alpha_pilot_tsa,
+# 2026-10-15) by scripts/quick_backtest.py --level on each league's matches before 2026-03-01 and scored on its starters after
+# that date (plain tackles_attempted): Brazil Serie A tackles 34.276 and fouls 14.396 (5,021 starters in 262 matches; on
+# Sportmonks data they were 496.882 and 40.556), Scottish Premiership tackles 52.918 and fouls 28.765 (1,813 starters in 106
+# matches; it had no fit before and used the English Championship's), Scottish Championship fouls 1000 (the fit found no
+# overdispersion, which this k stands for). The same runs scored k = 6 slightly better on tackles in both leagues (calibration
+# slopes 0.93-1.05 against 0.82-0.95); the fitted k is kept, as before, because choosing on the scored window would make it
+# selection data. GAME_STATE_K is the fallback for a league without its own (none since 2026-10-15): the English
+# Championship's 2026-10-08 fit.
 DEFAULT_GAME_STATE_K: Final[float] = 6.0
 GAME_STATE_K: Final[Mapping[str, float]] = {"tackles": 21.1, "fouls": 1000.0}
-LEAGUE_GAME_STATE_K: Final[Mapping[str, Mapping[str, float]]] = {"Brazil Serie A": {"tackles": 496.882, "fouls": 40.556}}
+LEAGUE_GAME_STATE_K: Final[Mapping[str, Mapping[str, float]]] = {
+    "Brazil Serie A": {"tackles": 34.276, "fouls": 14.396},
+    "Scottish Premiership": {"tackles": 52.918, "fouls": 28.765},
+    "Scottish Championship": {"fouls": 1000.0},  # tackles: UNPRICED_MARKETS
+}
+# Markets left unpriced per league because the stored counts are incomplete. TheStatsAPI records 2-8 tackles a match in the
+# Scottish Championship (none at all in 10 of its 39 matches of August-September 2026) against about 30 in every other
+# league, while its fouls look normal (about 23); tackles priced from that would be about a fifth of the truth.
+# The gap is at the source, not in loading (checked 2026-10-15): a fresh request for Ayr United v Stenhousemuir
+# (mt_200131818) still gives 2 tackles beside 201 duels won and 27 fouls; SofaScore's own team statistics show 0-0 and 2-0
+# tackles for two October 2026 Scottish Championship matches; FotMob (Opta) publishes no team or player statistics for the
+# league at all, while it does for the Scottish Premiership (Motherwell v Celtic: 15 and 14 tackles); and the Sportmonks
+# archive (prop_alpha_pilot) shows the same 2-8 a match. No source available here holds the real counts.
+UNPRICED_MARKETS: Final[Mapping[str, frozenset[str]]] = {"Scottish Championship": frozenset({"tackles"})}
 PRIOR_STRENGTH: Final[Mapping[str, float]] = {"tackles": 6.0, "fouls": 6.0}
 # Only tackles are tipped, as in the League One/Two scan; fouls are priced but never staked or tipped (the pilot's
 # fouls calibration slopes were 0.86 and 0.89 against the 0.9-1.1 the PRD requires).
@@ -204,7 +219,8 @@ def pilot_settings_digest() -> str:
     """The identity of the pilot's pricing settings, written on every pilot prediction: a prediction made under other
     settings is never mistaken for one made under these (the pilot has no frozen code, so no source digest)."""
     settings = {"default_k": DEFAULT_GAME_STATE_K, "k": GAME_STATE_K, "league_k": LEAGUE_GAME_STATE_K,
-                "prior": PRIOR_STRENGTH, "tackles_count": pilot_ledger.PILOT_TACKLES_SQL, "edge_cap": PLAUSIBLE_EDGE_CAP}
+                "prior": PRIOR_STRENGTH, "unpriced": {k: sorted(v) for k, v in UNPRICED_MARKETS.items()},
+                "tackles_count": pilot_ledger.PILOT_TACKLES_SQL, "edge_cap": PLAUSIBLE_EDGE_CAP}
     return "pilot:" + hashlib.sha256(json.dumps(settings, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
@@ -219,11 +235,13 @@ def price_pilot(
     market_engines: Mapping[str, QuantEngine] | None = None,
 ) -> tuple[dict[ProjectionKey, FactorProjection], list[str]]:
     """The model's projections for one pilot-league fixture (scan.scan_fixture's `pricer`); pass the engines of
-    `pilot_engines(fixture.league)`."""
-    return build_projections(
+    `pilot_engines(fixture.league)`. A market in UNPRICED_MARKETS for the fixture's league is left out."""
+    projections, notes = build_projections(
         fixture, inputs.squad, inputs.history_by_player, inputs.team_recent_fixtures, inputs.league_rates, engine,
         season_levels=inputs.season_levels or None, market_engines=market_engines, prior_strengths=PRIOR_STRENGTH,
     )
+    unpriced = UNPRICED_MARKETS.get(fixture.league, frozenset())
+    return {key: p for key, p in projections.items() if key[2] not in unpriced}, notes
 
 
 def missing_by_league(

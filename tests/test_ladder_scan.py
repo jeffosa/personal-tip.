@@ -233,12 +233,16 @@ def test_the_pilot_prices_with_its_own_settings_by_league_not_the_frozen_ones() 
     scottish = replace(FIXTURE, league="Scottish Premiership")
     engine, market_engines = ladder_scan.pilot_engines(scottish.league)
     fallback, _ = ladder_scan.price_pilot(scottish, inputs, engine, market_engines)
-    # A league without its own fit uses the English Championship's: tackles 21.1, fouls 1000.
-    assert fallback[(9101, 1, "tackles")].game_state_k == 21.1 and fallback[(9101, 1, "fouls")].game_state_k == 1000.0
+    # Each pilot league has its own fit on TheStatsAPI data (2026-10-15).
+    assert fallback[(9101, 1, "tackles")].game_state_k == 52.918 and fallback[(9101, 1, "fouls")].game_state_k == 28.765
     brazil, _ = ladder_scan.price_pilot(FIXTURE, inputs, *ladder_scan.pilot_engines(FIXTURE.league))
-    assert brazil[(9101, 1, "tackles")].game_state_k == 496.882 and brazil[(9101, 1, "fouls")].game_state_k == 40.556
+    assert brazil[(9101, 1, "tackles")].game_state_k == 34.276 and brazil[(9101, 1, "fouls")].game_state_k == 14.396
+    # A league without its own fit falls back to GAME_STATE_K (the English Championship's tackles 21.1, fouls 1000).
+    unknown, _ = ladder_scan.price_pilot(replace(FIXTURE, league="Nowhere League"), inputs,
+                                         *ladder_scan.pilot_engines("Nowhere League"))
+    assert unknown[(9101, 1, "tackles")].game_state_k == 21.1 and unknown[(9101, 1, "fouls")].game_state_k == 1000.0
     frozen, _ = scan.price_fixture(FIXTURE, inputs, *scan.scan_engines())
-    assert frozen[(9101, 1, "tackles")].game_state_k == scan.SCAN_GAME_STATE_K_BY_MARKET["tackles"] not in (21.1, 496.882)
+    assert frozen[(9101, 1, "tackles")].game_state_k == scan.SCAN_GAME_STATE_K_BY_MARKET["tackles"] not in (21.1, 34.276)
     # The pilot applies no rate multiplier and its own prior strength: the same call by hand agrees.
     by_hand, _ = build_projections(FIXTURE, inputs.squad, inputs.history_by_player, inputs.team_recent_fixtures,
                                    RATES, QuantEngine(game_state_k=6.0),
@@ -247,6 +251,24 @@ def test_the_pilot_prices_with_its_own_settings_by_league_not_the_frozen_ones() 
                                    prior_strengths=ladder_scan.PRIOR_STRENGTH)
     assert brazil[(9101, 1, "tackles")].rate_posterior.alpha == pytest.approx(by_hand[(9101, 1, "tackles")].rate_posterior.alpha)
 
+
+
+def test_scottish_championship_tackles_are_not_priced_because_the_stored_counts_are_incomplete() -> None:
+    """TheStatsAPI records about a fifth of the usual tackles there (2026-10-15): pricing them would be wrong, so the
+    pilot leaves that market out and still prices fouls."""
+    inputs = _inputs()
+    fixture = replace(FIXTURE, league="Scottish Championship")
+    projections, _ = ladder_scan.price_pilot(fixture, inputs, *ladder_scan.pilot_engines(fixture.league))
+    assert {key[2] for key in projections} == {"fouls"}
+    assert projections[(9101, 1, "fouls")].game_state_k == 1000.0
+    other, _ = ladder_scan.price_pilot(FIXTURE, inputs, *ladder_scan.pilot_engines(FIXTURE.league))
+    assert {key[2] for key in other} == {"tackles", "fouls"}
+
+
+def test_the_unpriced_markets_are_part_of_the_pilot_settings_digest(monkeypatch: pytest.MonkeyPatch) -> None:
+    current = ladder_scan.pilot_settings_digest()
+    monkeypatch.setattr(ladder_scan, "UNPRICED_MARKETS", {})
+    assert ladder_scan.pilot_settings_digest() != current
 
 # ---------------- listings ----------------
 def test_the_pilot_competitions_and_the_listing_keep_only_the_pilot_leagues_scheduled_matches() -> None:

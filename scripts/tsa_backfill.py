@@ -36,7 +36,7 @@ ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from backup import pg_tool  # noqa: E402  (scripts/ is on sys.path when this file runs as a script)
 
-from prop_alpha.ingestion import thestatsapi  # noqa: E402
+from prop_alpha.ingestion import results, thestatsapi  # noqa: E402
 from prop_alpha.ingestion.pipeline import ConcurrentIngestionEngine, build_pool, build_thestatsapi_client, load_kappas  # noqa: E402
 
 WORKING_DB: Final[str] = "prop_alpha_tsa"
@@ -169,6 +169,9 @@ def ingest(matches: Sequence[Mapping[str, Any]]) -> None:
                         if "ValueError" in reason or "refused" in reason.lower():
                             refused[uid] = reason[:300]
                     REFUSED.write_text(json.dumps(refused, indent=1, ensure_ascii=False), encoding="utf-8")
+                    # ... and in the results job's own record, so the daily job does not retry it either.
+                    results.record_refused(results.REFUSED_FILE if database == WORKING_DB else results.PILOT_REFUSED_FILE,
+                                           report.failed)
                     print(f"  batch {i // BATCH + 1}: {len(report.succeeded)}/{len(todo[i:i + BATCH])} ok, merge "
                           f"{report.merge}, {len(report.failed)} failed, {len(report.timed_out)} timed out", flush=True)
                     for uid, reason in sorted(report.failed.items())[:5]:
