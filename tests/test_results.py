@@ -67,7 +67,7 @@ def test_a_listing_longer_than_the_page_limit_ingests_nothing() -> None:
         results.list_finished(_Listing(MAX_TSA_PAGES + 1), date(2026, 9, 30), date(2026, 10, 10))
 
 
-def test_run_ingests_only_the_missing_fixtures_and_reports_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_ingests_only_the_missing_fixtures_and_reports_failures(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     monkeypatch.setattr(results, "read_stored", lambda dsn: (LATEST, frozenset({_uid(101)})))
     sent: list[list[str]] = []
 
@@ -89,7 +89,8 @@ def test_run_ingests_only_the_missing_fixtures_and_reports_failures(monkeypatch:
 
     monkeypatch.setattr(results, "refresh_incomplete", refresh_incomplete)
     listing: dict[str, Mapping[str, Any]] = {}
-    report = results.run(NOW, _Listing(3), "postgresql://unused", listing=listing)
+    refused = tmp_path / "refused.json"
+    report = results.run(NOW, _Listing(3), "postgresql://unused", refused_path=refused, listing=listing)
     assert sent == [[_uid(102), _uid(103)]]
     assert sorted(listing) == [_uid(101), _uid(102), _uid(103)]  # the client's match table: teams, kickoff, score
     assert refreshed == [report.start - timedelta(days=1)] and report.incomplete == 2  # quarantine refreshed
@@ -97,8 +98,41 @@ def test_run_ingests_only_the_missing_fixtures_and_reports_failures(monkeypatch:
     assert report.listed == 3 and report.missing == [_uid(102), _uid(103)] and report.ingested == 1
     assert report.failed == {_uid(103): "ValueError: refused"} and not report.ok
     assert f"3 finished, 2 not yet stored, 1 ingested, 1 FAILED ({_uid(103)})" in report.text()
-    dry = results.run(NOW, _Listing(3), "postgresql://unused", dry_run=True)
-    assert dry.missing == [_uid(102), _uid(103)] and dry.ingested == 0 and len(sent) == 1
+    # The adapter's refusal is permanent: recorded, and not asked for again on the next run (2026-10-15: League One/Two
+    # used to retry it on every run and fail the job until the listing window moved past it).
+    assert set(results.load_refused(refused)) == {_uid(103)}
+    dry = results.run(NOW, _Listing(3), "postgresql://unused", dry_run=True, refused_path=refused)
+    assert dry.missing == [_uid(102)] and dry.skipped_refused == 1 and dry.ingested == 0 and len(sent) == 1
+    assert "2 not yet stored" not in dry.text() and "(1 refused earlier, not retried)" in dry.text()
+
+
+def test_every_results_run_names_its_refusal_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    """League One/Two reads and writes REFUSED_FILE, the pilot PILOT_REFUSED_FILE; run() has no default, so a caller
+    cannot leave the record out again."""
+    from prop_alpha.ingestion import pipeline
+
+    with pytest.raises(TypeError, match="refused_path"):
+        results.run(NOW, _Listing(1), "postgresql://unused", dry_run=True)  # type: ignore[call-arg]
+
+    closed: list[bool] = []
+
+    class _Client:
+        def close(self) -> None:
+            closed.append(True)
+
+    seen: list[Any] = []
+
+    def fake_run(now: datetime, client: Any, dsn: str, **kwargs: Any) -> results.ResultsReport:
+        seen.append((kwargs["refused_path"], kwargs.get("leagues", thestatsapi.SCAN_COMPETITIONS)))
+        return results.ResultsReport(date(2026, 10, 1), date(2026, 10, 10))
+
+    monkeypatch.setattr(pipeline, "build_thestatsapi_client", lambda environ, listing=None: _Client())
+    monkeypatch.setattr(results, "run", fake_run)
+    assert results.main([]) == 0 and results.main(["--pilot"]) == 0
+    assert seen == [(results.REFUSED_FILE, thestatsapi.SCAN_COMPETITIONS),
+                    (results.PILOT_REFUSED_FILE, thestatsapi.PILOT_COMPETITIONS)]
+    assert results.REFUSED_FILE != results.PILOT_REFUSED_FILE
+    assert closed == [True, True]  # the client is closed after each run
 
 
 class _PilotListing:
@@ -119,13 +153,15 @@ def test_the_pilot_competitions_are_the_three_pilot_leagues() -> None:
                                                                "Scottish Premiership"]
 
 
-def test_the_results_job_lists_and_ingests_only_the_pilot_leagues_when_given_them(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_results_job_lists_and_ingests_only_the_pilot_leagues_when_given_them(monkeypatch: pytest.MonkeyPatch,
+                                                                                  tmp_path: Any) -> None:
     monkeypatch.setattr(results, "read_stored", lambda dsn: (LATEST, frozenset({_uid(1)})))
     client = _PilotListing()
-    report = results.run(NOW, client, "postgresql://pilot", dry_run=True, leagues=thestatsapi.PILOT_COMPETITIONS)
+    report = results.run(NOW, client, "postgresql://pilot", dry_run=True, leagues=thestatsapi.PILOT_COMPETITIONS,
+                         refused_path=tmp_path / "pilot_refused.json")
     assert report.listed == 2 and report.missing == [_uid(2)]  # League One is not the pilot's
     assert {p.split("competition_id=")[1].split("&")[0] for p in client.paths} == set(thestatsapi.PILOT_COMPETITIONS)
-    default = results.run(NOW, _PilotListing(), "postgresql://working", dry_run=True)
+    default = results.run(NOW, _PilotListing(), "postgresql://working", dry_run=True, refused_path=tmp_path / "refused.json")
     assert default.listed == 1 and default.missing == [_uid(3)]
 
 
