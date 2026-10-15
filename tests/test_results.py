@@ -197,3 +197,24 @@ def test_the_pilot_results_job_skips_recorded_refusals_and_records_new_ones(
                          refused_path=path)
     assert sent == []  # match 2 is the only pilot match not stored and it was refused earlier: nothing is ingested
     assert report.missing == [] and set(results.load_refused(path)) == {_uid(2)}
+
+
+def test_a_match_with_no_statistics_at_the_source_is_recorded_without_failing_the_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """2026-10-15: the first pilot run on TheStatsAPI failed (and raised a TASK FAILING alert) over one Scottish match the
+    source holds no statistics for. Such a match is recorded and reported, not a failure; an adapter refusal still is."""
+    monkeypatch.setattr(results, "read_stored", lambda dsn: (LATEST, frozenset({_uid(101)})))
+    missing_stats = 'HTTPError: HTTP 404: {"error":{"code":"STATS_NOT_AVAILABLE_AT_SOURCE"}}'
+
+    def fake_ingest(client: Any, dsn: str, uids: list[str], workers: int) -> SlateReport:
+        return SlateReport(job="stats", results={_uid(102): FixtureResult(_uid(102), False, 0, 0, 0.1, error=missing_stats)})
+
+    monkeypatch.setattr(results, "ingest", fake_ingest)
+    monkeypatch.setattr(results, "refresh_incomplete", lambda dsn, since: 0)
+    refused = tmp_path / "refused.json"
+    report = results.run(NOW, _Listing(2), "postgresql://unused", refused_path=refused)
+    assert report.ok and report.failed == {} and report.unavailable == [_uid(102)]
+    assert set(results.load_refused(refused)) == {_uid(102)}
+    assert f"1 with no statistics at the source, recorded and not retried ({_uid(102)})" in report.text()
+    assert "FAILED" not in report.text()
