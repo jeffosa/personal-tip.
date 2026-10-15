@@ -177,3 +177,21 @@ def test_league_one_and_two_go_to_the_working_database_and_the_rest_to_the_pilot
     assert sorted(m["competition_id"] for m in split["prop_alpha_tsa"]) == ["comp_0196", "comp_4023"]
     assert sorted(m["competition_id"] for m in split["prop_alpha_pilot_tsa"]) == ["comp_4795", "comp_6236", "comp_6387"]
     assert backfill.WORKING_DB != "prop_alpha" and backfill.PILOT_DB != "prop_alpha_pilot"  # the Sportmonks archive is never written
+
+
+def test_a_failed_request_drops_the_threads_connection_so_the_next_one_starts_fresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """2026-10-14/15: after a Wi-Fi dropout the backfill reused a broken connection and failed every request for hours."""
+    import requests
+
+    client = build_thestatsapi_client({"THESTATSAPI_KEY": "test-key"})
+    broken = client._session()  # noqa: SLF001
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise requests.exceptions.SSLError("EOF occurred in violation of protocol")
+
+    monkeypatch.setattr(broken, "get", fail)
+    with pytest.raises(requests.ConnectionError, match="SSLError"):
+        client._get("https://api.thestatsapi.com/api/health")  # noqa: SLF001
+    fresh = client._session()  # noqa: SLF001
+    assert fresh is not broken and broken not in client._sessions and client._sessions == [fresh]  # noqa: SLF001
+    client.close()
