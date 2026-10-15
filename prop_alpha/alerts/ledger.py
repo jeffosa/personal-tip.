@@ -33,7 +33,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Final, Iterator, Mapping, Sequence
+from typing import Any, Callable, Final, Iterator, Mapping, Sequence
 
 from prop_alpha.alerts.closing import load_closing_quotes
 from prop_alpha.alerts.fx import BOOK_CURRENCY, CURRENCY_SYMBOLS, ExchangeRate, bankroll_currency, cached_rate, is_fresh
@@ -95,6 +95,8 @@ EDIT_NOTICE: Final[str] = (
     "as a new reply to the alert."
 )
 COMMAND_WORDS: Final[tuple[str, ...]] = ("placed", "undo", "settle")
+# A bot command ("/status", "/bets@my_bot ..."): read-only questions the poll answers (alerts/bot_commands.py, 2026-10-15).
+BOT_COMMAND_PREFIX: Final[str] = "/"
 # A bet still open this long after it was placed is flagged for settling by hand (postponed, abandoned, or a
 # player row missing from the stored match).
 STALE_AFTER: Final[timedelta] = timedelta(days=7)
@@ -357,10 +359,13 @@ def process_updates(
     now: datetime,
     currency: str = "",
     book_rate: ExchangeRate | None = None,
+    bot_commands: list[tuple[int, str]] | None = None,
 ) -> tuple[list[tuple[int, str]], int | None]:
     """Record the bets in `updates` and return (replies to send as (message id to answer, text), next offset).
     Messages from other chats, non-text messages and chat that is not a command are skipped. Stakes are recorded
-    in `currency` (the bankroll's); one typed with the books' sign is converted at `book_rate`."""
+    in `currency` (the bankroll's); one typed with the books' sign is converted at `book_rate`. With `bot_commands`, each
+    "/command" from the chat is appended to it as (message id, command name) for the caller to answer; without, it is
+    skipped as before."""
     replies: list[tuple[int, str]] = []
     next_offset: int | None = None
     bets, cancelled, seen = store.load()
@@ -387,6 +392,9 @@ def process_updates(
         text = message.get("text")
         if not isinstance(chat, dict) or str(chat.get("id")) != chat_id:
             logger.warning("ignored update %d from a chat other than TELEGRAM_CHAT_ID", update_id)
+            continue
+        if bot_commands is not None and isinstance(text, str) and text.strip().startswith(BOT_COMMAND_PREFIX)                 and isinstance(message.get("message_id"), int):
+            bot_commands.append((int(message["message_id"]), bot_command_name(text)))
             continue
         if not isinstance(text, str) or not text.strip().lower().startswith(COMMAND_WORDS):
             continue
@@ -420,6 +428,12 @@ def process_updates(
                 next_id += 1
         seen.add(update_id)
     return replies, next_offset
+
+
+def bot_command_name(text: str) -> str:
+    """"/Status@prop_alpha_bot now" -> "status": the command word, lower case, without the bot's name."""
+    word = text.strip()[len(BOT_COMMAND_PREFIX):].split(maxsplit=1)
+    return word[0].split("@", 1)[0].lower() if word else ""
 
 
 def _record_place(
@@ -492,12 +506,16 @@ def poll(
     notifier: TelegramNotifier, index: MessageIndex, store: PlacedBetStore, offset_file: Path, now: datetime,
     currency: str = "", book_rate: ExchangeRate | None = None, *, outbox: AnswerOutbox | None = None,
     deliveries: DeliveryLog | None = None, heartbeat_file: Path | None = None,
+    answer_command: Callable[[str, datetime], str] | None = None,
 ) -> int:
     """Read new replies, record bets, answer each in the chat. Returns the number of answers sent.
 
     With an `outbox`, every answer is queued before the offset is saved and an unsent one is re-sent by the next
     poll; with `deliveries`, a reply to an alert whose send was never confirmed still records its bet
-    (confirm_quoted_deliveries); with a `heartbeat_file`, the time Telegram was read is saved for the status report.
+    (confirm_quoted_deliveries); with a `heartbeat_file`, the time Telegram was read is saved for the status report;
+    with `answer_command` (command name, now) -> text, each "/command" is answered. Command answers are built only after
+    the offset is saved and the bet answers are queued, so one that fails cannot make the poll re-read the same messages
+    on every run (the run fails and task_health reports it; the queued bet answers go out with the next poll).
     New answers go out before re-sent ones, so one answer Telegram keeps refusing cannot hold back the rest."""
     if notifier.chat_id is None:
         raise ValueError("TELEGRAM_CHAT_ID is not set; run python -m prop_alpha.alerts.telegram --get-chat-id")
@@ -512,7 +530,9 @@ def poll(
     messages: dict[int, Mapping[int, AlertItem]] = dict(index.load())
     if deliveries is not None:
         messages.update(confirm_quoted_deliveries(updates, notifier.chat_id, messages, deliveries, index, now))
-    replies, next_offset = process_updates(updates, notifier.chat_id, messages, store, now, currency, book_rate)
+    commands: list[tuple[int, str]] = []
+    replies, next_offset = process_updates(updates, notifier.chat_id, messages, store, now, currency, book_rate,
+                                           bot_commands=commands if answer_command is not None else None)
     queued = [(outbox.queue(reply_to, text, now) if outbox is not None else 0, reply_to, text)
               for reply_to, text in replies]
     if next_offset is not None:
@@ -522,6 +542,10 @@ def poll(
     if heartbeat_file is not None:
         heartbeat_file.parent.mkdir(parents=True, exist_ok=True)
         heartbeat_file.write_text(json.dumps({"at": now.isoformat()}), encoding="utf-8")
+    if answer_command is not None:
+        for command_message, name in commands:
+            text = answer_command(name, now)
+            queued.append((outbox.queue(command_message, text, now) if outbox is not None else 0, command_message, text))
     retries = [(answer_id, reply_to, (DELAYED_PREFIX if reply_to is not None else DELAYED_NOTICE_PREFIX) + text)
                for answer_id, reply_to, text, attempts in earlier if attempts < MAX_ANSWER_ATTEMPTS]
     for answer_id, reply_to, text in [*queued, *retries]:
@@ -746,9 +770,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     currency = bankroll_currency()
     rate = None if currency == BOOK_CURRENCY else cached_rate()
     fresh = rate if rate is not None and is_fresh(rate, now.date()) else None
+    # Imported here: bot_commands builds the status report, and alerts/status.py imports this module.
+    from prop_alpha.alerts.bot_commands import answer
+
     with ledger_lock():
         sent = poll(TelegramNotifier(load_config()), MessageIndex(), store, DEFAULT_OFFSET_FILE, now, currency, fresh,
-                    outbox=AnswerOutbox(), deliveries=DeliveryLog(), heartbeat_file=DEFAULT_HEARTBEAT_FILE)
+                    outbox=AnswerOutbox(), deliveries=DeliveryLog(), heartbeat_file=DEFAULT_HEARTBEAT_FILE,
+                    answer_command=answer)
     print(f"answered {sent} message(s)")
     return 0
 

@@ -382,3 +382,67 @@ def test_the_confirmed_only_total_leaves_out_provisional_automatic_results(tmp_p
     assert "confirmed only: 1 bet(s), staked 4.00, profit -4.00" in summary
     manual_only = [(bet, s) for bet, s in store.settled_bets() if s.source == "manual"]
     assert "confirmed only" not in ledger.results_summary(manual_only)  # nothing provisional: one total is enough
+
+
+# ---------------- bot commands (2026-10-15) ----------------
+def test_bot_commands_are_collected_from_the_chat_only_and_never_recorded_as_bets(tmp_path: Path) -> None:
+    store = PlacedBetStore(tmp_path / "bets.jsonl")
+    updates = [_update(1, "/status", reply_to=None), _update(2, "/Bets@prop_alpha_bot now", reply_to=None),
+               _update(3, "/status", reply_to=None, chat="999"), _update(4, "placed 1 @2.05 5")]
+    commands: list[tuple[int, str]] = []
+    replies, offset = process_updates(updates, CHAT, MESSAGES, store, NOW, bot_commands=commands)
+    assert commands == [(901, "status"), (902, "bets")]  # the other chat's command is ignored
+    assert [reply_to for reply_to, _ in replies] == [904] and len(store.open_bets(NOW)) == 1 and offset == 5
+    # Without a command list (any caller from before), a "/command" is skipped as it always was.
+    skipped, _ = process_updates([_update(5, "/status", reply_to=None)], CHAT, MESSAGES, store, NOW)
+    assert skipped == []
+    assert ledger.bot_command_name("/") == "" and ledger.bot_command_name("  /PILOT  ") == "pilot"
+
+
+def test_poll_answers_a_command_after_saving_its_offset(tmp_path: Path) -> None:
+    index = MessageIndex(tmp_path / "index.jsonl")
+    index.record(500, [ALERT, BOARD], NOW)
+    store, offset_file = PlacedBetStore(tmp_path / "bets.jsonl"), tmp_path / "offset.json"
+    outbox = ledger.AnswerOutbox(tmp_path / "answers.jsonl")
+    fake = _FakeTelegram([_update(1, "placed 1 @2.05 5"), _update(2, "/bets", reply_to=None)])
+    asked: list[tuple[str, bool]] = []
+
+    def answer(name: str, now: datetime) -> str:
+        asked.append((name, offset_file.is_file()))
+        return f"answer to /{name}"
+
+    assert poll(fake, index, store, offset_file, NOW, outbox=outbox, answer_command=answer) == 2
+    assert asked == [("bets", True)]  # built only once the offset was saved
+    assert fake.sent[-1] == ("answer to /bets", 902) and outbox.unsent() == []
+
+
+def test_a_failing_command_answer_is_not_read_again_and_the_bet_answer_still_goes_out(tmp_path: Path) -> None:
+    index = MessageIndex(tmp_path / "index.jsonl")
+    index.record(500, [ALERT, BOARD], NOW)
+    store, offset_file = PlacedBetStore(tmp_path / "bets.jsonl"), tmp_path / "offset.json"
+    outbox = ledger.AnswerOutbox(tmp_path / "answers.jsonl")
+    fake = _FakeTelegram([_update(1, "placed 1 @2.05 5"), _update(2, "/status", reply_to=None)])
+
+    def broken(name: str, now: datetime) -> str:
+        raise ValueError("damaged state file")
+
+    with pytest.raises(ValueError, match="damaged"):
+        poll(fake, index, store, offset_file, NOW, outbox=outbox, answer_command=broken)
+    assert json.loads(offset_file.read_text(encoding="utf-8")) == {"offset": 3}  # not re-read on every run
+    assert len(store.open_bets(NOW)) == 1 and len(outbox.unsent()) == 1  # the bet answer is queued
+    assert poll(fake, index, store, offset_file, NOW, outbox=outbox) == 1 and fake.sent[-1][1] == 901
+
+
+def test_bot_command_answers_read_the_ledgers_and_list_the_commands(tmp_path: Path) -> None:
+    from prop_alpha.alerts import bot_commands, pilot_ledger
+
+    assert bot_commands.answer("help", NOW, tmp_path) == bot_commands.HELP_TEXT == bot_commands.answer("start", NOW, tmp_path)
+    assert bot_commands.answer("nope", NOW, tmp_path).startswith("Unknown command /nope.\nCommands")
+    assert bot_commands.answer("bets", NOW, tmp_path) == "BETS: 0 open (stake 0)\nNo settled bet yet."
+    store = PlacedBetStore(tmp_path / ledger.DEFAULT_BETS_FILE.name)
+    process_updates([_update(1, "placed 1 @2.05 5")], CHAT, MESSAGES, store, NOW)
+    store.record_settlement(Settlement(1, "won", "manual", "settled by hand", NOW, update_id=7))
+    bets = bot_commands.answer("bets", NOW, tmp_path).splitlines()
+    assert bets[0] == "BETS: 0 open (stake 0)" and bets[1].startswith("#1 WON") and len(bets) == 3
+    assert bot_commands.answer("pilot", NOW, tmp_path).startswith("PILOT PAPER TIPS (never real bets): 0 open\n")
+    assert (tmp_path / pilot_ledger.PILOT_BETS_FILE.name).exists() is False  # read-only: nothing written
