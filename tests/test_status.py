@@ -71,11 +71,17 @@ def test_trial_expiry_turns_into_a_warning(monkeypatch: pytest.MonkeyPatch) -> N
     assert "WARNING: Sportmonks trial ended 20 Oct" in status.format_report(after, [], 0, 0.0)
 
 
-def test_no_recorded_trial_end_says_so_and_never_warns() -> None:
-    """2026-10-21: the Sportmonks Starter trial had not started, so its end was not known; the report says so."""
-    assert status.DATA_TRIAL_ENDS is None
+def test_no_recorded_trial_end_says_so_and_never_warns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A paid plan (or a trial whose start is not yet known) has no trial end; the report says so and never warns."""
+    monkeypatch.setattr(status, "DATA_TRIAL_ENDS", None)
     report = status.format_report(datetime(2026, 10, 21, tzinfo=timezone.utc), [], 0, 0.0)
     assert "Sportmonks: no trial end recorded (status.DATA_TRIAL_ENDS)" in report and "WARNING" not in report
+
+
+def test_the_starter_trial_ends_14_days_after_it_starts_on_23_october() -> None:
+    assert status.DATA_TRIAL_ENDS == date(2026, 10, 23) + timedelta(days=14) == date(2026, 11, 6)
+    assert "Sportmonks trial: 16 days left (ends 06 Nov)" in status.format_report(datetime(2026, 10, 21, tzinfo=timezone.utc),
+                                                                                 [], 0, 0.0)
 
 
 def test_default_database_is_never_the_ci_database() -> None:

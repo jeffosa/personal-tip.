@@ -55,10 +55,10 @@ POLL_STALE_AFTER: Final[timedelta] = timedelta(hours=1)
 # Telegram keeps an update the bot has not read for 24 hours, then drops it: a reply older than that is lost.
 TELEGRAM_UPDATE_RETENTION: Final[timedelta] = timedelta(hours=24)
 # The data vendor and the end of its trial: Sportmonks again (maintainer, 2026-10-21: the Starter plan, EUR 29 a month, five
-# leagues, a 14-day trial). TheStatsAPI's trial ended 2026-10-20. None: the trial's end is not yet known (set it to the trial
-# start + 14 days once the plan is active; leave None once it is paid).
+# leagues, a 14-day trial). TheStatsAPI's trial ended 2026-10-20. The maintainer starts the trial on 2026-10-23 (told
+# 2026-10-21), so it ends 2026-11-06. None means no trial end is known (set it to None once the plan is paid).
 DATA_VENDOR_NAME: Final[str] = "Sportmonks"
-DATA_TRIAL_ENDS: Final[date | None] = None
+DATA_TRIAL_ENDS: Final[date | None] = date(2026, 11, 6)
 # The status report warns this many days before the trial ends (and every run after).
 TRIAL_WARNING_DAYS: Final[int] = 7
 # An archived OddsPapi reply as alerts/scan.py names it: <run time>_<bookmaker>.json.gz. A malformed reply is archived
