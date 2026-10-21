@@ -45,6 +45,17 @@ def test_listing_window_looks_back_and_caps_the_span() -> None:
         results.listing_window(None, NOW)
 
 
+def test_the_window_starts_behind_the_league_furthest_behind() -> None:
+    # 2026-10-21: the pilot database held the Scottish Premiership to 18 Oct (free plan) but Brazil only to 11 Oct; a
+    # database-wide latest would have listed from 15 Oct and never fetched Brazil's matches of 11-15 Oct.
+    brazil, scotland = datetime(2026, 10, 11, tzinfo=timezone.utc), datetime(2026, 10, 18, tzinfo=timezone.utc)
+    assert results.earliest_latest({"Brazil Serie A": brazil, "Scottish Premiership": scotland},
+                                   ["Brazil Serie A", "Scottish Premiership"]) == brazil
+    assert results.earliest_latest({}, ["Brazil Serie A"]) is None
+    with pytest.raises(ValueError, match="Championship: backfill"):
+        results.earliest_latest({"Brazil Serie A": brazil}, ["Brazil Serie A", "Championship"])
+
+
 def test_missing_fixtures_skips_stored_finals_and_runs_earliest_first() -> None:
     listed = [("3", LATEST + timedelta(days=2)), ("1", LATEST), ("2", LATEST + timedelta(days=1))]
     assert results.missing_fixtures(listed, frozenset({"2"})) == ["1", "3"]
@@ -71,7 +82,8 @@ def test_a_listing_longer_than_the_page_limit_ingests_nothing() -> None:
 
 
 def test_run_ingests_only_the_missing_fixtures_and_reports_failures(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
-    monkeypatch.setattr(results, "read_stored", lambda dsn: (LATEST, frozenset({_uid(101)})))
+    monkeypatch.setattr(results, "read_stored", lambda dsn, names: (LATEST, frozenset({_uid(101)}))
+                        if names == ["League One", "League Two"] else pytest.fail(f"read_stored got {names}"))
     sent: list[list[str]] = []
 
     def fake_ingest(client: Any, dsn: str, uids: list[str], workers: int) -> SlateReport:
@@ -176,7 +188,7 @@ def test_the_pilot_leagues_are_read_from_the_plan_across_pages_and_missing_ones_
 
 def test_the_results_job_lists_and_ingests_only_the_pilot_leagues_when_given_them(monkeypatch: pytest.MonkeyPatch,
                                                                                   tmp_path: Any) -> None:
-    monkeypatch.setattr(results, "read_stored", lambda dsn: (LATEST, frozenset({_uid(1)})))
+    monkeypatch.setattr(results, "read_stored", lambda dsn, names: (LATEST, frozenset({_uid(1)})))
     client = _PilotListing()
     report = results.run(NOW, client, "postgresql://pilot", dry_run=True, leagues=PILOT,
                          refused_path=tmp_path / "pilot_refused.json")
@@ -202,7 +214,7 @@ def test_vendor_refusals_are_recorded_once_and_never_network_errors(tmp_path: An
 def test_the_pilot_results_job_skips_recorded_refusals_and_records_new_ones(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
-    monkeypatch.setattr(results, "read_stored", lambda dsn: (LATEST, frozenset({_uid(1)})))
+    monkeypatch.setattr(results, "read_stored", lambda dsn, names: (LATEST, frozenset({_uid(1)})))
     path = tmp_path / "pilot_refused.json"
     path.write_text('{"%s": "ValueError: refused earlier"}' % _uid(2), encoding="utf-8")
     sent: list[list[str]] = []
@@ -224,7 +236,7 @@ def test_a_match_with_no_statistics_at_the_source_is_recorded_without_failing_th
 ) -> None:
     """2026-10-15: the first pilot run on TheStatsAPI failed (and raised a TASK FAILING alert) over one Scottish match the
     source holds no statistics for. Such a match is recorded and reported, not a failure; an adapter refusal still is."""
-    monkeypatch.setattr(results, "read_stored", lambda dsn: (LATEST, frozenset({_uid(101)})))
+    monkeypatch.setattr(results, "read_stored", lambda dsn, names: (LATEST, frozenset({_uid(101)})))
     missing_stats = 'HTTPError: HTTP 404: {"error":{"code":"STATS_NOT_AVAILABLE_AT_SOURCE"}}'
 
     def fake_ingest(client: Any, dsn: str, uids: list[str], workers: int) -> SlateReport:
