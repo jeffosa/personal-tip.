@@ -9,14 +9,14 @@ from typing import Final, Mapping
 
 DEFAULT_ENV_FILE: Final[Path] = Path(__file__).resolve().parents[1] / ".env"
 DSN_ENV: Final[str] = "PROP_ALPHA_DB_DSN"
-# The working database (League One/Two): built from TheStatsAPI since 2026-10-15 (scripts/tsa_backfill.py); the
-# Sportmonks one, `prop_alpha`, stays as an archive. prop_alpha_ci is reset by every CI run, so the alerts, ledger and
-# status never read it by default.
-DEFAULT_DSN: Final[str] = "postgresql://postgres@localhost:5432/prop_alpha_tsa"
-# The pilot database (Brazil Serie A and the two Scottish leagues), also from TheStatsAPI since 2026-10-15 (the Sportmonks
-# one, `prop_alpha_pilot`, is the archive): its own results job and scan read and write it, never the working one above.
+# The working database (League One/Two), from Sportmonks: back since 2026-10-21 (maintainer chose the Sportmonks Starter
+# plan, whose counts match Opta's); `prop_alpha_tsa`, built from TheStatsAPI for 2026-10-15 to 2026-10-20, stays as an
+# archive. prop_alpha_ci is reset by every CI run, so the alerts, ledger and status never read it by default.
+DEFAULT_DSN: Final[str] = "postgresql://postgres@localhost:5432/prop_alpha"
+# The pilot database (sportmonks.PILOT_LEAGUES_WANTED), also Sportmonks again (`prop_alpha_pilot_tsa` is the archive): its
+# own results job and scan read and write it, never the working one above.
 PILOT_DSN_ENV: Final[str] = "PROP_ALPHA_PILOT_DSN"
-DEFAULT_PILOT_DSN: Final[str] = "postgresql://postgres@localhost:5432/prop_alpha_pilot_tsa"
+DEFAULT_PILOT_DSN: Final[str] = "postgresql://postgres@localhost:5432/prop_alpha_pilot"
 
 
 def parse_env_file(text: str) -> dict[str, str]:
@@ -40,6 +40,13 @@ def parse_env_file(text: str) -> dict[str, str]:
 
 def read_env_file(env_file: Path = DEFAULT_ENV_FILE) -> str | None:
     return env_file.read_text(encoding="utf-8") if env_file.is_file() else None
+
+
+def setting(name: str, default: str, environ: Mapping[str, str] | None = None, env_file: Path = DEFAULT_ENV_FILE) -> str:
+    """A non-secret setting: the process environment first, then `.env`, then `default`."""
+    source = os.environ if environ is None else environ
+    text = read_env_file(env_file)
+    return source.get(name) or (parse_env_file(text).get(name, "") if text is not None else "") or default
 
 
 def credential(name: str, environ: Mapping[str, str] | None = None, env_file: Path = DEFAULT_ENV_FILE) -> str:

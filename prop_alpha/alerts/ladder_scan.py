@@ -9,17 +9,18 @@ lines. It never places a bet.
 
 It is the League One/Two scan (alerts/scan.py) with these differences, and nothing else:
 
-* Leagues: TheStatsAPI's competitions for the pilot leagues (thestatsapi.PILOT_COMPETITIONS; Sportmonks until 2026-10-15,
-  whose plan then listed none of them).
+* Leagues: Sportmonks league ids are read from the plan's own league list (sportmonks.PILOT_LEAGUES_WANTED), so a
+  league the plan does not include is reported ("not in the Sportmonks plan"), never guessed (Sportmonks again since
+  2026-10-21; TheStatsAPI from 2026-10-15 to 2026-10-20).
 * Pricing is the pilot's, read from the pilot database `prop_alpha_pilot` (read-only), never from the working
   `prop_alpha`: tackles counted as pilot_ledger.PILOT_TACKLES_SQL (plain tackles_attempted since 2026-10-13, after settled
   results contradicted the 2026-10-12 tackles-plus-challenges-lost count, MARKET_CONTRACT.md 2e; loaded through PilotCursor so the
   frozen League One/Two queries are untouched), prior strength 6, no rate multiplier, and a game-state k per league and market (LEAGUE_GAME_STATE_K: each
   league's own fit on TheStatsAPI data, 2026-10-15); Scottish Championship tackles are not priced (UNPRICED_MARKETS). These are NOT the frozen League One/Two settings and are not frozen themselves: the model_freeze
   fingerprint and the League One/Two lockbox are untouched, and no pilot lockbox exists.
-* Tips: only leagues in TIP_LEAGUES can produce a tip. It is empty: Brazil Serie A was turned on by the maintainer on 2026-10-11
-  and paused on 2026-10-12 until the gap between the model and the bookmakers' prices is explained. Every pilot league is
-  scanned, priced and logged for evaluation; nothing is tipped.
+* Tips: only leagues in TIP_LEAGUES can produce a tip: Brazil Serie A (turned on by the maintainer on 2026-10-11, paused on
+  2026-10-12 while the gap between the model and the bookmakers' prices was diagnosed, resumed on 2026-10-15). Every pilot
+  league is scanned, priced and logged for evaluation; the Scottish leagues are never tipped.
 * Odds are ladders (oddspapi.ladder_prices) or over/under lines (oddspapi.prop_prices): both parsers read the same
   reply. A "k+" step is the Over of line k - 0.5 on its own; the "0" step is the Under of 0.5. They go through the same
   quote building, allocator and high-value screen as the other scan.
@@ -46,8 +47,9 @@ import hashlib
 import json
 import logging
 import os
+import statistics
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -71,8 +73,8 @@ from prop_alpha.alerts.telegram import (
     load_config,
 )
 from prop_alpha.config import DEFAULT_PILOT_DSN, PILOT_DSN_ENV
-from prop_alpha.ingestion import oddspapi, thestatsapi
-from prop_alpha.ingestion.results import PILOT_REFUSED_FILE, load_refused
+from prop_alpha.ingestion import oddspapi, sportmonks
+from prop_alpha.ingestion.results import PILOT_REFUSED_FILE, load_refused, pilot_leagues
 from prop_alpha.modeling.engine import FactorProjection, QuantEngine
 from prop_alpha.scanner.market_scanner import (
     MODEL_RISK_LOSS_FLOOR,
@@ -94,21 +96,22 @@ from prop_alpha.scanner.slate import (
 
 logger = logging.getLogger("prop_alpha.ladder_scan")
 
-# The pilot's pricing settings. Game-state dispersion k per league and market, refitted on TheStatsAPI data (prop_alpha_pilot_tsa,
-# 2026-10-15) by scripts/quick_backtest.py --level on each league's matches before 2026-03-01 and scored on its starters after
-# that date (plain tackles_attempted): Brazil Serie A tackles 34.276 and fouls 14.396 (5,021 starters in 262 matches; on
-# Sportmonks data they were 496.882 and 40.556), Scottish Premiership tackles 52.918 and fouls 28.765 (1,813 starters in 106
-# matches; it had no fit before and used the English Championship's), Scottish Championship fouls 1000 (the fit found no
-# overdispersion, which this k stands for). The same runs scored k = 6 slightly better on tackles in both leagues (calibration
-# slopes 0.93-1.05 against 0.82-0.95); the fitted k is kept, as before, because choosing on the scored window would make it
-# selection data. GAME_STATE_K is the fallback for a league without its own (none since 2026-10-15): the English
-# Championship's 2026-10-08 fit.
+# The pilot's pricing settings. Game-state dispersion k per league and market, fitted on Sportmonks data (prop_alpha_pilot; the
+# data vendor again since 2026-10-21) by scripts/quick_backtest.py --level on each league's matches before 2026-03-01, scored
+# on its starters after that date (plain tackles_attempted): Brazil Serie A tackles 496.882 (no overdispersion) and fouls 40.556
+# (2026-10-11, 4,808 starters in 253 matches); the English Championship tackles 21.1 and fouls none (2026-10-08, 4,196 starters
+# in 234 matches); the Scottish Premiership tackles none and fouls 47.86 (2026-10-21, 1,795 starters in 105 matches: tackles
+# Brier skill +0.054 to +0.081, fouls +0.051 and +0.060). "None" (no game-state overdispersion found) is k 1000. As on
+# TheStatsAPI's data (2026-10-15), k = 6 calibrated tackles slightly better in the scored window; the fitted k is kept, because
+# choosing on the scored window would make it selection data. TheStatsAPI's fits of 2026-10-15 (Brazil 34.276 / 14.396,
+# Scottish Premiership 52.918 / 28.765) priced its own counts and no longer apply. GAME_STATE_K is the fallback for a league
+# without its own: the English Championship's fit.
 DEFAULT_GAME_STATE_K: Final[float] = 6.0
 GAME_STATE_K: Final[Mapping[str, float]] = {"tackles": 21.1, "fouls": 1000.0}
 LEAGUE_GAME_STATE_K: Final[Mapping[str, Mapping[str, float]]] = {
-    "Brazil Serie A": {"tackles": 34.276, "fouls": 14.396},
-    "Scottish Premiership": {"tackles": 52.918, "fouls": 28.765},
-    "Scottish Championship": {"fouls": 1000.0},  # tackles: UNPRICED_MARKETS
+    "Brazil Serie A": {"tackles": 496.882, "fouls": 40.556},
+    "Championship": {"tackles": 21.1, "fouls": 1000.0},
+    "Scottish Premiership": {"tackles": 1000.0, "fouls": 47.86},
 }
 # Markets left unpriced per league because the stored counts are incomplete. TheStatsAPI records 2-8 tackles a match in the
 # Scottish Championship (none at all in 10 of its 39 matches of August-September 2026) against about 30 in every other
@@ -130,13 +133,27 @@ ALERT_MARKETS: Final[frozenset[str]] = frozenset({"tackles"})
 # 1.25 times the book's. Shrinking towards the market would not do this: a blended edge is a fraction of the model's, so the
 # outliers would still rank first.
 PLAUSIBLE_EDGE_CAP: Final[float] = 0.25
+# The bookmaker check (maintainer, 2026-10-15: "find mispriced prices first, then check they are value"): a real price goes on to
+# the value checks only when another bookmaker quotes the same selection (fixture, player, market, line, side) and this price is
+# at least this much above the median of the other books' prices. So a tip needs two signals that do not share a cause: the
+# model says the price is long, and the rest of the market prices it shorter. A price no other book quotes cannot be confirmed
+# and is left out. Measured on the archived Brazil ladders (bet365 v Betway, 1,683 tackles selections both quoted, runs of
+# 11, 12 and 18 Oct): the books differ widely (bet365/Betway price ratio 0.64 to 1.50 from the 10th to the 90th percentile,
+# median 0.97; median gap at the 2+ and 3+ steps 5-7%), so 10% asks for more than the usual gap. Of the 37 archived prices that
+# passed the model's 4%-25% edge rule, 16 had no second book and 16 were at least 10% above the other book. A judgement, not a
+# fitted value: too few settled outcomes exist to fit it. None turns the check off. Mock odds are never checked (one book).
+MARKET_CHECK_MARGIN: Final[float | None] = 0.10
 # The leagues that may produce a tip. Brazil Serie A was turned on by the maintainer on 2026-10-11 ("yes"), after being shown its
 # backtest (tackles Brier skill +0.06 to +0.08 over the league average, slopes 0.93-1.02, the strict PRD bin test failing) and
 # that the bookmakers' prices run far above the model's counts (mean expected profit about -60%). The Scottish leagues have
 # neither a backtest nor a bookmaker price: they are scanned and priced, never tipped. Adding a league here is a maintainer decision.
 # PAUSED by the maintainer on 2026-10-12 ("pause brazil tipping and diagnose the gap"): the model sits at about half the books'
 # level (0.22 v 0.38-0.40), so its few tips were the players it most likely misjudges. Re-adding "Brazil Serie A" restores it.
-TIP_LEAGUES: Final[frozenset[str]] = frozenset()
+# RESUMED by the maintainer on 2026-10-15 ("resume tipping"), for Brazil Serie A only, as before the pause: since then the pilot
+# prices the plain tackles count that SportyBet's settlements support (MARKET_CONTRACT.md 2e), the PLAUSIBLE_EDGE_CAP guard
+# leaves out implausible edges, and Brazil's k was refitted on TheStatsAPI data. Still open: bet365's settlement rule, and the
+# mean expected profit of about -37% the archived bet365 ladders leave on this count. Tips stay PAPER bets (pilot_ledger).
+TIP_LEAGUES: Final[frozenset[str]] = frozenset({"Brazil Serie A"})
 BOOKMAKERS_ENV: Final[str] = "LADDER_BOOKMAKERS"
 # Brazil Serie A: Betway lists the tackles and fouls ladders for every fixture seen on 2026-10-11 (7 of 7), bet365 for 4 of 13.
 DEFAULT_BOOKMAKERS: Final[tuple[str, ...]] = ("bet365", "betway")
@@ -215,12 +232,47 @@ def without_implausible_edges(
     return kept, removed
 
 
+def beating_other_books(
+    quotes: Sequence[LiveOddsQuote], margin: float,
+) -> tuple[list[LiveOddsQuote], int, int]:
+    """Pure: `quotes` with every side left out unless its price is at least `margin` above the median price the other
+    bookmakers quote for the same selection (fixture, player, market, line, side); a quote with no side left is dropped.
+    Returns (kept, sides no other book quotes, sides not that far above the others)."""
+    if not 0.0 <= margin < 10.0:
+        raise ValueError(f"the bookmaker-check margin must be in [0, 10), not {margin!r}")
+    books: dict[tuple[int, int, str, float, str], list[tuple[str, float]]] = defaultdict(list)
+    for quote in quotes:
+        for side, price in (("over", quote.over_price), ("under", quote.under_price)):
+            if price is not None:
+                books[(quote.fixture_id, quote.player_id, quote.market_type, quote.line_value, side)].append(
+                    (quote.sportsbook, price))
+    kept: list[LiveOddsQuote] = []
+    single = in_line = 0
+    for quote in quotes:
+        prices: dict[str, float | None] = {"over": quote.over_price, "under": quote.under_price}
+        for side, price in list(prices.items()):
+            if price is None:
+                continue
+            others = [other for book, other in books[(quote.fixture_id, quote.player_id, quote.market_type,
+                                                      quote.line_value, side)] if book != quote.sportsbook]
+            if not others:
+                prices[side] = None
+                single += 1
+            elif price < statistics.median(others) * (1.0 + margin):
+                prices[side] = None
+                in_line += 1
+        if prices["over"] is not None or prices["under"] is not None:
+            kept.append(replace(quote, over_price=prices["over"], under_price=prices["under"]))
+    return kept, single, in_line
+
+
 def pilot_settings_digest() -> str:
     """The identity of the pilot's pricing settings, written on every pilot prediction: a prediction made under other
     settings is never mistaken for one made under these (the pilot has no frozen code, so no source digest)."""
     settings = {"default_k": DEFAULT_GAME_STATE_K, "k": GAME_STATE_K, "league_k": LEAGUE_GAME_STATE_K,
                 "prior": PRIOR_STRENGTH, "unpriced": {k: sorted(v) for k, v in UNPRICED_MARKETS.items()},
-                "tackles_count": pilot_ledger.PILOT_TACKLES_SQL, "edge_cap": PLAUSIBLE_EDGE_CAP}
+                "tackles_count": pilot_ledger.PILOT_TACKLES_SQL, "edge_cap": PLAUSIBLE_EDGE_CAP,
+                "market_check": MARKET_CHECK_MARGIN}
     return "pilot:" + hashlib.sha256(json.dumps(settings, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
@@ -268,13 +320,16 @@ def stale_message(league: str, missing: Sequence[tuple[str, datetime]]) -> str:
             "`scripts/pilot_backfill.py --list --seed --ingest` for a league never loaded.")
 
 
-def finished_listing(client: Any, now: datetime, leagues: Mapping[str, str]) -> list[tuple[str, datetime, str]]:
-    """(match uid, kickoff, league) of every finished TheStatsAPI match of `leagues` from the last STALE_AFTER."""
-    from prop_alpha.ingestion.pipeline import list_matches
-
-    rows = list_matches(client, leagues, (now - STALE_AFTER).date(), now.date(), "finished")
-    return [(str(m["id"]), thestatsapi.kickoff(m), leagues[str(m["competition_id"])]) for m in rows
-            if str(m.get("competition_id")) in leagues]
+def finished_listing(client: Any, now: datetime, leagues: Mapping[int, str]) -> list[tuple[str, datetime, str]]:
+    """Finished matches of `leagues` from the last STALE_AFTER, from the Sportmonks listing (at most MAX_LISTING_PAGES)."""
+    finished: list[tuple[str, datetime, str]] = []
+    for page in range(1, scan.MAX_LISTING_PAGES + 1):
+        body = client.get_json(sportmonks.upcoming_path(now - STALE_AFTER, now, page, leagues))
+        rows, has_more = sportmonks.finished_with_leagues(body, leagues)
+        finished += rows
+        if not has_more:
+            return finished
+    raise ValueError(f"finished pilot listing has more than {scan.MAX_LISTING_PAGES} pages; check refused")
 
 
 def load_ladder_catalogue(path: Path) -> dict[int, oddspapi.LadderMarket]:
@@ -381,15 +436,16 @@ LATEST_STORED_SQL: Final[str] = """
 
 
 def parse_manual_fixture(raw: str) -> UpcomingFixture:
-    """'league|TheStatsAPI match id (mt_ and nine digits)|home team id|away team id|home|away|kickoff (ISO, UTC)' ->
-    UpcomingFixture."""
+    """'league|sportmonks fixture id|home team id|away team id|home|away|kickoff (ISO, UTC)' -> UpcomingFixture."""
     parts = raw.split("|")
     if len(parts) != 7:
         raise ValueError(f"--fixture needs 7 fields separated by '|', got {len(parts)}: {raw!r}")
-    league, match_id, home_uid, away_uid, home, away, kickoff = (part.strip() for part in parts)
-    if league not in thestatsapi.PILOT_COMPETITIONS.values():
+    league, fixture_id, home_uid, away_uid, home, away, kickoff = (part.strip() for part in parts)
+    if league not in sportmonks.PILOT_LEAGUES_WANTED.values():
         raise ValueError(f"{league!r} is not a pilot league")
-    return UpcomingFixture(thestatsapi.fixture_number(match_id), league, home_uid, away_uid, home, away,
+    if not fixture_id.isdigit():
+        raise ValueError(f"the fixture id must be a Sportmonks fixture number, not {fixture_id!r}")
+    return UpcomingFixture(int(fixture_id), league, home_uid, away_uid, home, away,
                            datetime.fromisoformat(kickoff).astimezone(timezone.utc))
 
 
@@ -466,7 +522,11 @@ def run_ladder_scan(
         return _scan_slate(now, list(manual), None, dsn, notifier, store, bankroll, label, max_alerts, summary, tipping,
                            start, end, rate, currency, odds=odds, odds_client=odds_client, books=books, state_dir=state_dir,
                            predictions=predictions, paper_bets=paper_bets, tips_file=tips_file)
-    leagues = thestatsapi.PILOT_COMPETITIONS
+    leagues, absent = pilot_leagues(client)
+    if absent:
+        summary.odds_notes.append(f"Not in the Sportmonks plan, not scanned: {', '.join(name for name in absent)}")
+    if not leagues:
+        return summary
     listed = scan.fetch_upcoming(client, start, end, leagues)
     if not listed:
         return summary
@@ -556,9 +616,18 @@ def _scan_slate(
     else:
         raise ValueError(f"unknown odds source {odds!r}")
     implausible: list[int] = []
+    one_book: list[int] = []
+    in_line: list[int] = []
 
     def guarded(fixture: UpcomingFixture, projections: Mapping[ProjectionKey, FactorProjection]) -> list[LiveOddsQuote]:
-        kept, removed = without_implausible_edges(quotes_for(fixture, projections), projections)
+        quotes = quotes_for(fixture, projections)
+        margin = MARKET_CHECK_MARGIN
+        if odds == "oddspapi" and margin is not None:
+            # The bookmaker check first, on every book's raw price, then the model's implausible-edge guard.
+            quotes, single, level = beating_other_books(quotes, margin)
+            one_book.append(single)
+            in_line.append(level)
+        kept, removed = without_implausible_edges(quotes, projections)
         implausible.append(removed)
         return kept
 
@@ -583,6 +652,10 @@ def _scan_slate(
         combined.directives.extend(report.directives)
         all_projections.update(projections)
         all_descriptions.update(scan.descriptions(fixture, inputs, projections))
+    if sum(one_book) or sum(in_line):
+        summary.odds_notes.append(f"Bookmaker check (a tip needs another book pricing it at least {MARKET_CHECK_MARGIN:.0%} "
+                                  f"shorter): {sum(one_book)} price(s) no other book quotes and {sum(in_line)} in line "
+                                  "with the other books were left out")
     if sum(implausible):
         summary.odds_notes.append(f"Prices left out as implausible (the model above the book by more than "
                                   f"{PLAUSIBLE_EDGE_CAP:.0%} if the player plays): {sum(implausible)}")
@@ -619,7 +692,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--at", type=datetime.fromisoformat, default=None, help="simulated UTC run time (testing)")
     parser.add_argument("--fixture", action="append", default=[], metavar="SPEC", type=parse_manual_fixture,
                         help="scan this fixture instead of the Sportmonks listing (repeatable): "
-                             "'league|TheStatsAPI match id|home team id|away team id|home|away|kickoff ISO UTC'")
+                             "'league|sportmonks fixture id|home team id|away team id|home|away|kickoff ISO UTC'")
     parser.add_argument("--tip", action="append", default=None, metavar="LEAGUE",
                         help="tip this league for this run only, whatever TIP_LEAGUES says (repeatable; needs --fixture)")
     args = parser.parse_args(argv)
@@ -631,11 +704,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     now = args.at.astimezone(timezone.utc) if args.at is not None else datetime.now(timezone.utc)
     currency = bankroll_currency()
     book_rate = book_to_bankroll(currency, now.date())
-    from prop_alpha.ingestion.pipeline import build_odds_client, build_thestatsapi_client
+    from prop_alpha.ingestion.pipeline import build_odds_client, build_vendor_client
 
     environ = {**os.environ, "DATA_VENDOR_MAX_REQUESTS": os.environ.get("DATA_VENDOR_MAX_REQUESTS", "12"),
                "DATA_VENDOR_QUOTA_RESERVE": os.environ.get("DATA_VENDOR_QUOTA_RESERVE", "100")}
-    client = build_thestatsapi_client(environ)
+    client = build_vendor_client(environ)
     real = args.odds == "oddspapi"
     label = PILOT_LABEL if real else f"{scan.MOCK_LABEL}\n{PILOT_LABEL}"
     odds_client = build_odds_client(os.environ) if real else None

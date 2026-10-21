@@ -8,18 +8,18 @@ then announced, so a later check can say how good the estimate was and whether a
 the team. It does not change any price.
 
 Each run, between LISTING_START_HOUR and LISTING_END_HOUR UTC, lists the League One/Two fixtures kicking off in the
-next CAPTURE_EARLIEST minutes with one TheStatsAPI request per competition (the scan's own `fetch_upcoming`; the saved scan fixtures are
+next CAPTURE_EARLIEST minutes with one Sportmonks request (the scan's own `fetch_upcoming`; the saved scan fixtures are
 not used, because the scan runs only once the match is within four hours and would miss a 12:30 kickoff). For each
 fixture between CAPTURE_LATEST and CAPTURE_EARLIEST minutes from kickoff that has no outcome yet, it fetches the sheet
-(`VendorClient.get_lineups`, adapter `thestatsapi.lineup_payload`; it was Sportmonks until 2026-10-15). A sheet that
-TheStatsAPI marks confirmed (it also serves predicted line-ups) with exactly 11 starters per side is "confirmed". An incomplete one is retried on the next poll; on the last poll before CAPTURE_LATEST it is recorded as
+(`VendorClient.get_lineups`, adapter `sportmonks.lineup_payload`; Sportmonks again since 2026-10-21, TheStatsAPI from
+2026-10-15 to 2026-10-20). A sheet the vendor does not mark unconfirmed with exactly 11 starters per side is "confirmed". An incomplete one is retried on the next poll; on the last poll before CAPTURE_LATEST it is recorded as
 "incomplete", so a miss is a record, not silence. Records go to `.prop_alpha_state/lineups_t60.jsonl` (append-only,
 gitignored, in the daily backup); handled fixtures to `lineups_t60_handled.json`.
 
 A vendor failure or an unidentified starter (the adapter refuses that sheet) raises, so the scheduled step fails and
 `task_health` reports it; nothing is recorded for that attempt.
 
-I/O: one TheStatsAPI listing per competition per run in hours, and one request per fixture due; the two state files.
+I/O: one Sportmonks listing per run in hours, and one request per fixture due; the two state files.
 """
 
 from __future__ import annotations
@@ -32,7 +32,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
 
-from prop_alpha.ingestion import thestatsapi
 from prop_alpha.scanner.slate import UpcomingFixture
 
 logger = logging.getLogger("prop_alpha.lineup_capture")
@@ -141,7 +140,7 @@ def capture(now: datetime, client: Any, state_dir: Path = STATE_DIR) -> tuple[in
     notes: list[str] = []
     path = state_dir / LINEUPS_NAME
     for fixture in due:
-        payload = client.get_lineups(thestatsapi.match_uid(fixture.fixture_id))
+        payload = client.get_lineups(str(fixture.fixture_id))
         status = sheet_status(payload)
         if status != STATUS_CONFIRMED and not is_last_chance(fixture, now):
             notes.append(f"{fixture.name}: team sheet not complete yet, will retry")
@@ -162,12 +161,12 @@ def capture(now: datetime, client: Any, state_dir: Path = STATE_DIR) -> tuple[in
 
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    from prop_alpha.ingestion.pipeline import build_thestatsapi_client
+    from prop_alpha.ingestion.pipeline import build_vendor_client
 
     now = datetime.now(timezone.utc)
     if not listing_hours(now):
         return 0
-    client = build_thestatsapi_client({**os.environ, "DATA_VENDOR_MAX_REQUESTS": "8", "DATA_VENDOR_QUOTA_RESERVE": "100"})
+    client = build_vendor_client({**os.environ, "DATA_VENDOR_MAX_REQUESTS": "8", "DATA_VENDOR_QUOTA_RESERVE": "100"})
     try:
         recorded, confirmed, notes = capture(now, client)
     finally:

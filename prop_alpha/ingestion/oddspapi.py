@@ -26,9 +26,10 @@ SOCCER_SPORT_ID: Final[int] = 10
 # OddsPapi tournament ids for the scanned leagues (Sportmonks name -> OddsPapi id).
 TOURNAMENTS: Final[Mapping[str, int]] = {"League One": 24, "League Two": 25}
 # OddsPapi ids of the pilot scan's leagues (names as in sportmonks.PILOT_LEAGUES_WANTED). Brazil Serie A lists tackles and
-# fouls as "k+" ladders at bet365 and Betway (2026-10-11), as the English Championship did; no bookmaker has been seen listing them
-# for the two Scottish leagues (bet365, 2026-10-08), so both the ladder and the over/under parser read these tournaments.
-PILOT_TOURNAMENTS: Final[Mapping[str, int]] = {"Brazil Serie A": 325, "Scottish Premiership": 36, "Scottish Championship": 206}
+# fouls as "k+" ladders at bet365 and Betway (2026-10-11), as the English Championship (18, back in the plan since 2026-10-21) did at
+# bet365, Ladbrokes, Coral, bwin, Betway, Betfred and Paddy Power (2026-10-08); no bookmaker has been seen listing them for the
+# Scottish Premiership (bet365, 2026-10-08), so both the ladder and the over/under parser read these tournaments.
+PILOT_TOURNAMENTS: Final[Mapping[str, int]] = {"Brazil Serie A": 325, "Scottish Premiership": 36, "Championship": 18}
 # OddsPapi marketType -> prop_alpha market. Card markets are not priced by the scan yet.
 MARKET_TYPES: Final[Mapping[str, str]] = {"playertotals-tackles": "tackles", "playertotals-foulscommitted": "fouls"}
 # Championship/Premier League ladders (pilot, 2026-10-08): "k+" is Over k - 0.5 and "0" is Under 0.5.

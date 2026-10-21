@@ -269,7 +269,9 @@ def test_the_listing_reads_every_page_of_every_competition_soonest_first() -> No
     assert [r["utc_date"][:10] for r in rows] == ["2026-10-11", "2026-10-12", "2026-10-18", "2026-10-19"]
 
 
-def test_settlement_looks_the_bet_up_by_its_thestatsapi_match_id(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_settlement_looks_the_bet_up_by_its_sportmonks_fixture_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sportmonks again since 2026-10-21: the stored vendor uid is the fixture number itself (it was TheStatsAPI's mt_ id
+    from 2026-10-15 to 2026-10-20)."""
     import psycopg2
 
     from prop_alpha.alerts import ledger
@@ -301,10 +303,22 @@ def test_settlement_looks_the_bet_up_by_its_thestatsapi_match_id(monkeypatch: py
         fixture_id, player_id = 10487045, 7
 
     rows = ledger.read_settlement_rows("postgresql://unused", [_Bet()])  # type: ignore[list-item]
-    assert asked == [(7, "mt_010487045")] and rows[(10487045, 7)] == ("final", 90, 2, 1)
+    assert asked == [(7, "10487045")] and rows[(10487045, 7)] == ("final", 90, 2, 1)
 
 
 def test_an_empty_position_is_stored_as_no_position_not_refused() -> None:
     """mt_732019591 (Brazil Serie A, 2026-10-07) was refused for one player's position ''."""
     payload = thestatsapi.fixture_payload(MATCH, _stats(_row("pl_1", "tm_h", True, 90, position="")))
     assert payload["players"][0]["position"] is None
+
+
+def test_the_request_rate_is_read_from_the_environment_then_dotenv_then_the_trial_default(tmp_path: Path) -> None:
+    """2026-10-21: .env.example offered THESTATSAPI_RPS, but only the process environment was read, so a paid plan's higher
+    rate set in .env was silently ignored."""
+    from prop_alpha.config import setting
+
+    env_file = tmp_path / ".env"
+    assert setting("THESTATSAPI_RPS", "0.19", {}, env_file) == "0.19"  # no .env: the trial-safe default
+    env_file.write_text("THESTATSAPI_RPS=1.8\n", encoding="utf-8")
+    assert setting("THESTATSAPI_RPS", "0.19", {}, env_file) == "1.8"
+    assert setting("THESTATSAPI_RPS", "0.19", {"THESTATSAPI_RPS": "0.5"}, env_file) == "0.5"  # the process environment wins

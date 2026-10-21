@@ -47,12 +47,12 @@ STATE_DIR: Final[Path] = ROOT / ".prop_alpha_state"
 BACKUP_DIR_ENV: Final[str] = "PROP_ALPHA_BACKUP_DIR"
 DEFAULT_BACKUP_DIR: Final[Path] = STATE_DIR / "backups" / "daily"
 DEFAULT_KEEP: Final[int] = 14
-# The TheStatsAPI databases since 2026-10-15 (the Sportmonks ones, prop_alpha and prop_alpha_pilot, are the archive and
-# are in every backup made before that day). The dump file names stay the same.
-SOURCE_DB: Final[str] = "prop_alpha_tsa"
+# The Sportmonks databases (again since 2026-10-21; the TheStatsAPI ones of 2026-10-15 to 2026-10-20, prop_alpha_tsa and
+# prop_alpha_pilot_tsa, are in the backups made in those days). The dump file names stay the same.
+SOURCE_DB: Final[str] = "prop_alpha"
 # The pilot database (Brazil Serie A and the Scottish leagues; audit 2026-10-11, finding 5): dumped beside the working one when
 # it exists, so the pilot's history does not depend on a vendor plan to be rebuilt.
-PILOT_DB: Final[str] = "prop_alpha_pilot_tsa"
+PILOT_DB: Final[str] = "prop_alpha_pilot"
 PILOT_DUMP_NAME: Final[str] = "prop_alpha_pilot.dump"
 _DATABASE_NAME: Final[re.Pattern[str]] = re.compile(r"^[a-z_][a-z0-9_]*$")
 PG_BIN_ENV: Final[str] = "PROP_ALPHA_PG_BIN"
@@ -75,7 +75,9 @@ STATE_FILES: Final[tuple[str, ...]] = (
     "pilot_refused.json", "pilot_last_scan.json",
 )
 # Folders copied whole: the raw bookmaker responses are the evidence for closing-line analysis (PRD Gate 3).
-STATE_DIRS: Final[tuple[str, ...]] = ("odds_archive",)
+# and the pre-match analyses the maintainer asked to keep (2026-10-15: the model's prices for upcoming matches, as CSV files
+# with the scripts that made them).
+STATE_DIRS: Final[tuple[str, ...]] = ("odds_archive", "analysis")
 REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "fixtures", "player_match_stats", "players", "teams", "leagues", "raw_payloads", "incomplete_team_matches",
 )

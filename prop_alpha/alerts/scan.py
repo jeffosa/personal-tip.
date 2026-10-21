@@ -57,7 +57,7 @@ from prop_alpha.alerts.telegram import (
     load_config,
 )
 from prop_alpha.config import DEFAULT_DSN, DEFAULT_ENV_FILE, DSN_ENV
-from prop_alpha.ingestion import oddspapi, thestatsapi
+from prop_alpha.ingestion import oddspapi, sportmonks
 from prop_alpha.ingestion.pipeline import QuotaExhaustedError, VendorError
 from prop_alpha.modeling.engine import FactorProjection, ProjectionError, QuantEngine
 from prop_alpha.modeling.league_level import SEASON_START_MONTH, SeasonTotals, season_of, season_rates
@@ -262,18 +262,20 @@ def _utc(value: datetime) -> datetime:
 
 
 def fetch_upcoming(
-    client: Any, start: datetime, end: datetime, leagues: Mapping[str, str] = thestatsapi.SCAN_COMPETITIONS
+    client: Any, start: datetime, end: datetime, leagues: Mapping[int, str] = sportmonks.SCAN_LEAGUES
 ) -> list[UpcomingFixture]:
-    """Scheduled TheStatsAPI matches of `leagues` (competition id -> league name; default the League One/Two ones) with
-    kickoff in [start, end), one listing request per competition (TheStatsAPI since 2026-10-15; it was Sportmonks). A
-    listing too long to read whole raises (pipeline.list_matches): a scan of part of the window would report normally
-    while missing fixtures."""
-    from prop_alpha.ingestion.pipeline import list_matches
-
-    rows = list_matches(client, leagues, start.date(), end.date(), "scheduled")
-    fixtures = [UpcomingFixture(**found) for found in (thestatsapi.upcoming_fixture(m, leagues) for m in rows)
-                if found is not None and start <= found["kickoff_at"] < end]
-    return sorted(fixtures, key=lambda f: (f.kickoff_at, f.fixture_id))
+    """Not-started Sportmonks fixtures of `leagues` (league id -> name; default SCAN_LEAGUES) with kickoff in [start, end).
+    Raises if the listing is longer than MAX_LISTING_PAGES pages: a scan of part of the window would report normally while
+    missing fixtures. (Sportmonks again since 2026-10-21; TheStatsAPI from 2026-10-15 to 2026-10-20.)"""
+    fixtures: list[UpcomingFixture] = []
+    for page in range(1, MAX_LISTING_PAGES + 1):
+        rows, has_more = sportmonks.upcoming_fixtures(
+            client.get_json(sportmonks.upcoming_path(start, end, page, leagues)), leagues)
+        fixtures += [UpcomingFixture(**row) for row in rows if start <= row["kickoff_at"] < end]
+        if not has_more:
+            return sorted(fixtures, key=lambda f: (f.kickoff_at, f.fixture_id))
+    raise ValueError(f"fixture listing for {start:%Y-%m-%d %H:%M}-{end:%H:%M} UTC has more than {MAX_LISTING_PAGES} "
+                     "pages; scan refused rather than run on part of the window")
 
 
 def load_slate_inputs(cur: Any, fixture: UpcomingFixture) -> SlateInputs:
@@ -693,11 +695,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     now = _utc(args.at) if args.at is not None else datetime.now(timezone.utc)
     currency = bankroll_currency()
     book_rate = book_to_bankroll(currency, now.date())
-    from prop_alpha.ingestion.pipeline import build_odds_client, build_thestatsapi_client
+    from prop_alpha.ingestion.pipeline import build_odds_client, build_vendor_client
 
     environ = {**os.environ, "DATA_VENDOR_MAX_REQUESTS": os.environ.get("DATA_VENDOR_MAX_REQUESTS", "10"),
                "DATA_VENDOR_QUOTA_RESERVE": os.environ.get("DATA_VENDOR_QUOTA_RESERVE", "100")}
-    client = build_thestatsapi_client(environ)
+    client = build_vendor_client(environ)
     real = args.odds == "oddspapi"
     label = "" if real else MOCK_LABEL
     odds_client = build_odds_client(os.environ) if real else None

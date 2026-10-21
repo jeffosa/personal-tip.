@@ -43,9 +43,6 @@ def test_a_sheet_is_confirmed_only_with_eleven_distinct_starters_a_side() -> Non
     assert lineup_capture.sheet_status(_payload(overlap=True)) == "incomplete"
     with pytest.raises(ValueError, match="two sides"):
         lineup_capture.sheet_status({"lineups": {"76": {"starters": [], "bench": []}}})
-    # TheStatsAPI serves predicted line-ups before the clubs announce theirs: only a confirmed sheet counts.
-    predicted = {**_payload(), "fixture": {"uid": "mt_000009001", "confirmed": False}}
-    assert lineup_capture.sheet_status(predicted) == "incomplete"
 
 
 def test_the_last_poll_before_the_cut_off_is_the_last_chance() -> None:
@@ -60,15 +57,15 @@ class _Client:
         self.sheets, self.listings, self.fetched = sheets, 0, 0
 
     def get_json(self, path: str) -> dict[str, Any]:
-        """TheStatsAPI's listing (since 2026-10-15): one scheduled League Two match, fixture 9001."""
         self.listings += 1
-        row = {"id": "mt_000009001", "competition_id": "comp_4023", "status": "scheduled",
-               "utc_date": KICKOFF.isoformat().replace("+00:00", "Z"),
-               "home_team": {"id": "76", "name": "Walsall"}, "away_team": {"id": "348", "name": "Port Vale"}}
-        return {"data": [row] if "competition_id=comp_4023" in path else [], "meta": {"total_pages": 1}}
+        row = {"id": 9001, "league_id": 14, "state": {"developer_name": "NS"},
+               "starting_at_timestamp": int(KICKOFF.timestamp()),
+               "participants": [{"id": 76, "name": "Walsall", "meta": {"location": "home"}},
+                                {"id": 348, "name": "Port Vale", "meta": {"location": "away"}}]}
+        return {"data": [row], "pagination": {"has_more": False}}
 
     def get_lineups(self, uid: str) -> dict[str, Any]:
-        assert uid == "mt_000009001"  # the TheStatsAPI match id, rebuilt from fixture 9001
+        assert uid == "9001"
         self.fetched += 1
         return self.sheets.pop(0)
 
@@ -112,3 +109,12 @@ def test_a_vendor_failure_is_not_swallowed_and_records_nothing(tmp_path: Path) -
         lineup_capture.capture(KICKOFF - timedelta(minutes=60), _Broken([]), tmp_path)
     assert lineup_capture.load_records(tmp_path) == []
     assert not (tmp_path / lineup_capture.HANDLED_NAME).exists()
+
+
+def test_a_sheet_the_vendor_marks_unconfirmed_is_incomplete_and_an_unmarked_one_is_judged_on_its_starters() -> None:
+    """Sportmonks' sheets carry no confirmed mark (a full sheet counts); a vendor that serves predicted line-ups marks them
+    `confirmed: False` (TheStatsAPI, 2026-10-15 to 2026-10-20), and those never count."""
+    full = _payload()
+    assert lineup_capture.sheet_status(full) == "confirmed"
+    predicted = {**full, "fixture": {**full["fixture"], "confirmed": False}}
+    assert lineup_capture.sheet_status(predicted) == "incomplete"
