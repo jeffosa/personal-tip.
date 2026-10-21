@@ -10,7 +10,9 @@ Data: Sportmonks (back since 2026-10-21, maintainer: the Starter plan, whose cou
 to 2026-10-20): one listing request per page, then one fixture request per missing match through ingestion/sportmonks.py.
 
 The listing covers [latest stored final kickoff - LOOKBACK, today], at most MAX_SPAN per run, so a job that has
-not run for weeks catches up over several runs. Fixtures already final in the database are skipped; the rest go
+not run for weeks catches up over several runs. The latest stored final is taken per league of the run and the earliest of
+them is used (2026-10-21): one league loaded further ahead (the pilot's Scottish Premiership, on the free plan) must not
+move the window past matches another league is still missing. Fixtures already final in the database are skipped; the rest go
 through ConcurrentIngestionEngine (job "stats"), which does all writes. Every listing page and every fixture spends
 one Sportmonks request (DATA_VENDOR_MAX_REQUESTS, default DEFAULT_MAX_REQUESTS). A listing longer than
 MAX_LISTING_PAGES raises rather than ingest part of it. Exit code 1 when any fixture failed or was refused.
@@ -50,7 +52,11 @@ REFUSED_FILE: Final[Path] = DEFAULT_ENV_FILE.parent / ".prop_alpha_state" / "ref
 
 # TheStatsAPI's answer for a match it holds no player statistics for (HTTP 404): a permanent gap, recorded as refused.
 STATS_NOT_AVAILABLE: Final[str] = "STATS_NOT_AVAILABLE_AT_SOURCE"
-LATEST_FINAL_SQL: Final[str] = "SELECT max(kickoff_at) FROM prop_alpha.fixtures WHERE status = 'final'"
+# The latest final kickoff of each named league (leagues.name, as in SCAN_LEAGUES and PILOT_LEAGUES_WANTED).
+LATEST_FINAL_SQL: Final[str] = """
+    SELECT l.name, max(f.kickoff_at) FROM prop_alpha.fixtures f JOIN prop_alpha.leagues l USING (league_id)
+    WHERE f.status = 'final' AND l.name = ANY(%s) GROUP BY l.name
+"""
 # Final fixtures from a day before the listing window starts (kickoff dates are listed in UTC).
 REFRESH_INCOMPLETE_SQL: Final[str] = "SELECT prop_alpha.refresh_incomplete_team_matches(%s)"
 STORED_FINAL_SQL: Final[str] = """
@@ -101,6 +107,17 @@ def listing_window(latest_final: datetime | None, now: datetime) -> tuple[date, 
         raise ValueError("no final fixture is stored: backfill the database before running the results job")
     start = (latest_final - LOOKBACK).date()
     return start, min(now.date(), start + MAX_SPAN)
+
+
+def earliest_latest(latest_by_league: Mapping[str, datetime], names: Sequence[str]) -> datetime | None:
+    """The earliest of the named leagues' latest stored final kickoffs, so the listing starts behind every one of them;
+    None when no league has one. A named league with none stored raises: backfill it first."""
+    if not latest_by_league:
+        return None
+    absent = sorted(set(names) - set(latest_by_league))
+    if absent:
+        raise ValueError(f"no final fixture is stored for {', '.join(absent)}: backfill it before running the results job")
+    return min(latest_by_league[name] for name in names)
 
 
 def missing_fixtures(listed: Sequence[tuple[str, datetime]], stored_final: frozenset[str]) -> list[str]:
@@ -159,9 +176,9 @@ def pilot_leagues(client: Any) -> tuple[dict[int, str], list[str]]:
     raise ValueError(f"league listing has more than {MAX_LISTING_PAGES} pages")
 
 
-def read_stored(dsn: str) -> tuple[datetime | None, frozenset[str]]:
-    """(latest final kickoff, final fixture ids from LOOKBACK plus a day before it), in one read-only
-    transaction."""
+def read_stored(dsn: str, names: Sequence[str]) -> tuple[datetime | None, frozenset[str]]:
+    """(the earliest of the named leagues' latest final kickoffs, final fixture ids from LOOKBACK plus a day before it),
+    in one read-only transaction."""
     import psycopg2
 
     conn = psycopg2.connect(dsn, options="-c statement_timeout=10000 -c default_transaction_read_only=on",
@@ -169,11 +186,8 @@ def read_stored(dsn: str) -> tuple[datetime | None, frozenset[str]]:
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute(LATEST_FINAL_SQL)
-                found = cur.fetchone()
-                if found is None:
-                    raise ValueError("latest-final query returned no row")
-                latest = found[0]
+                cur.execute(LATEST_FINAL_SQL, (list(names),))
+                latest = earliest_latest({str(name): kickoff for name, kickoff in cur.fetchall()}, names)
                 stored: frozenset[str] = frozenset()
                 if latest is not None:
                     cur.execute(STORED_FINAL_SQL, (latest, LOOKBACK))
@@ -220,7 +234,7 @@ def run(
 ) -> ResultsReport:
     """Fixtures recorded in `refused_path` (REFUSED_FILE, or PILOT_REFUSED_FILE for the pilot; required, so no caller can
     leave it out) are left out of `missing`, and the new permanent refusals are recorded after the ingest."""
-    latest, stored = read_stored(dsn)
+    latest, stored = read_stored(dsn, sorted(set(leagues.values())))
     start, end = listing_window(latest, now)
     listed = list_finished(client, start, end, leagues)
     refused = frozenset(load_refused(refused_path))
