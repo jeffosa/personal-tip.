@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,7 @@ SNAPSHOT = status.DatabaseSnapshot(120, 110, datetime(2026, 10, 3, 6, 0, tzinfo=
 
 def test_report_states_database_alerts_trial_and_paper_label(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(status, "read_snapshot", lambda dsn: SNAPSHOT)
+    monkeypatch.setattr(status, "DATA_TRIAL_ENDS", date(2026, 10, 20))
     store = SentAlertStore(tmp_path / "sent.jsonl")
     store.append(SentAlert((1, 2, "tackles", 1.5, "over", "A"), 150.0, NOW - timedelta(hours=1)))
     store.append(SentAlert((1, 3, "fouls", 0.5, "over", "B"), 50.0, NOW - timedelta(hours=30)))
@@ -31,7 +32,7 @@ def test_report_states_database_alerts_trial_and_paper_label(tmp_path: Path, mon
     assert "Last merge: 2026-10-03 06:00 UTC" in report
     assert "Incomplete club-matches (a player without an ID played; left out of pricing): 0" in report
     assert "Alerts in the last 4h: 1; open alerted exposure: 200.00" in report
-    assert "TheStatsAPI trial: 17 days left" in report
+    assert "Sportmonks trial: 17 days left" in report
     assert report.endswith(PAPER_LABEL) and "WARNING" not in report
     assert len(report) < 4096
 
@@ -55,22 +56,31 @@ def test_unreachable_database_is_reported_not_silent(monkeypatch: pytest.MonkeyP
     ]
 
 
-def test_the_trial_warns_a_week_ahead_not_only_after_it_ended() -> None:
+def test_the_trial_warns_a_week_ahead_not_only_after_it_ended(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(status, "DATA_TRIAL_ENDS", date(2026, 10, 20))
     far = datetime(2026, 10, 12, tzinfo=timezone.utc)   # 8 days left: plain information
     near = datetime(2026, 10, 13, tzinfo=timezone.utc)  # 7 days left: a warning
-    assert "TheStatsAPI trial: 8 days left (ends 20 Oct)" in status.format_report(far, [], 0, 0.0)
+    assert "Sportmonks trial: 8 days left (ends 20 Oct)" in status.format_report(far, [], 0, 0.0)
     warning = status.format_report(near, [], 0, 0.0)
-    assert "WARNING: TheStatsAPI trial ends 20 Oct (7 days left)" in warning and "choose a paid plan" in warning
+    assert "WARNING: Sportmonks trial ends 20 Oct (7 days left)" in warning and "choose a paid plan" in warning
 
 
-def test_trial_expiry_turns_into_a_warning() -> None:
+def test_trial_expiry_turns_into_a_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(status, "DATA_TRIAL_ENDS", date(2026, 10, 20))
     after = datetime(2026, 10, 21, tzinfo=timezone.utc)
-    assert "WARNING: TheStatsAPI trial ended 20 Oct" in status.format_report(after, [], 0, 0.0)
+    assert "WARNING: Sportmonks trial ended 20 Oct" in status.format_report(after, [], 0, 0.0)
+
+
+def test_no_recorded_trial_end_says_so_and_never_warns() -> None:
+    """2026-10-21: the Sportmonks Starter trial had not started, so its end was not known; the report says so."""
+    assert status.DATA_TRIAL_ENDS is None
+    report = status.format_report(datetime(2026, 10, 21, tzinfo=timezone.utc), [], 0, 0.0)
+    assert "Sportmonks: no trial end recorded (status.DATA_TRIAL_ENDS)" in report and "WARNING" not in report
 
 
 def test_default_database_is_never_the_ci_database() -> None:
-    # The TheStatsAPI working database since 2026-10-15; never the CI one, never the Sportmonks archive.
-    assert status.DEFAULT_DSN.endswith("/prop_alpha_tsa") and "_ci" not in status.DEFAULT_DSN
+    # The Sportmonks working database (again since 2026-10-21); never the CI one, never TheStatsAPI's archive.
+    assert status.DEFAULT_DSN.endswith("/prop_alpha") and "_ci" not in status.DEFAULT_DSN
 
 
 def test_report_lists_open_and_stale_bets_and_settled_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

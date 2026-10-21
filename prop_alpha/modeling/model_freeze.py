@@ -20,11 +20,14 @@ from pathlib import Path
 from typing import Final, Mapping
 
 FROZEN_ON: Final[date] = date(2026, 10, 5)
-# Restarted (maintainer, 2026-10-15) with the move from Sportmonks to TheStatsAPI: the pricing code is unchanged (same
-# FROZEN_DIGEST), but its input data now come from another vendor whose counts differ (tackles for about 1 player in 8),
-# so matches priced on Sportmonks data (from 2026-10-06) no longer count. Only matches from this date, priced and scored
-# on TheStatsAPI data (prop_alpha_tsa), count towards Gate 2.
-LOCKBOX_START: Final[datetime] = datetime(2026, 10, 17, tzinfo=timezone.utc)
+# Restored to the original 2026-10-06 (maintainer, 2026-10-21) with the return to Sportmonks, the data the model was frozen
+# and selected on. From 2026-10-15 to 2026-10-20 the start was 2026-10-17, because the input data had moved to TheStatsAPI,
+# whose counts differ; with Sportmonks back, every lockbox match is scored on Sportmonks history again (prop_alpha, caught
+# up after the switch). The pricing code is unchanged (same FROZEN_DIGEST). Caveat recorded with the decision: some early
+# lockbox matches had been run through scripts/gate2_lockbox.py on 2026-10-11 (24 matches), so this restoration was chosen
+# after part of the lockbox had been seen; the maintainer chose it over a fresh start on 2026-10-24 to keep about 20 matches
+# already logged on Sportmonks data.
+LOCKBOX_START: Final[datetime] = datetime(2026, 10, 6, tzinfo=timezone.utc)
 # Lines scored per market: the lines the selection backtests reported, fixed before any lockbox match.
 GATE2_LINES: Final[Mapping[str, tuple[float, ...]]] = {"tackles": (0.5, 1.5, 2.5), "fouls": (0.5, 1.5)}
 # Every top-level definition that decides a price ("*" = the whole module). Odds matching, alerts, mock prices and

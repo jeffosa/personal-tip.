@@ -251,6 +251,8 @@ def _state(tmp_path: Path) -> Path:
     (state / "placed_bets.jsonl").write_text('{"event": "placed", "bet_id": 1}\n', encoding="utf-8")
     (state / "sent_alerts.jsonl").write_text("{}\n", encoding="utf-8")
     (state / "odds_archive" / "20261010T120000Z_bet365.json.gz").write_bytes(b"\x1f\x8b raw")
+    (state / "analysis").mkdir()
+    (state / "analysis" / "league_one_two_2026-10-17.csv").write_text("player,over_1.5\n", encoding="utf-8")
     (state / "status.log").write_text("logs are not state", encoding="utf-8")
     return state
 
@@ -266,7 +268,8 @@ def test_backup_dumps_copies_and_verifies_the_ledger_and_writes_a_manifest(tmp_p
     assert not any("password" in part.lower() or "@" in part for call in calls for part in call)
     manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
     assert set(manifest["state"]) == {"placed_bets.jsonl", "sent_alerts.jsonl",
-                                      "odds_archive/20261010T120000Z_bet365.json.gz"}
+                                      "odds_archive/20261010T120000Z_bet365.json.gz",
+                                      "analysis/league_one_two_2026-10-17.csv"}  # the stored analyses (2026-10-15)
     assert (folder / "state" / "placed_bets.jsonl").read_text(encoding="utf-8") == '{"event": "placed", "bet_id": 1}\n'
     assert manifest["dump"]["bytes"] == len(b"PGDMP fake dump") and manifest["dump"]["counts"] == COUNTS
 

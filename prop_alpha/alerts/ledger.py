@@ -70,7 +70,6 @@ from prop_alpha.alerts.telegram import (
 )
 from prop_alpha.config import DEFAULT_DSN, DSN_ENV
 from prop_alpha.evaluation.backtest import closing_line_value
-from prop_alpha.ingestion import thestatsapi
 from prop_alpha.scanner.market_scanner import ExposureBook, ProjectionKey
 
 logger = logging.getLogger("prop_alpha.ledger")
@@ -611,9 +610,10 @@ def read_settlement_rows(
         with conn:
             with conn.cursor() as cur:
                 for bet in bets:
-                    # The stored vendor uid of the bet's match: TheStatsAPI's "mt_" and nine digits since 2026-10-15
-                    # (a bet on a Sportmonks fixture id finds no row and stays open, flagged after STALE_AFTER).
-                    cur.execute(settlement_sql, (bet.player_id, thestatsapi.match_uid(bet.fixture_id)))
+                    # The stored vendor uid of the bet's match: the Sportmonks fixture id (again since 2026-10-21; a bet
+                    # made on TheStatsAPI data, 2026-10-15 to 2026-10-20, finds no row and stays open, flagged after
+                    # STALE_AFTER: none was placed then).
+                    cur.execute(settlement_sql, (bet.player_id, str(bet.fixture_id)))
                     found = cur.fetchone()
                     rows[(bet.fixture_id, bet.player_id)] = None if found is None else (
                         str(found[0]), _nullable_int(found[1]), _nullable_int(found[2]), _nullable_int(found[3])

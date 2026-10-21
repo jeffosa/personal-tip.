@@ -159,7 +159,7 @@ def test_a_database_written_to_during_the_dump_fails_the_backup(tmp_path: Path) 
     backup = _script("backup")
     (tmp_path / "state").mkdir()
     changed = dict(COUNTS, player_match_stats=72)
-    with pytest.raises(ValueError, match=r"prop_alpha_tsa changed during the dump \(player_match_stats\)"):
+    with pytest.raises(ValueError, match=r"prop_alpha changed during the dump \(player_match_stats\)"):
         backup.backup(tmp_path / "backups", tmp_path / "state", NOW, runner=_backup_runner([COUNTS, changed]))
     assert [path.name for path in (tmp_path / "backups").iterdir()] == ["prop_alpha_20261011T023000Z.incomplete"]
 

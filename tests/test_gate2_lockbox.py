@@ -25,8 +25,8 @@ def _module() -> ModuleType:
     return module
 
 
-def _logged(player: int, p_win: float, digest: str = FROZEN_DIGEST, logged: str = "2026-10-24T13:44:00+00:00") -> dict[str, Any]:
-    return {"logged_at": logged, "window_start": logged, "kickoff_at": "2026-10-24T14:00:00+00:00", "fixture_id": 1,
+def _logged(player: int, p_win: float, digest: str = FROZEN_DIGEST, logged: str = "2026-10-10T13:44:00+00:00") -> dict[str, Any]:
+    return {"logged_at": logged, "window_start": logged, "kickoff_at": "2026-10-10T14:00:00+00:00", "fixture_id": 1,
             "player_id": player, "market": "tackles", "line": 1.5, "p_win": p_win, "p_lose": 0.9 - p_win, "p_void": 0.1,
             "lineup_basis": "estimated", "digest": digest}
 
@@ -35,7 +35,7 @@ def test_repriced_probabilities_are_compared_with_the_logged_ones_and_difference
     lockbox = _module()
     repriced = {(1, 7, "tackles", 1.5): 0.5 / 0.9, (1, 8, "tackles", 1.5): 0.31, (2, 9, "tackles", 1.5): 0.4}
     logged = [_logged(7, 0.5), _logged(8, 0.3),
-              _logged(8, 0.6, logged="2026-10-24T13:50:00+00:00"),  # a later duplicate: the earliest stands
+              _logged(8, 0.6, logged="2026-10-10T13:50:00+00:00"),  # a later duplicate: the earliest stands
               _logged(7, 0.1, digest="not-frozen")]  # made by other code: never compared
     check = lockbox.compare_with_log(repriced, logged)
     assert check["compared"] == 2 and check["differ"] == 1 and check["differing"] == [[1, 8, "tackles", 1.5]]

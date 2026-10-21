@@ -312,9 +312,11 @@ SCAN_LEAGUES: Final[Mapping[int, str]] = {12: "League One", 14: "League Two"}
 # three): (country, Sportmonks league name) -> the league's name in that database (unique there). Sportmonks league ids are read
 # from the plan's own league list (`resolve_leagues`) instead of being written down: a league the plan does not
 # include is reported, never guessed.
+# Since 2026-10-21 (the Starter plan's five leagues, maintainer): the English Championship, where bookmakers quote player
+# tackles and fouls, in place of the Scottish Championship, whose per-player tackles no source here holds.
 PILOT_LEAGUES_WANTED: Final[Mapping[tuple[str, str], str]] = {
     ("Scotland", "Premiership"): "Scottish Premiership",
-    ("Scotland", "Championship"): "Scottish Championship",
+    ("England", "Championship"): "Championship",
     ("Brazil", "Serie A"): "Brazil Serie A",
 }
 LEAGUES_PATH: Final[str] = "leagues?include=country&per_page=50"

@@ -33,7 +33,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from prop_alpha.config import credential
+from prop_alpha.config import credential, setting
 from prop_alpha.ingestion import oddspapi, sportmonks, thestatsapi
 from prop_alpha.ingestion.transform import (
     DEFAULT_KAPPAS,
@@ -678,7 +678,8 @@ THESTATSAPI_RPS: Final[float] = 0.19
 
 def build_thestatsapi_client(environ: Mapping[str, str], matches: Mapping[str, Mapping[str, Any]] | None = None) -> VendorClient:
     """TheStatsAPI client: key from THESTATSAPI_KEY (environment or `.env`) as a Bearer token, at most THESTATSAPI_RPS
-    requests a second (THESTATSAPI_RPS in the environment overrides it), the monthly quota read from
+    requests a second (THESTATSAPI_RPS in the environment or `.env` overrides it: the trial allowed 12 a minute, the paid
+    Starter plan 120 a minute, so 1.8 suits it), the monthly quota read from
     X-Monthly-Quota-Remaining, DATA_VENDOR_MAX_REQUESTS and DATA_VENDOR_QUOTA_RESERVE as for any vendor. With `matches`
     (match uid -> its listing row), get_fixture_feed returns transform.py's payload (thestatsapi.fixture_payload); a uid
     not in it is refused, since the player-stats reply alone has no teams, kickoff or score."""
@@ -690,7 +691,7 @@ def build_thestatsapi_client(environ: Mapping[str, str], matches: Mapping[str, M
     max_requests = int(environ["DATA_VENDOR_MAX_REQUESTS"]) if environ.get("DATA_VENDOR_MAX_REQUESTS") else None
     return VendorClient(
         thestatsapi.BASE_URL, credential(thestatsapi.KEY_NAME, environ),
-        TokenBucketRateLimiter(rate_per_sec=float(environ.get("THESTATSAPI_RPS", THESTATSAPI_RPS)), burst=1),
+        TokenBucketRateLimiter(rate_per_sec=float(setting("THESTATSAPI_RPS", str(THESTATSAPI_RPS), environ)), burst=1),
         timeout=30.0, max_requests=max_requests, quota_reserve=int(environ.get("DATA_VENDOR_QUOTA_RESERVE", "0")),
         auth_header="Authorization", auth_prefix="Bearer ",
         stats_path=thestatsapi.PLAYER_STATS_PATH, lineups_path=thestatsapi.LINEUPS_PATH,
