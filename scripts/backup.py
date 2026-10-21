@@ -77,7 +77,8 @@ STATE_FILES: Final[tuple[str, ...]] = (
 # Folders copied whole: the raw bookmaker responses are the evidence for closing-line analysis (PRD Gate 3).
 # and the pre-match analyses the maintainer asked to keep (2026-10-15: the model's prices for upcoming matches, as CSV files
 # with the scripts that made them).
-STATE_DIRS: Final[tuple[str, ...]] = ("odds_archive", "analysis")
+# and the bookmaker coverage probes (scripts/odds_probe.py, 2026-10-21).
+STATE_DIRS: Final[tuple[str, ...]] = ("odds_archive", "analysis", "odds_probe")
 REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "fixtures", "player_match_stats", "players", "teams", "leagues", "raw_payloads", "incomplete_team_matches",
 )
