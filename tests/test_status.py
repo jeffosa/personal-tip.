@@ -78,9 +78,10 @@ def test_no_recorded_trial_end_says_so_and_never_warns(monkeypatch: pytest.Monke
     assert "Sportmonks: no trial end recorded (status.DATA_TRIAL_ENDS)" in report and "WARNING" not in report
 
 
-def test_the_starter_trial_ends_14_days_after_it_starts_on_23_october() -> None:
-    assert status.DATA_TRIAL_ENDS == date(2026, 10, 23) + timedelta(days=14) == date(2026, 11, 6)
-    assert "Sportmonks trial: 16 days left (ends 06 Nov)" in status.format_report(datetime(2026, 10, 21, tzinfo=timezone.utc),
+def test_the_starter_trial_ends_on_the_date_sportmonks_reports() -> None:
+    # The plan went live on 2026-10-25; Sportmonks' subscription reply: "Trialing until 2026-11-08 04:57:14" (UTC).
+    assert status.DATA_TRIAL_ENDS == date(2026, 11, 8)
+    assert "Sportmonks trial: 18 days left (ends 08 Nov)" in status.format_report(datetime(2026, 10, 21, tzinfo=timezone.utc),
                                                                                  [], 0, 0.0)
 
 
@@ -264,3 +265,12 @@ def test_the_report_shows_the_pilots_health_from_its_own_files(tmp_path: Path) -
     warning = status.pilot_section(tmp_path, now)[0]
     assert warning.startswith("WARNING: Pilot scan: last run Sun 11 Oct 06:00 UTC") and "skipped as stale: Brazil Serie A" in warning
     assert "NO real odds" in warning and "has not run for over 5 hours" in warning
+
+
+def test_messages_name_the_data_vendor_the_settlement_actually_reads() -> None:
+    # 2026-10-25: after the switch back to Sportmonks the status footer and the automatic settlement reply still said
+    # "TheStatsAPI"; both must name the current vendor.
+    from prop_alpha.alerts import replies
+
+    for text in (status.STATUS_NOTE, replies.AUTO_BASIS):
+        assert status.DATA_VENDOR_NAME in text and "TheStatsAPI" not in text
