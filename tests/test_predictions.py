@@ -62,6 +62,28 @@ def test_the_log_is_append_only_and_a_fixture_is_logged_once_per_digest_whatever
     assert len(log.load()) == 2 * first
 
 
+def test_the_log_records_its_data_source_and_logs_a_moved_kickoff_again(tmp_path: Path) -> None:
+    # 2026-10-25 (LOCKBOX_PROTOCOL.md): the data source is part of the protocol, and a postponed match used to keep its
+    # first, now-wrong prediction for ever (one per fixture and digest).
+    log = PredictionLog(tmp_path / "p.jsonl", data_vendor="sportmonks")
+    first = log.record(FIXTURE, _projections(), NOW, WINDOW, "abc")
+    assert {r["data_vendor"] for r in log.load()} == {"sportmonks"}
+    moved = UpcomingFixture(9001, "League Two", "76", "348", "Walsall", "Port Vale", KICKOFF + timedelta(days=3))
+    assert log.record(moved, _projections_for(moved), NOW + timedelta(days=3), WINDOW, "abc") == first
+    assert log.record(moved, _projections_for(moved), NOW + timedelta(days=3, minutes=5), WINDOW, "abc") == 0
+    assert {r["kickoff_at"] for r in log.load()} == {KICKOFF.isoformat(), moved.kickoff_at.isoformat()}
+    assert "data_vendor" not in prediction_records(FIXTURE, _projections(), NOW, WINDOW, "abc")[0]
+
+
+def _projections_for(fixture: UpcomingFixture) -> Any:
+    rows = [Appearance(1, 100 + week, "76", KICKOFF - timedelta(days=7 * (10 - week)), True, 90.0, 2, 1)
+            for week in range(10)]
+    projections, _ = build_projections(fixture, [SquadPlayer(1, "Regular Starter", "MID", "76")], {1: rows},
+                                       {"76": [105, 106, 107, 108, 109], "348": [105, 106, 107, 108, 109]}, RATES,
+                                       QuantEngine(game_state_k=6.0))
+    return projections
+
+
 def test_a_damaged_log_line_raises_rather_than_being_skipped(tmp_path: Path) -> None:
     path = tmp_path / "p.jsonl"
     path.write_text(json.dumps({"fixture_id": 1}) + "\n", encoding="utf-8")
@@ -77,7 +99,7 @@ def _record(**changes: object) -> dict[str, object]:
         "logged_at": (LOCKBOX_START + timedelta(days=4, hours=-2)).isoformat(), "window_start": WINDOW.isoformat(),
         "kickoff_at": (LOCKBOX_START + timedelta(days=4)).isoformat(), "fixture_id": 1, "player_id": 1,
         "market": "tackles", "line": 1.5, "p_win": 0.4, "p_lose": 0.6, "p_void": 0.0,
-        "lineup_basis": "estimated", "digest": FROZEN_DIGEST,
+        "lineup_basis": "estimated", "digest": FROZEN_DIGEST, "data_vendor": "sportmonks",
     }
     return {**base, **changes}
 
@@ -89,6 +111,8 @@ def test_only_frozen_code_before_kickoff_from_the_lockbox_start_counts() -> None
     assert not counts_for_lockbox(_record(kickoff_at=early, logged_at=(LOCKBOX_START - timedelta(hours=3)).isoformat()))
     kickoff = datetime.fromisoformat(str(_record()["kickoff_at"]))
     assert not counts_for_lockbox(_record(logged_at=(kickoff + timedelta(minutes=1)).isoformat()))  # after kickoff
+    assert not counts_for_lockbox(_record(data_vendor="thestatsapi"))             # another data source (2026-10-25)
+    assert not counts_for_lockbox(_record(fixture_id=19728228))                   # examined before the restart
 
 
 def test_lockbox_progress_counts_per_market_and_line_and_what_does_not_count() -> None:

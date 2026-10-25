@@ -2,7 +2,9 @@
 
 The 2026-09-12 to 2026-10-04 window chose the scan's settings (scripts/tune_backtest.py, scripts/recalibrate.py),
 so it is selection data, not a holdout. Gate 2 evidence comes only from matches kicking off on or after
-LOCKBOX_START, priced by the model as it was frozen on FROZEN_ON and scored once by scripts/gate2_lockbox.py.
+LOCKBOX_START, priced by the model as it was frozen on FROZEN_ON, logged before kickoff and scored once by
+scripts/gate2_prospective.py under the protocol in LOCKBOX_PROTOCOL.md (evaluation/lockbox.py; since 2026-10-25, when
+scripts/gate2_lockbox.py, which repriced, was retired).
 
 The freeze is enforced: tests/test_model_freeze.py fails when the pricing code (PRICING_CODE, fingerprinted by
 pricing_digest, which ignores comments, docstrings and formatting) differs from FROZEN_DIGEST. A pricing change
@@ -27,7 +29,11 @@ FROZEN_ON: Final[date] = date(2026, 10, 5)
 # lockbox matches had been run through scripts/gate2_lockbox.py on 2026-10-11 (24 matches), so this restoration was chosen
 # after part of the lockbox had been seen; the maintainer chose it over a fresh start on 2026-10-24 to keep about 20 matches
 # already logged on Sportmonks data.
-LOCKBOX_START: Final[datetime] = datetime(2026, 10, 6, tzinfo=timezone.utc)
+# Moved to 2026-10-27 (maintainer, 2026-10-25: "treat all predictions and outcomes from those examined matches as
+# ineligible"): the prospective protocol in LOCKBOX_PROTOCOL.md and evaluation/lockbox.py (PROTOCOL.start, which
+# tests/test_lockbox.py keeps equal to this). Every match examined so far kicked off by 2026-10-10 14:15 UTC; the pricing
+# code and FROZEN_DIGEST are unchanged, so this is not a re-freeze.
+LOCKBOX_START: Final[datetime] = datetime(2026, 10, 27, tzinfo=timezone.utc)
 # Lines scored per market: the lines the selection backtests reported, fixed before any lockbox match.
 GATE2_LINES: Final[Mapping[str, tuple[float, ...]]] = {"tackles": (0.5, 1.5, 2.5), "fouls": (0.5, 1.5)}
 # Every top-level definition that decides a price ("*" = the whole module). Odds matching, alerts, mock prices and

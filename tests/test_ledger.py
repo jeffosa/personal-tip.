@@ -446,3 +446,43 @@ def test_bot_command_answers_read_the_ledgers_and_list_the_commands(tmp_path: Pa
     assert bets[0] == "BETS: 0 open (stake 0)" and bets[1].startswith("#1 WON") and len(bets) == 3
     assert bot_commands.answer("pilot", NOW, tmp_path).startswith("PILOT PAPER TIPS (never real bets): 0 open\n")
     assert (tmp_path / pilot_ledger.PILOT_BETS_FILE.name).exists() is False  # read-only: nothing written
+
+
+def _paper_store(tmp_path: Path) -> PlacedBetStore:
+    """A pilot paper-bet store holding tip #1 (bet365, Fernando OVER 1.5 tackles), as pilot_ledger.paper_bet writes it."""
+    store = PlacedBetStore(tmp_path / "pilot_paper_bets.jsonl")
+    store.record_bet(PlacedBet(bet_id=1, update_id=1, message_id=0, number=1, kind="alert", fixture_id=10, player_id=20,
+                               market="tackles", line=1.5, side="over", odds=3.4, stake=13.86, book="bet365", min_odds=3.2,
+                               match="Bragantino v Cruzeiro", player="Fernando (Bragantino)", placed_at=NOW))
+    return store
+
+
+def test_parse_reply_reads_a_pilot_result_with_or_without_the_book() -> None:
+    from prop_alpha.alerts.replies import ResultCommand
+
+    assert parse_reply("result 3 won") == ResultCommand(3, "won", None)
+    assert parse_reply("Result #12 lose SportyBet") == ResultCommand(12, "lost", "SportyBet")
+    assert isinstance(parse_reply("result 3 maybe"), ReplyError)
+
+
+def test_a_result_message_records_the_bookmakers_result_for_a_pilot_paper_tip_once(tmp_path: Path) -> None:
+    # 2026-10-25: before, a bookmaker result for a pilot tip could only be entered on the laptop (pilot_ledger --record), so
+    # none ever was. Update id 1 equals the paper tip's own number: it must not be mistaken for a recorded update.
+    bets, paper = PlacedBetStore(tmp_path / "bets.jsonl"), _paper_store(tmp_path)
+    updates = [_update(1, "result 1 lost sportybet", reply_to=None), _update(2, "result 9 won", reply_to=None)]
+    replies, offset = process_updates(updates, CHAT, MESSAGES, bets, NOW, pilot_store=paper,
+                                      pilot_lock=tmp_path / "pilot.lock")
+    assert offset == 3 and replies[0][1].startswith("Recorded the bookmaker's result for pilot paper tip #1: LOST (sportybet)")
+    assert "the tip was bet365's price; this result is sportybet's" in replies[0][1]
+    assert replies[1][1] == "No pilot paper tip #9 (tip numbers: /pilot)."
+    [(tip, settlement)] = paper.settled_bets()
+    assert (tip.bet_id, settlement.result, settlement.source) == (1, "lost", "manual")
+    assert "sportybet" in settlement.detail and bets.load()[0] == {}   # nothing touches the real ledger
+    again, _ = process_updates(updates[:1], CHAT, MESSAGES, bets, NOW, pilot_store=paper)
+    assert again == [] and len(paper.settlement_update_ids()) == 1     # a re-delivered update is recorded once
+
+
+def test_without_the_pilot_store_a_result_message_is_answered_not_recorded(tmp_path: Path) -> None:
+    replies, _ = process_updates([_update(1, "result 1 won", reply_to=None)], CHAT, MESSAGES,
+                                 PlacedBetStore(tmp_path / "bets.jsonl"), NOW)
+    assert replies[0][1] == "Pilot results are not recorded by this poll."

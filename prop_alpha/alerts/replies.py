@@ -37,10 +37,19 @@ UNDO_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\s*undo\s+#?(?P<bet_id>\d{1
 SETTLE_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^\s*settled?\s+#?(?P<bet_id>\d{1,7})\s+(?P<result>won|win|lost|lose|void)\s*$", re.IGNORECASE
 )
+# The bookmaker's settled result for a pilot PAPER tip (2026-10-25): "result 3 won bet365". It records evidence about the
+# settlement rules only (alerts/pilot_ledger --reconcile); pilot tips stay paper and are never recorded as placed bets. The tip
+# number is the one /pilot lists; the book is optional (a result read off another bookmaker's slip names that book).
+RESULT_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^\s*result\s+#?(?P<bet_id>\d{1,7})\s+(?P<result>won|win|lost|lose|void)"
+    r"(?:\s+(?P<book>[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}?))?\s*$",
+    re.IGNORECASE,
+)
 USAGE: Final[str] = (
     "To record a bet, reply to the tip or board message with: placed <number> [over|under] @<odds> <stake> [book]"
     " - e.g. placed 1a @1.95 5 (the number is the one shown beside the bet). To cancel one: undo <bet id>. "
-    "To record a result: settled <bet id> won|lost|void."
+    "To record a result: settled <bet id> won|lost|void. For a pilot paper tip, the bookmaker's result: "
+    "result <tip number> won|lost|void [book] (tip numbers: /pilot)."
 )
 REF_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\d{1,3}[a-npq-tv-z]?$")
 RESULTS: Final[tuple[str, ...]] = ("won", "lost", "void")
@@ -133,12 +142,21 @@ class SettleCommand:
 
 
 @dataclass(frozen=True)
+class ResultCommand:
+    """The bookmaker's result for pilot paper tip `bet_id`, and the bookmaker it was read from (None: not given)."""
+
+    bet_id: int
+    result: str
+    book: str | None
+
+
+@dataclass(frozen=True)
 class ReplyError:
     message: str
 
 
-def parse_reply(text: str) -> PlaceCommand | UndoCommand | SettleCommand | ReplyError:
-    """A `placed`, `undo` or `settled` command, or a ReplyError explaining the expected form."""
+def parse_reply(text: str) -> PlaceCommand | UndoCommand | SettleCommand | ResultCommand | ReplyError:
+    """A `placed`, `undo`, `settled` or `result` command, or a ReplyError explaining the expected form."""
     placed = PLACED_PATTERN.match(text)
     if placed is not None:
         side = placed.group("side")
@@ -160,6 +178,11 @@ def parse_reply(text: str) -> PlaceCommand | UndoCommand | SettleCommand | Reply
     if settle is not None:
         word = settle.group("result").lower()
         return SettleCommand(int(settle.group("bet_id")), {"win": "won", "lose": "lost"}.get(word, word))
+    found = RESULT_PATTERN.match(text)
+    if found is not None:
+        word = found.group("result").lower()
+        return ResultCommand(int(found.group("bet_id")), {"win": "won", "lose": "lost"}.get(word, word),
+                             (found.group("book") or "").strip() or None)
     return ReplyError(f"Not understood. {USAGE}")
 
 

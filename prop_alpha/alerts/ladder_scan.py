@@ -725,7 +725,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             int(os.environ.get(scan.MAX_ALERTS_ENV, scan.DEFAULT_MAX_ALERTS)),
             odds=args.odds, odds_client=odds_client, books=books, currency=currency, book_rate=book_rate,
             # Mock runs keep no record: their tips are not tips. Real runs log predictions and record paper bets.
-            predictions=PredictionLog(PILOT_PREDICTIONS_FILE) if real else None,
+            predictions=PredictionLog(PILOT_PREDICTIONS_FILE, data_vendor="sportmonks") if real else None,
             paper_bets=PlacedBetStore(pilot_ledger.PILOT_BETS_FILE) if real and args.send else None,
             manual=manual, tip_leagues=args.tip,
         )

@@ -44,6 +44,7 @@ from prop_alpha.evaluation.backtest import (  # noqa: E402
     log_loss,
     walk_forward_over_probability,
 )
+from prop_alpha.evaluation.lockbox import tuning_cutoff  # noqa: E402
 from prop_alpha.modeling.engine import QuantEngine  # noqa: E402
 from prop_alpha.modeling.league_level import SeasonTotals, season_of, season_rates  # noqa: E402
 
@@ -53,6 +54,9 @@ from prop_alpha.modeling.league_level import SeasonTotals, season_of, season_rat
 SEASON_SPLIT: Final[datetime] = datetime.fromisoformat(os.environ.get("BACKTEST_SPLIT", "2026-07-01")).replace(
     tzinfo=timezone.utc)
 LEAGUE_FILTER: Final[str | None] = os.environ.get("BACKTEST_LEAGUE") or None
+# The Gate 2 lockbox is never scored here (LOCKBOX_PROTOCOL.md, 2026-10-25): for League One/Two (the default, or
+# BACKTEST_LEAGUE naming one of them) no match kicking off from the lockbox start is scored; None for other leagues.
+LOCKBOX_CUTOFF: Final[datetime | None] = tuning_cutoff(LEAGUE_FILTER)
 # The tackles count scored (2026-10-12, MARKET_CONTRACT.md section 2b): BACKTEST_TACKLES=attempted (default, what the
 # frozen model prices) or attempted_plus_dribbled_past (tackles attempted plus challenges lost, the pilot ladder count).
 # The wider count is also scored at 3.5, where the bookmakers' ladders still have prices.
@@ -285,7 +289,8 @@ def score_market(
                     group, line, rates[position], engine, market, PRIOR_STRENGTH_90S, failures=failures,
                     level=None if levels is None else levels[position])
             scored = [pr for pr in predictions if pr.kickoff_at >= SEASON_SPLIT and started_of[(pr.player_id, pr.fixture_id)]
-                      and pr.n_history >= MIN_PRIOR_APPEARANCES]
+                      and pr.n_history >= MIN_PRIOR_APPEARANCES
+                      and (LOCKBOX_CUTOFF is None or pr.kickoff_at < LOCKBOX_CUTOFF)]
             target_of = {(o.player_id, o.fixture_id): o for o in all_obs}
             base = np.array([
                 poisson_baseline(target_of[(pr.player_id, pr.fixture_id)],

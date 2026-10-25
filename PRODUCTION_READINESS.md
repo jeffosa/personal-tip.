@@ -11,7 +11,28 @@ settlements, closing prices) that code cannot produce. They take calendar time a
 
 Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not executed where it will run · **[N]** not built.
 
-## Status on 2026-10-15 (read this first; the sections below are history)
+## Status on 2026-10-25: Gate 2 lockbox audited and restarted (read this first)
+
+**Still PAPER ONLY; no go-live gate passed.** At the maintainer's instruction the Gate 2 evidence process was audited and
+repaired (`LOCKBOX_PROTOCOL.md`). No pricing, staking, settlement or risk setting changed; `FROZEN_DIGEST` is unchanged.
+
+| Item | State on 2026-10-25 |
+|---|---|
+| Examined matches | The 24 League One/Two matches of 2026-10-10 were scored on 2026-10-11 (`gate2_lockbox.py`) and fell inside the 2026-10-15 backtest, tune and recalibration windows. They and all 2,715 logged predictions (all for those matches) are **ineligible**. No other League One/Two outcome was scored, and no prediction exists for any later match. |
+| New lockbox start | **2026-10-27 00:00 UTC** (`model_freeze.LOCKBOX_START` = `evaluation/lockbox.PROTOCOL.start`): after the last examined kickoff (2026-10-10 14:15 UTC) and after the restart decision (2026-10-25). Not a re-freeze; no conflict with the freeze rules. |
+| Protocol [T] | Frozen in `evaluation/lockbox.py`: digest, data source (Sportmonks), leagues, Gate 2 lines, outcome columns, eligibility (digest, data source, start, examined matches, logged before kickoff, protocol line, kickoff within 15 minutes of the stored one, earliest of duplicates), outcomes captured once 72 h after kickoff (revisions reported, not applied), missing after 14 days, players who did not play void. The logged probability is scored, never a re-price. |
+| Scoring [T] | `scripts/gate2_prospective.py`: counts only until every Gate 2 line has 500 scored predictions; then every metric once (skill and 90% interval, slope and intercept, bins, worst bin, market benchmark where 200+ closing prices exist) into `gate2_prospective_result.json`, never re-scored. A missing benchmark or sample is a fail. `gate2_lockbox.py` is retired (refuses to run; records kept). |
+| Lockbox kept from tuning [T] | `quick_backtest.py` (League One/Two), `tune_backtest.py` and `recalibrate.py` never score a match from the lockbox start. |
+| Predictions [T] | Every line now records its data source (`data_vendor`); a match whose kickoff moves is logged again when next scanned. |
+| Today's count | 0 eligible predictions (`gate2_prospective.py --dry-run`: 2,715 not eligible, all "match examined before the restart"). |
+
+**Still open (Gate 2 cannot pass until each is closed):** 500 scored predictions per line from 2026-10-27 (calendar time,
+the laptop on and the scheduled scans running); the market benchmark (no closing price captured; no bookmaker has been seen
+quoting League One/Two tackles or fouls); `yellow_card`, a PRD target market the model does not price (build it or a
+maintainer decision on scope); line-ups are estimated, not team-sheet based, a PRD protocol deviation. Settlement
+verification and Gate 3 are unchanged from the 2026-10-15 table below.
+
+## Status on 2026-10-15 (history)
 
 **Still PAPER ONLY. Settlement and model validation are open (High).** No PRD go-live gate has been passed, and none can be
 passed by code: each needs evidence that only calendar time, bookmaker results or the maintainer can supply. Measured today:

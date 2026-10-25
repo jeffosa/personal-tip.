@@ -72,6 +72,8 @@ PURE_MODULES: tuple[str, ...] = (
     "prop_alpha/modeling/league_level.py",
     # Gate 2 scoring: Brier skill, clustered bootstrap, calibration (randomness only from the caller's generator).
     "prop_alpha/evaluation/gate2.py",
+    # Gate 2 lockbox protocol (2026-10-25): eligibility, outcome capture and scoring rows; the caller passes the clock.
+    "prop_alpha/evaluation/lockbox.py",
 )
 IO_LIBRARIES = frozenset({
     "psycopg2", "requests", "urllib3", "socket", "http", "sqlite3", "threading", "concurrent", "asyncio", "subprocess",

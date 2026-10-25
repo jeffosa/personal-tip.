@@ -180,7 +180,16 @@ def test_settle_sends_the_new_results_only_when_asked(
 ) -> None:
     sent: list[str] = []
     _settle_setup(tmp_path, monkeypatch, sent)
+    locks: list[Path] = []
+    original_lock = ledger.ledger_lock
+
+    def record_lock(path: Path = ledger.DEFAULT_LOCK_FILE) -> Any:
+        locks.append(path)
+        return original_lock(path)
+
+    monkeypatch.setattr(ledger, "ledger_lock", record_lock)
     assert pilot_ledger.main(["--settle", "--send"]) == 0
+    assert locks == [ledger.DEFAULT_LOCK_FILE, pilot_ledger.lock_for(PlacedBetStore(pilot_ledger.PILOT_BETS_FILE))]
     assert "#1 LOST (provisional)" in capsys.readouterr().out
     assert len(sent) == 1 and sent[0].startswith(pilot_ledger.SETTLED_HEADER) and "never bets you placed" in sent[0]
     assert ledger.AnswerOutbox(tmp_path / "answers.jsonl").unsent() == []  # queued, then marked sent
@@ -333,3 +342,14 @@ def test_the_new_modules_add_no_exception_handler() -> None:
         assert module.__file__ is not None
         tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
         assert not [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)], module.__name__
+
+
+def test_record_names_the_bookmaker_the_result_was_read_from(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                             capsys: pytest.CaptureFixture[str]) -> None:
+    # 2026-10-25: results read off another bookmaker's slip (SportyBet tickets for bet365 tips) are recorded with that book.
+    store, _ = _record(tmp_path, 1)
+    monkeypatch.setattr(pilot_ledger, "PILOT_BETS_FILE", store.path)
+    assert pilot_ledger.main(["--record", "1", "lost", "--book", "sportybet"]) == 0
+    [(_, settlement)] = store.settled_bets()
+    assert (settlement.result, settlement.source) == ("lost", "manual") and "(sportybet)" in settlement.detail
+    assert "(sportybet)" in capsys.readouterr().out

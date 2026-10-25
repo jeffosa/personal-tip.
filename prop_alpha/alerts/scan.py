@@ -715,7 +715,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                            int(os.environ.get(MAX_ALERTS_ENV, DEFAULT_MAX_ALERTS)),
                            odds=args.odds, odds_client=odds_client, books=books,
                            bets=PlacedBetStore() if real else None, currency=currency, book_rate=book_rate,
-                           predictions=PredictionLog() if real and args.send else None)
+                           predictions=PredictionLog(data_vendor=environ.get("DATA_VENDOR", "sportmonks"))
+                           if real and args.send else None)
     finally:
         client.close()
         if odds_client is not None:
