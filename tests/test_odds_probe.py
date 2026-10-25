@@ -62,3 +62,37 @@ def test_the_report_names_the_books_quoting_each_league_and_keeps_failures() -> 
     assert text.endswith("League One: no bookmaker quoted player tackles or fouls\n"
                          "League Two: no bookmaker quoted player tackles or fouls\n"
                          "Championship: tackles/fouls quoted by bet365")
+
+
+class _Client:
+    """Answers each odds request from `replies` in turn; an Exception reply is raised."""
+
+    def __init__(self, *replies: Any) -> None:
+        self.replies, self.calls = list(replies), 0
+
+    def get_json_value(self, path: str, empty_on: Any = None) -> Any:
+        self.calls += 1
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+def test_a_too_fast_answer_is_retried_once_after_a_pause_and_other_failures_are_not() -> None:
+    probe = _module()
+    waits: list[float] = []
+    client = _Client(RuntimeError("odds: HTTP 429"), [{"fixtureId": "x"}])
+    assert probe.fetch_with_retry(client, "odds", waits.append) == [{"fixtureId": "x"}]
+    assert client.calls == 2 and waits == [probe.RETRY_AFTER_429_S]
+    failing = _Client(RuntimeError("odds: HTTP 400: Invalid"))
+    try:
+        probe.fetch_with_retry(failing, "odds", waits.append)
+    except RuntimeError as exc:
+        assert "HTTP 400" in str(exc)
+    else:
+        raise AssertionError("an HTTP 400 must not be retried")
+    assert failing.calls == 1 and waits == [probe.RETRY_AFTER_429_S]
+
+
+def test_betfair_is_not_asked_because_oddspapi_does_not_know_the_name() -> None:
+    assert "betfair" not in _module().DEFAULT_BOOKS

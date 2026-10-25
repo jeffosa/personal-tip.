@@ -8,6 +8,11 @@ ladders); no other request is metered. Every raw reply is archived under .prop_a
 report; --send also sends the report to Telegram. It refuses to run when the OddsPapi quota would fall below
 scan.ODDS_QUOTA_RESERVE. One bookmaker's failure is recorded in the report and the others are still asked.
 
+First run (25 Oct 2026, 14 hours late after the laptop slept): it stopped after 8 requests, the OddsPapi client's default
+per-run cap, so 7 of the 15 books were never asked; Ladbrokes got HTTP 429 (too fast) and `betfair` is not an OddsPapi
+name (HTTP 400). Since then the run sets its own cap (every book plus one retry each, and the account read), pauses
+PAUSE_S between bookmakers, retries a 429 once after RETRY_AFTER_429_S, and `betfair` is gone from the list.
+
     .venv\\Scripts\\python.exe scripts\\odds_probe.py [--send] [--books bet365,ladbrokes,...]
 """
 
@@ -18,10 +23,11 @@ import gzip
 import json
 import os
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Final, Mapping, Sequence
+from typing import Any, Callable, Final, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -35,10 +41,13 @@ TOURNAMENTS: Final[Mapping[int, str]] = {24: "League One", 25: "League Two", 18:
 # three more UK books (unibet, betvictor, boylesports) whose OddsPapi names are unconfirmed: a name OddsPapi does not
 # know is answered like "no fixtures" (its 400 wording does not tell the two apart).
 DEFAULT_BOOKS: Final[tuple[str, ...]] = (
-    "bet365", "skybet", "williamhill", "ladbrokes", "coral", "paddypower", "betfair", "betfred", "betway", "bwin",
+    "bet365", "skybet", "williamhill", "ladbrokes", "coral", "paddypower", "betfred", "betway", "bwin",
     "pinnacle", "livescorebet", "unibet", "betvictor", "boylesports",
 )
 PROP_MARKETS: Final[frozenset[str]] = frozenset({"tackles", "fouls"})
+# Seconds between bookmaker requests, and before the one retry of a request OddsPapi answered with HTTP 429 (too fast).
+PAUSE_S: Final[float] = 5.0
+RETRY_AFTER_429_S: Final[float] = 30.0
 STATE: Final[Path] = ROOT / ".prop_alpha_state"
 
 
@@ -60,6 +69,18 @@ def coverage(body: Any, book: str, lines: Mapping[int, Any], ladders: Mapping[in
             result[league]["prices"][market] += 1
     return {league: {"fixtures": v["fixtures"], "with_props": len(v["with_props"]), "prices": dict(v["prices"])}
             for league, v in result.items() if league != "other" or v["fixtures"]}
+
+
+def fetch_with_retry(client: Any, path: str, sleep: Callable[[float], None] = time.sleep) -> Any:
+    """One bookmaker's odds reply (None for OddsPapi's "no fixtures" answer); a request answered with HTTP 429 is retried
+    once after RETRY_AFTER_429_S, any other failure raises at once."""
+    try:
+        return client.get_json_value(path, empty_on=oddspapi.NO_FIXTURES_REPLIES)
+    except Exception as exc:  # re-raised unless it is the vendor's too-fast answer; the caller records the failure
+        if "HTTP 429" not in str(exc):
+            raise
+    sleep(RETRY_AFTER_429_S)
+    return client.get_json_value(path, empty_on=oddspapi.NO_FIXTURES_REPLIES)
 
 
 def report(at: datetime, results: Mapping[str, Any]) -> str:
@@ -99,7 +120,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     out = STATE / "odds_probe" / f"{now:%Y%m%dT%H%M%SZ}"
     lines_catalogue = scan.load_catalogue(STATE / scan.ODDS_CACHE_DIR / scan.CATALOGUE_FILE)
     ladder_catalogue = load_ladder_catalogue(STATE / scan.ODDS_CACHE_DIR / LADDER_CATALOGUE_FILE)
-    client = build_odds_client(dict(os.environ))
+    # Every book, one retry each and the account read; the client's default cap (8) cut the first run short.
+    client = build_odds_client({**os.environ, "ODDS_MAX_REQUESTS": str(2 * len(books) + 1)})
     results: dict[str, Any] = {}
     try:
         subscriptions = client.get_json_value(oddspapi.ACCOUNT_PATH).get("subscriptions") or []
@@ -107,9 +129,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if left - len(books) < scan.ODDS_QUOTA_RESERVE:
             raise SystemExit(f"refused: {left} OddsPapi requests left, {len(books)} needed, reserve {scan.ODDS_QUOTA_RESERVE}")
         out.mkdir(parents=True, exist_ok=True)
-        for book in books:
+        for index, book in enumerate(books):
+            if index:
+                time.sleep(PAUSE_S)
             try:
-                body = client.get_json_value(oddspapi.odds_path(book, sorted(TOURNAMENTS)), empty_on=oddspapi.NO_FIXTURES_REPLIES)
+                body = fetch_with_retry(client, oddspapi.odds_path(book, sorted(TOURNAMENTS)))
             except Exception as exc:  # one bookmaker's failure is recorded in the report; the others are still asked
                 results[book] = f"FAILED ({type(exc).__name__}: {str(exc)[:120]})"
                 continue

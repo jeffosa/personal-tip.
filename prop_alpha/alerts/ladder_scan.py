@@ -16,7 +16,7 @@ It is the League One/Two scan (alerts/scan.py) with these differences, and nothi
   `prop_alpha`: tackles counted as pilot_ledger.PILOT_TACKLES_SQL (plain tackles_attempted since 2026-10-13, after settled
   results contradicted the 2026-10-12 tackles-plus-challenges-lost count, MARKET_CONTRACT.md 2e; loaded through PilotCursor so the
   frozen League One/Two queries are untouched), prior strength 6, no rate multiplier, and a game-state k per league and market (LEAGUE_GAME_STATE_K: each
-  league's own fit on TheStatsAPI data, 2026-10-15); Scottish Championship tackles are not priced (UNPRICED_MARKETS). These are NOT the frozen League One/Two settings and are not frozen themselves: the model_freeze
+  league's own fit on Sportmonks data, 2026-10-08 to 2026-10-21); Scottish Championship tackles are not priced (UNPRICED_MARKETS). These are NOT the frozen League One/Two settings and are not frozen themselves: the model_freeze
   fingerprint and the League One/Two lockbox are untouched, and no pilot lockbox exists.
 * Tips: only leagues in TIP_LEAGUES can produce a tip: Brazil Serie A (turned on by the maintainer on 2026-10-11, paused on
   2026-10-12 while the gap between the model and the bookmakers' prices was diagnosed, resumed on 2026-10-15). Every pilot

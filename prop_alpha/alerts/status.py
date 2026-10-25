@@ -46,7 +46,7 @@ from prop_alpha.ingestion import oddspapi
 logger = logging.getLogger("prop_alpha.status")
 
 STATUS_NOTE: Final[str] = (
-    "No PRD go-live gate passed. Bets are settled from TheStatsAPI counts under assumed market rules (provisional); closing "
+    "No PRD go-live gate passed. Bets are settled from Sportmonks counts under assumed market rules (provisional); closing "
     "prices are captured 0-15 min before kickoff; the database bet ledger is not built."
 )
 REPORT_INTERVAL: Final[timedelta] = timedelta(hours=4)
@@ -55,10 +55,10 @@ POLL_STALE_AFTER: Final[timedelta] = timedelta(hours=1)
 # Telegram keeps an update the bot has not read for 24 hours, then drops it: a reply older than that is lost.
 TELEGRAM_UPDATE_RETENTION: Final[timedelta] = timedelta(hours=24)
 # The data vendor and the end of its trial: Sportmonks again (maintainer, 2026-10-21: the Starter plan, EUR 29 a month, five
-# leagues, a 14-day trial). TheStatsAPI's trial ended 2026-10-20. The maintainer starts the trial on 2026-10-23 (told
-# 2026-10-21), so it ends 2026-11-06. None means no trial end is known (set it to None once the plan is paid).
+# leagues, a 14-day trial). TheStatsAPI's trial ended 2026-10-20. The plan went live on 2026-10-25 and Sportmonks' own
+# reply says "Trialing until 2026-11-08 04:57:14" (UTC). None means no trial end is known (set it to None once paid).
 DATA_VENDOR_NAME: Final[str] = "Sportmonks"
-DATA_TRIAL_ENDS: Final[date | None] = date(2026, 11, 6)
+DATA_TRIAL_ENDS: Final[date | None] = date(2026, 11, 8)
 # The status report warns this many days before the trial ends (and every run after).
 TRIAL_WARNING_DAYS: Final[int] = 7
 # An archived OddsPapi reply as alerts/scan.py names it: <run time>_<bookmaker>.json.gz. A malformed reply is archived
