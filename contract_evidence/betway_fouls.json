@@ -1,0 +1,42 @@
+{
+  "book": "betway",
+  "market": "fouls",
+  "document": {
+    "title": "Betway Betting Rules, Version 42, 'These terms were last updated 10/02/2022'",
+    "supplied": "by the maintainer as BettingRules.pdf on 2026-10-25; copy kept (gitignored, in the daily backup) at .prop_alpha_state/analysis/bookmaker_rules/betway_betting_rules_v42_2022-02-10.pdf",
+    "sha256": "a5f3e6d56e776a3a51e129fdf2328256f51ade6a620fda78b6b9a8b2683aae30",
+    "caveats": [
+      "Dated 10 February 2022 (version 42): whether it is the version in force today is not confirmed.",
+      "It names no licensee or website; whether OddsPapi's 'betway' prices are that operator's is not confirmed.",
+      "It defines no player fouls market. The 'Fouls' section (p.47) is the team/match handicap and over/under: only fouls conceded count, offsides excluded, misconduct with the ball out of play excluded, penalties included. Whether a player fouls market uses the same definition is not stated, so no statistic rule is recorded for this market."
+    ]
+  },
+  "rules": [
+    {
+      "topic": "extra time",
+      "source": "bookmaker rules document",
+      "url_or_document": "Betway Betting Rules v42 (10/02/2022), p.49 'Player Performance'",
+      "checked_on": "2026-10-25",
+      "wording": "p.49: player performance markets are on the result at the end of regular time including stoppage time, and \"does not include extra time\", a penalty shootout or a golden goal."
+    },
+    {
+      "topic": "player participation and void",
+      "source": "bookmaker rules document",
+      "url_or_document": "Betway Betting Rules v42 (10/02/2022), p.49 'Player Performance'",
+      "checked_on": "2026-10-25",
+      "wording": "p.49: \"Propositions markets specifically, players must start for bets to stand.\""
+    },
+    {
+      "topic": "abandoned or postponed match",
+      "source": "bookmaker rules document",
+      "url_or_document": "Betway Betting Rules v42 (10/02/2022), p.49 'Player Performance' and p.30 'Soccer - General'",
+      "checked_on": "2026-10-25",
+      "wording": "p.49: bets on a match \"abandoned before the completion of the regular time will be void\" except markets already unconditionally determined. p.30: a match not played on the scheduled date (local time) is void."
+    }
+  ],
+  "missing_rules": [
+    "statistic and data provider: no player fouls definition and no provider named (see caveats).",
+    "whole-line settlement: given only for goals over/under (p.33-34), not for player markets."
+  ],
+  "examples": []
+}

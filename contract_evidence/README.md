@@ -5,7 +5,8 @@ anything on its own: a contract is verified only when the maintainer lists it in
 `prop_alpha/alerts/market_contract.VERIFIED_CONTRACTS`, and `tests/test_market_contract.py` then fails unless
 `market_contract.evidence_failures` finds nothing missing (criteria: `MARKET_CONTRACT.md` section 10).
 
-- `rules`: the bookmaker's own wording, first-hand (`bookmaker rules page` or `bookmaker support reply`), with its URL or
+- `rules`: the bookmaker's own wording, first-hand (`bookmaker rules page`, `bookmaker rules document` or
+  `bookmaker support reply`), with its URL or
   document and the date read, on each of: statistic and data provider, extra time, player participation and void,
   abandoned or postponed match, whole-line settlement. Search-engine summaries and other bookmakers' pages do not count.
 - `examples`: results settled by this bookmaker (a bet slip or account history the maintainer read), at least 20 per

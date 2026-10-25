@@ -62,7 +62,8 @@ RIVAL_STATISTICS: Final[Mapping[str, tuple[str, ...]]] = {
 # Every rule topic the bookmaker's own wording must cover, and the sources that count as first-hand.
 RULE_TOPICS: Final[tuple[str, ...]] = ("statistic and data provider", "extra time", "player participation and void",
                                        "abandoned or postponed match", "whole-line settlement")
-FIRST_HAND_SOURCES: Final[tuple[str, ...]] = ("bookmaker rules page", "bookmaker support reply")
+# A rules document is the bookmaker's own published rules as a file (Betway's "Betting Rules" PDF, 2026-10-25).
+FIRST_HAND_SOURCES: Final[tuple[str, ...]] = ("bookmaker rules page", "bookmaker rules document", "bookmaker support reply")
 MIN_EXAMPLES: Final[int] = 20
 MIN_DISCRIMINATING: Final[int] = 3
 WITHHELD_NOTE: Final[str] = (

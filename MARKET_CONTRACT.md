@@ -247,7 +247,7 @@ restrictions"), and web.archive.org cannot be fetched from here. Quotes are kept
 | bet365 | Extra time | Player match markets include extra time where played | Match-statistics page; summary, 2026-10-25 | Lead (league matches have no extra time, so the scanned leagues are not affected) |
 | bet365 | Abandoned or postponed match; corrections after settlement | Not found | n/a | Open |
 | Sky Bet (not a book the scans price) | Opta definitions | A tackle is a player connecting with the ball in a legal ground-level challenge; **tackles won and lost both count** (lost: the tackle is made but the ball goes to an opponent). Fouls as bet365's, offsides excluded. Settled after 90 minutes plus injury time; extra time and shoot-outs excluded unless stated; Opta may amend statistics later | "Opta Football Statistics - Definitions", https://support.skybet.com/app/answers/detail/opta-football-statistics-definitions; **read in full** (fetch), 2026-10-25; no date on the page | Sky Bet's published rule; evidence about Opta's definition, not about bet365's market |
-| Betway | Any rule | No published tackles or fouls rule found | Web search, 2026-10-25 | Open |
+| Betway | Any rule | No published tackles or fouls rule found online; **superseded by section 12** (Betway's own rules document, supplied by the maintainer) | Web search, 2026-10-25 | See section 12 |
 | SportyBet | Any rule | No published rule found; the market is labelled "Player tackles (incl. overtime)" | Web search, 2026-10-25; market label from the maintainer's tickets | Open; its settlements are in section 2e |
 | Sportradar (a feed many books use; not shown to be Betway's or SportyBet's) | Player markets | A soccer player not in the starting line-up: void; overtime included, shoot-outs excluded | https://docs.sportradar.com/uof/data-and-features/player-markets/pre-match-player-markets-rules-and-faqs; read in full (fetch), 2026-10-25 | Industry practice only |
 
@@ -355,3 +355,46 @@ For one bookmaker and one market:
   both ledgers, adds their stored counts and prints what is missing; `--write` saves a draft for the maintainer to complete.
   A pilot result counts only if it names the bookmaker. On 2026-10-25 all four book-market pairs had 0 examples, and every
   rule topic was missing.
+
+## 12. Betway's own rules document (supplied by the maintainer, 2026-10-25)
+
+**Source.**
+- Document: "Betway Betting Rules", Version 42, "These terms were last updated 10/02/2022" (201 pages). Supplied by the maintainer
+  as `BettingRules.pdf`; SHA-256 `a5f3e6d56e776a3a51e129fdf2328256f51ade6a620fda78b6b9a8b2683aae30`.
+- Read in full as text on 2026-10-25. A copy is kept, gitignored and in the daily backup, at
+  `.prop_alpha_state/analysis/bookmaker_rules/betway_betting_rules_v42_2022-02-10.pdf`.
+- Recorded in `contract_evidence/betway_tackles.json` and `betway_fouls.json`, with page references and short quotes.
+- This is the first first-hand bookmaker rule in this file.
+
+| Topic | What the document says | Page | Fits the project's assumption? |
+|---|---|---|---|
+| Tackle | A player connects with the ball in a ground challenge and successfully takes it from the man in possession (the Opta wording); does not say whether a tackle after which the ball goes straight back to an opponent counts | 51 | Consistent with Opta "Tackles" = `tackles_attempted`; not decisive against `tackles_won` |
+| Data provider | Player performance markets settle on "feed provided data", else Betway's own statistics; **no provider named** | 49 | Open |
+| Player fouls | **Not defined.** Only team/match fouls are (fouls conceded, offsides and misconduct with the ball out of play excluded, penalties included) | 47 | Open |
+| Extra time | Regular time with stoppage time; extra time, shoot-outs and golden goals excluded | 49 | Yes (league matches have no extra time) |
+| Participation | "Propositions markets specifically, players must start for bets to stand." A player who does not start: void | 49 | **No.** The scans price, and settlement grades, "void only if he does not play" (`VOID_IF_NO_APPEARANCE`) |
+| Abandoned | Void if abandoned before the end of regular time, unless already determined | 49 | Not modelled (no abandoned match yet) |
+| Postponed | Void if not played on the scheduled date (local time) | 30 | Not modelled; the lockbox already drops a moved kickoff |
+| Whole line | Push (stake returned) stated only for goals over/under; nothing for player markets | 33-34 | The pilot's Betway markets are "k+" ladders, which have no whole line |
+
+**Caveats (why this verifies nothing yet):**
+- The document is dated February 2022 and may not be the version in force.
+- It names no licensee or website. GBP/EUR stakes and UK broadcasters point to Betway's UK/international site, but whether
+  OddsPapi's `betway` is that operator is unconfirmed.
+- It names no statistics provider and defines no player fouls market.
+- There are **0** Betway-settled examples.
+
+`scripts/contract_evidence.py` on 2026-10-25:
+- Betway tackles: first-hand wording on 4 of 5 topics (whole-line missing), 0 of 20 examples.
+- Betway fouls: 3 of 5 topics (statistic and whole-line missing), 0 of 20 examples.
+
+**Consequence for the model.** Betway voids non-starters, so the model's probability for a Betway quote is conditioned on the
+wrong event: it includes substitute appearances, which Betway would void. The project's automatic settlement would grade a
+substitute's Betway bet on his count where Betway voids it.
+- Even with complete evidence, a Betway contract (`VOID_IF_NOT_STARTING`) does not match what the scans price, so the gate keeps
+  Betway tips withheld (`tests/test_market_contract.py`).
+- Pricing Betway quotes as `VOID_IF_NOT_STARTING` (the engine supports it) changes pricing and settlement semantics. It is the
+  maintainer's decision (AGENT.md A7) and has not been made.
+  - In the pilot (not frozen) it needs no lockbox restart.
+  - The frozen League One/Two model would need a new freeze and a later lockbox start, if a Betway League One/Two market ever
+    appears.

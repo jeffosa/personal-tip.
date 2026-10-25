@@ -213,3 +213,21 @@ def test_a_contract_the_settlements_contradict_fails_and_bad_evidence_raises() -
     del broken["examples"][0]["counts"]["dribbled_past"]
     with pytest.raises(ValueError, match="lacks the stored counts"):
         evidence_failures(broken, "bet365", "tackles", TACKLES)
+
+
+def test_betways_rules_document_covers_four_topics_and_voids_non_starters() -> None:
+    """Betway Betting Rules v42 (10/02/2022, supplied by the maintainer 2026-10-25): first-hand wording on four topics for
+    tackles, three for fouls; no same-book settlement yet; and its participation rule (players must start) is not the void
+    rule the scans price, so even a fully evidenced Betway contract would keep the tips withheld."""
+    tackles = json.loads((EVIDENCE_DIR / "betway_tackles.json").read_text(encoding="utf-8"))
+    fouls = json.loads((EVIDENCE_DIR / "betway_fouls.json").read_text(encoding="utf-8"))
+    starting = VoidRule.VOID_IF_NOT_STARTING.value
+    tackle_failures = evidence_failures(tackles, "betway", "tackles", Contract("s.tackles_attempted", starting, "betway_tackles.json"))
+    assert [f for f in tackle_failures if f.startswith("no first-hand rule")] == ["no first-hand rule on whole-line settlement"]
+    assert "0 same-book settled examples, 20 needed" in tackle_failures
+    foul_failures = evidence_failures(fouls, "betway", "fouls", Contract("s.fouls_committed", starting, "betway_fouls.json"))
+    assert {f for f in foul_failures if f.startswith("no first-hand rule")} == {
+        "no first-hand rule on statistic and data provider", "no first-hand rule on whole-line settlement"}
+    assert "players must start" in tackles["rules"][2]["wording"]
+    contracts = {("betway", "tackles"): Contract("s.tackles_attempted", starting, "betway_tackles.json")}
+    assert not contract_verified("betway", "tackles", NO_APPEARANCE, MODEL_STATISTICS["tackles"], contracts)

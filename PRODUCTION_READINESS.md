@@ -22,7 +22,7 @@ Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not e
 
 | Requirement | State | Evidence |
 |---|---|---|
-| First-hand rules per book and market | **Not met** for bet365 and Betway, tackles and fouls | bet365 help pages answer 403; betway.com is refused by the browser pane; Betway's regional pages render no text (`MARKET_CONTRACT.md` section 11) |
+| First-hand rules per book and market | **Not met.** bet365: none. Betway: its own rules document (v42, dated 10/02/2022, supplied by the maintainer) covers 4 of 5 topics for tackles and 3 of 5 for fouls, and says players must start, which is **not** the void rule priced (`MARKET_CONTRACT.md` section 12) | bet365 help pages answer 403; betway.com is refused by the browser pane; Betway's regional pages render no text (`MARKET_CONTRACT.md` section 11) |
 | 20+ same-book settlements per market, discriminating, a substitute, a non-starter | **0 of 20** for every pair | `scripts/contract_evidence.py` on 2026-10-25 |
 | Reconciliation | 0 same-book results; 5 SportyBet results on bet365 tips are another book's, never counted | `pilot_ledger --reconcile` |
 | Contract listed | none (`VERIFIED_CONTRACTS` empty); a listed contract now fails CI without evidence meeting every criterion [T] | `tests/test_market_contract.py` |
