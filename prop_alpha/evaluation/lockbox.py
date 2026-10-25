@@ -12,7 +12,7 @@ import math
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Final, Mapping, Sequence
+from typing import Any, Collection, Final, Mapping, Sequence
 
 # The 24 League One/Two matches of 2026-10-10, scored by scripts/gate2_lockbox.py on 2026-10-11 and inside the
 # 2026-10-15 backtest windows: examined before the restart, so never evidence.
@@ -239,3 +239,37 @@ def tuning_cutoff(league: str | None, protocol: LockboxProtocol = PROTOCOL) -> d
     """Pure: the kickoff from which a tuning or backtest run on `league` (None: every league in the database, the League
     One/Two default) must not score a match, so the lockbox never informs a setting; None for a league outside it."""
     return protocol.start if league is None or league in protocol.leagues else None
+
+
+@dataclass(frozen=True)
+class Coverage:
+    """How much of the lockbox the evidence trails caught (closing-price review, 2026-10-25): of the protocol matches that
+    have kicked off, how many have an eligible prediction logged before kickoff, a closing-price capture attempt, and a
+    captured closing price. A match missed while the machine was off is otherwise invisible."""
+
+    matches: int
+    predicted: int
+    closing_tried: int
+    closing_priced: int
+
+
+def coverage(kicked_off: Mapping[int, datetime], records: Sequence[Mapping[str, Any]], closing_tried: Collection[int],
+             closing_priced: Collection[int], protocol: LockboxProtocol = PROTOCOL) -> Coverage:
+    """Pure: `kicked_off` is each protocol-league match that has kicked off, as stored (vendor id -> UTC kickoff); `records`
+    the prediction log; `closing_tried` the matches the closing capture ran for, `closing_priced` those it found prices for.
+    Matches before the start or examined before the restart are not lockbox matches and are left out."""
+    matches = {fixture_id for fixture_id, kickoff in kicked_off.items()
+               if kickoff >= protocol.start and fixture_id not in protocol.examined_fixtures}
+    predicted = {int(r["fixture_id"]) for r in eligible(records, kicked_off, protocol).eligible} & matches
+    return Coverage(len(matches), len(predicted), len(matches & set(closing_tried)), len(matches & set(closing_priced)))
+
+
+def coverage_line(result: Coverage, protocol: LockboxProtocol = PROTOCOL) -> str:
+    """Pure: the status report's line for `result`."""
+    head = f"Lockbox coverage (kickoff from {protocol.start:%d %b}): "
+    if result.matches == 0:
+        return head + "no lockbox match has kicked off yet"
+    missed = result.matches - result.predicted
+    return (head + f"{result.matches} matches kicked off; {result.predicted} with a prediction logged before kickoff"
+            + (f" (WARNING: {missed} missed: machine off, or the scan failed)" if missed else "")
+            + f"; closing capture ran for {result.closing_tried}, prices for {result.closing_priced}")

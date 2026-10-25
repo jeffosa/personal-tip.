@@ -194,15 +194,17 @@ def load_closing(path: Path) -> list[dict[str, Any]]:
 
 
 def closing_price(bet: PlacedBet, closing: Sequence[Mapping[str, Any]]) -> tuple[float, str] | None:
-    """Pure: the closing price of the bet's own selection (same fixture, player, market, line and side), preferring the
-    book it was tipped at, then the latest capture; None when none was captured."""
+    """Pure: the closing price of the bet's own selection (same fixture, player, market, line and side) at the book it was
+    tipped at, from the latest capture; None when that book's price was not captured (another book's close is never
+    used: its margin differs, closing-price review 2026-10-25)."""
     side = "over" if bet.side == "over" else "under"
     candidates = [q for q in closing
                   if (int(q["fixture_id"]), int(q["player_id"]), str(q["market"]), float(q["line"]))
-                  == (bet.fixture_id, bet.player_id, bet.market, bet.line) and q.get(side) is not None]
+                  == (bet.fixture_id, bet.player_id, bet.market, bet.line) and q.get(side) is not None
+                  and str(q["book"]).strip().lower() == bet.book.strip().lower()]
     if not candidates:
         return None
-    best = max(candidates, key=lambda q: (str(q["book"]).lower() == bet.book.lower(), str(q["captured_at"])))
+    best = max(candidates, key=lambda q: str(q["captured_at"]))
     return float(best[side]), str(best["book"])
 
 

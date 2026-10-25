@@ -35,7 +35,13 @@ from prop_alpha.alerts import ledger  # noqa: E402
 from prop_alpha.alerts.closing import load_closing_quotes  # noqa: E402
 from prop_alpha.alerts.market_contract import VERIFIED_CONTRACTS, contract_status  # noqa: E402
 from prop_alpha.alerts.ledger import PlacedBetStore  # noqa: E402
-from prop_alpha.alerts.pilot_ledger import PILOT_BETS_FILE, PILOT_SETTLEMENT_SQL  # noqa: E402
+from prop_alpha.alerts.pilot_ledger import (  # noqa: E402
+    PILOT_BETS_FILE,
+    PILOT_CLOSING_FILE,
+    PILOT_SETTLEMENT_SQL,
+    load_closing,
+)
+from prop_alpha.alerts.shadow_picks import PILOT_SHADOW_FILE, SHADOW_FILE, ShadowPickLog  # noqa: E402
 from prop_alpha.alerts.predictions import PredictionLog  # noqa: E402
 from prop_alpha.alerts.replies import profit, reconciliation_summary, reconciliation_text, same_book  # noqa: E402
 from prop_alpha.config import DEFAULT_DSN, DEFAULT_PILOT_DSN, DSN_ENV  # noqa: E402
@@ -122,6 +128,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     for market, entry in result["tips"].items():
         print(f"  {market} tips: {entry['note']}")
     print("  tips left out: " + (", ".join(f"{n} {why}" for why, n in sorted(not_tips.items())) or "none"))
+    print("4. Shadow picks (withheld picks kept unsent; not tips, not Gate 3 evidence): did their prices shorten by kickoff?")
+    pilot_closing = load_closing(PILOT_CLOSING_FILE)
+    report["shadow"] = {}
+    for name, log, closing_quotes in (("League One/Two", ShadowPickLog(SHADOW_FILE), quotes),
+                                      ("pilot", ShadowPickLog(PILOT_SHADOW_FILE), pilot_closing)):
+        entry = value_evidence.shadow_evidence(log.load(), closing_quotes, np.random.default_rng(lockbox.PROTOCOL.seed))
+        report["shadow"][name] = entry
+        price_text = (f"; price value {entry['price_value']:+.1%} (90% {entry['price_value_low']:+.1%} to "
+                 f"{entry['price_value_high']:+.1%})" if "price_value" in entry else "")
+        clv = (f"; de-vigged CLV {entry['clv']:+.1%} (90% {entry['clv_low']:+.1%} to {entry['clv_high']:+.1%})"
+               if "clv" in entry else "")
+        print(f"  {name}: {entry['picks']} shadow picks, {entry['with_close']} with a same-book closing price "
+              f"({entry['with_two_way_close']} two-way) in {entry['fixtures']} matches{price_text}{clv}; reported, not judged")
     shown = bool(VERIFIED_CONTRACTS) and any(entry["value_shown"] for entry in result["tips"].values())
     report["value_shown"] = shown
     print(f"Verdict: value {'shown on the Gate 3 sample' if shown else 'NOT shown'}; {contract_status()}. No value "

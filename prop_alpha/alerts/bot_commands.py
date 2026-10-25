@@ -56,7 +56,7 @@ def status_text(now: datetime, state_dir: Path) -> str:
     return status.build_report(
         now, os.environ.get(DSN_ENV, DEFAULT_DSN), SentAlertStore(), PlacedBetStore(state_dir / ledger.DEFAULT_BETS_FILE.name),
         cached_rate(), DeliveryLog(), (state_dir / ledger.DEFAULT_HEARTBEAT_FILE.name, ledger.AnswerOutbox()), state_dir,
-        pilot_state=state_dir)
+        pilot_state=state_dir, coverage_state=state_dir)
 
 
 def bets_text(store: PlacedBetStore, now: datetime, state_dir: Path) -> str:

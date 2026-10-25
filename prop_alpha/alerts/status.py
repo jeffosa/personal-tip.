@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
 
 from prop_alpha.alerts.fx import MAX_RATE_AGE, ExchangeRate, cached_rate, is_fresh
-from prop_alpha.alerts.closing import load_closing_quotes
+from prop_alpha.alerts.closing import CAPTURED_NAME, load_closing_quotes
 from prop_alpha.alerts.ledger import (
     DEFAULT_HEARTBEAT_FILE,
     MAX_ANSWER_ATTEMPTS,
@@ -36,11 +36,12 @@ from prop_alpha.alerts.ledger import (
     results_summary,
 )
 from prop_alpha.alerts import ladder_scan, pilot_ledger
-from prop_alpha.alerts.predictions import PredictionLog
+from prop_alpha.alerts.predictions import PREDICTIONS_NAME, PredictionLog
 from prop_alpha.alerts.scan import CATALOGUE_FILE, ODDS_ARCHIVE_DIR, ODDS_CACHE_DIR, STATE_DIR, load_catalogue
 from prop_alpha.ingestion.results import PILOT_REFUSED_FILE, load_refused
 from prop_alpha.alerts.telegram import PAPER_LABEL, DeliveryLog, SentAlertStore, TelegramNotifier, load_config
 from prop_alpha.config import DEFAULT_DSN, DSN_ENV
+from prop_alpha.evaluation import lockbox
 from prop_alpha.ingestion import oddspapi
 
 logger = logging.getLogger("prop_alpha.status")
@@ -67,6 +68,11 @@ ARCHIVED_REPLY: Final[re.Pattern[str]] = re.compile(r"([0-9]{8}T[0-9]{6}Z)_([a-z
 REJECTED_REPLY_SUFFIX: Final[str] = ".rejected.json.gz"
 QUOTE_MARKETS: Final[tuple[str, ...]] = tuple(sorted(set(oddspapi.MARKET_TYPES.values())))
 
+# Lockbox-league matches stored with a kickoff from the protocol start up to now (the results job stores finished matches).
+LOCKBOX_KICKOFFS_SQL: Final[str] = """
+    SELECT f.vendor_fixture_uid, f.kickoff_at FROM prop_alpha.fixtures f JOIN prop_alpha.leagues l USING (league_id)
+    WHERE l.name = ANY(%s) AND f.kickoff_at >= %s AND f.kickoff_at <= now()
+"""
 SNAPSHOT_SQL: Final[str] = """
     SELECT (SELECT count(*) FROM prop_alpha.fixtures),
            (SELECT count(*) FROM prop_alpha.fixtures WHERE status = 'final'),
@@ -89,6 +95,8 @@ class DatabaseSnapshot:
     rejects_24h: int
     raw_payloads: int
     incomplete_team_matches: int = 0
+    # The lockbox-league matches stored as kicked off from the protocol start (vendor id, kickoff), for the coverage line.
+    lockbox_kickoffs: tuple[tuple[int, datetime], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -195,16 +203,29 @@ def read_snapshot(dsn: str) -> DatabaseSnapshot:
                 row = cur.fetchone()
                 if row is None:
                     raise ValueError("status snapshot query returned no row")
+                cur.execute(LOCKBOX_KICKOFFS_SQL, (list(lockbox.PROTOCOL.leagues), lockbox.PROTOCOL.start))
+                kickoffs = tuple((int(uid), kickoff.astimezone(timezone.utc)) for uid, kickoff in cur.fetchall())
     finally:
         conn.close()
     if row is None:
         raise ValueError("status snapshot query returned no row")
     fixtures, final_fixtures, last_merge, player_rows, staged, rejects, raw, incomplete = row
     return DatabaseSnapshot(int(fixtures), int(final_fixtures), last_merge, int(player_rows), int(staged),
-                            int(rejects), int(raw), int(incomplete))
+                            int(rejects), int(raw), int(incomplete), kickoffs)
 
 
-def database_section(dsn: str) -> list[str]:
+def coverage_section(snapshot: DatabaseSnapshot, state_dir: Path) -> list[str]:
+    """The lockbox coverage line (closing-price review, 2026-10-25): of the lockbox matches stored as kicked off, how many
+    had a prediction logged before kickoff and a closing-price capture. A match missed while the machine was off leaves no
+    other trace."""
+    tried_file = state_dir / CAPTURED_NAME
+    tried = {int(f) for f in json.loads(tried_file.read_text(encoding="utf-8"))} if tried_file.is_file() else set()
+    priced = {int(q["fixture_id"]) for q in load_closing_quotes(state_dir)}
+    records = PredictionLog(state_dir / PREDICTIONS_NAME).load()
+    return [lockbox.coverage_line(lockbox.coverage(dict(snapshot.lockbox_kickoffs), records, tried, priced))]
+
+
+def database_section(dsn: str, coverage_state: Path | None = None) -> list[str]:
     import psycopg2
 
     try:
@@ -223,6 +244,8 @@ def database_section(dsn: str) -> list[str]:
         lines.append(f"WARNING: {snapshot.staged_rows} rows waiting in staging (merge failed or not run)")
     if snapshot.rejects_24h:
         lines.append(f"WARNING: {snapshot.rejects_24h} rows rejected in the last 24h (see staging_rejects)")
+    if coverage_state is not None:
+        lines += coverage_section(snapshot, coverage_state)
     return lines
 
 
@@ -344,9 +367,9 @@ def format_report(now: datetime, database_lines: list[str], alerts_in_window: in
 def build_report(now: datetime, dsn: str, store: SentAlertStore, bets: PlacedBetStore | None = None,
                  rate: ExchangeRate | None = None, deliveries: DeliveryLog | None = None,
                  poll_state: tuple[Path, AnswerOutbox] | None = None, odds_state: Path | None = None,
-                 pilot_state: Path | None = None) -> str:
+                 pilot_state: Path | None = None, coverage_state: Path | None = None) -> str:
     alerts = [alert for alert in store.load() if alert.sent_at > now - REPORT_INTERVAL]
-    return format_report(now, database_section(dsn), len(alerts), store.exposure(now).total,
+    return format_report(now, database_section(dsn, coverage_state), len(alerts), store.exposure(now).total,
                          [*(bet_section(bets, now) if bets is not None else ()),
                           *(delivery_section(deliveries, now) if deliveries is not None else ()),
                           *(poll_section(*poll_state, now) if poll_state is not None else ()),
@@ -362,7 +385,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     report = build_report(datetime.now(timezone.utc), os.environ.get(DSN_ENV, DEFAULT_DSN), SentAlertStore(),
                           PlacedBetStore(), cached_rate(), DeliveryLog(), (DEFAULT_HEARTBEAT_FILE, AnswerOutbox()),
-                          STATE_DIR, pilot_state=STATE_DIR)
+                          STATE_DIR, pilot_state=STATE_DIR, coverage_state=STATE_DIR)
     print(report)
     if args.send:
         message_id = TelegramNotifier(load_config()).send_message(report)

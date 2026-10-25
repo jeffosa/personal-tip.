@@ -43,8 +43,9 @@ from prop_alpha.alerts.closing import save_scan_fixtures
 from prop_alpha.alerts.fx import BOOK_CURRENCY, SUPPORTED_CURRENCIES, ExchangeRate, bankroll_currency, book_to_bankroll
 from prop_alpha.alerts.fx import identity as fx_identity
 from prop_alpha.alerts.ledger import PlacedBetStore, combined_exposure
-from prop_alpha.alerts.market_contract import MODEL_STATISTICS, WITHHELD_NOTE, contract_status, withhold_unverified
+from prop_alpha.alerts.market_contract import MODEL_STATISTICS, WITHHELD_NOTE, contract_status, split_unverified
 from prop_alpha.alerts.predictions import PredictionLog
+from prop_alpha.alerts.shadow_picks import ShadowPickLog
 from prop_alpha.alerts.replies import USAGE, AlertItem
 from prop_alpha.alerts.telegram import (
     DEFAULT_CRITERIA,
@@ -587,6 +588,7 @@ def run_scan(
     odds: str = "mock", odds_client: Any | None = None, books: Sequence[str] = DEFAULT_BOOKMAKERS,
     state_dir: Path = STATE_DIR, bets: PlacedBetStore | None = None, currency: str,
     book_rate: ExchangeRate | None = None, predictions: PredictionLog | None = None,
+    shadow: ShadowPickLog | None = None,
 ) -> ScanSummary:
     """With `bets`, exposure per market is the larger of the stakes alerted and the stakes recorded as placed.
     `currency` (fx.bankroll_currency()) is the bankroll's; when it is not BOOK_CURRENCY, `book_rate`
@@ -674,8 +676,13 @@ def run_scan(
         all_descriptions.update(descriptions(fixture, inputs, projections))
     combined.directives.sort(key=lambda d: (-d.ev_per_unit, d.fixture_id, d.player_id, d.market_type, d.line_value))
     if odds == "oddspapi":
-        # No tip on a real price without a verified settlement contract (market_contract, audit 2026-10-25).
-        combined.directives, summary.withheld = withhold_unverified(combined.directives, MODEL_STATISTICS)
+        # No tip on a real price without a verified settlement contract (market_contract, audit 2026-10-25). With `shadow`
+        # (a real --send run) the withheld picks are kept, unsent, for their closing-line value (alerts/shadow_picks.py).
+        combined.directives, withheld = split_unverified(combined.directives, MODEL_STATISTICS)
+        summary.withheld = len(withheld)
+        if shadow is not None:
+            shadow.record(withheld, {f.fixture_id: f for f in fixtures},
+                          {p.player_id: p.name for _, inputs in slate for p in inputs.squad}, now, "league")
     if notifier is not None:
         summary.alerts_sent, _ = notifier.notify_digest(
             combined, all_projections, bankroll_currency=currency, label=label, descriptions=all_descriptions,
@@ -726,7 +733,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                            odds=args.odds, odds_client=odds_client, books=books,
                            bets=PlacedBetStore() if real else None, currency=currency, book_rate=book_rate,
                            predictions=PredictionLog(data_vendor=environ.get("DATA_VENDOR", "sportmonks"))
-                           if real and args.send else None)
+                           if real and args.send else None,
+                           shadow=ShadowPickLog() if real and args.send else None)
     finally:
         client.close()
         if odds_client is not None:

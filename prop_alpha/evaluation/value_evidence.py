@@ -22,6 +22,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Final, Mapping, Sequence
 
 import numpy as np
@@ -231,3 +232,55 @@ def evidence(predictions: Sequence[Mapping[str, Any]], outcomes: Mapping[Selecti
                 [t for t in tips if t.market == market and t.line == float(line)], rng)
         report["tips"][market] = tip_evidence([t for t in tips if t.market == market], rng)
     return report
+
+
+def _utc(value: Any) -> datetime:
+    parsed = datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None:
+        raise ValueError(f"time {value!r} has no timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def shadow_closing_values(picks: Sequence[Mapping[str, Any]],
+                          closing: Sequence[Mapping[str, Any]]) -> list[tuple[int, float, float | None]]:
+    """Pure: (match, price value, de-vigged value or None) for each shadow pick (alerts/shadow_picks.py) with a closing price
+    of its own selection at its own bookmaker, captured after the pick and no later than kickoff (the latest such capture).
+    Price value = odds taken / closing odds - 1; de-vigged value = odds taken x de-vigged closing probability - 1, only when
+    both sides closed (PRD Gate 3's CLV). A shadow pick is not a tip: this measures whether the prices the model liked
+    shortened before kickoff, nothing about settlement."""
+    values: list[tuple[int, float, float | None]] = []
+    for pick in picks:
+        side, other = ("over", "under") if pick["side"] == "over" else ("under", "over")
+        key = (int(pick["fixture_id"]), int(pick["player_id"]), str(pick["market"]), float(pick["line"]))
+        recorded, kickoff = _utc(pick["recorded_at"]), _utc(pick["kickoff_at"])
+        candidates = [q for q in closing
+                      if (int(q["fixture_id"]), int(q["player_id"]), str(q["market"]), float(q["line"])) == key
+                      and str(q["book"]).strip().lower() == str(pick["book"]).strip().lower()
+                      and q.get(side) is not None and recorded < _utc(q["captured_at"]) <= kickoff]
+        if not candidates:
+            continue
+        close = max(candidates, key=lambda q: _utc(q["captured_at"]))
+        taken, closed = float(pick["odds"]), float(close[side])
+        devigged = (None if close.get(other) is None else
+                    taken * devig_two_way(closed, float(close[other]))[0] - 1.0)
+        values.append((key[0], taken / closed - 1.0, devigged))
+    return values
+
+
+def shadow_evidence(picks: Sequence[Mapping[str, Any]], closing: Sequence[Mapping[str, Any]],
+                    rng: np.random.Generator) -> dict[str, Any]:
+    """Pure: counts and the mean closing values of the shadow picks with fixture-clustered 90% intervals. Reported, never
+    judged: shadow picks are not paper bets, so no Gate 3 criterion applies."""
+    values = shadow_closing_values(picks, closing)
+    entry: dict[str, Any] = {"picks": len(picks), "with_close": len(values),
+                             "with_two_way_close": sum(1 for v in values if v[2] is not None),
+                             "fixtures": len({v[0] for v in values}), "judged": False}
+    if values:
+        fixtures, price = [v[0] for v in values], [v[1] for v in values]
+        entry["price_value"], entry["price_value_low"], entry["price_value_high"] = clustered_mean_interval(
+            fixtures, price, [1.0] * len(price), rng)
+    two_way = [(v[0], v[2]) for v in values if v[2] is not None]
+    if two_way:
+        entry["clv"], entry["clv_low"], entry["clv_high"] = clustered_mean_interval(
+            [f for f, _ in two_way], [float(c) for _, c in two_way], [1.0] * len(two_way), rng)
+    return entry

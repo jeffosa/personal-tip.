@@ -101,14 +101,26 @@ def contract_verified(book: str, market: str, void_rule: str, statistic: str,
     return contract is not None and contract.void_rule == void_rule and contract.statistic == statistic
 
 
+def split_unverified(directives: Sequence[StakingDirective], statistics: Mapping[str, str],
+                     contracts: Mapping[tuple[str, str], Contract] | None = None,
+                     ) -> tuple[list[StakingDirective], list[StakingDirective]]:
+    """Pure: (the directives that may be sent: a verified contract for their book and market on the count the model priced,
+    `statistics[market]`, and their void rule; the directives withheld), each in the given order."""
+    kept: list[StakingDirective] = []
+    withheld: list[StakingDirective] = []
+    for d in directives:
+        verified = d.market_type in statistics and contract_verified(
+            d.sportsbook, d.market_type, d.void_rule, statistics[d.market_type], contracts)
+        (kept if verified else withheld).append(d)
+    return kept, withheld
+
+
 def withhold_unverified(directives: Sequence[StakingDirective], statistics: Mapping[str, str],
                         contracts: Mapping[tuple[str, str], Contract] | None = None,
                         ) -> tuple[list[StakingDirective], int]:
-    """Pure: the directives that may be sent (a verified contract for their book and market on the count the model priced,
-    `statistics[market]`, and their void rule) and how many were withheld."""
-    kept = [d for d in directives if d.market_type in statistics
-            and contract_verified(d.sportsbook, d.market_type, d.void_rule, statistics[d.market_type], contracts)]
-    return kept, len(directives) - len(kept)
+    """Pure: the directives that may be sent (split_unverified) and how many were withheld."""
+    kept, withheld = split_unverified(directives, statistics, contracts)
+    return kept, len(withheld)
 
 
 def expected_result(statistic: str, void_rule: str, line: float, side: str, started: bool, minutes: int,

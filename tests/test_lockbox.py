@@ -190,3 +190,18 @@ def test_prospective_result_is_written_once(tmp_path: Path, monkeypatch: pytest.
     assert scorer.write_result_once(first) is None
     assert scorer.write_result_once(later) == first
     assert json.loads(result_file.read_text(encoding="utf-8")) == first
+
+
+# ---------------- coverage (closing-price review, 2026-10-25) ----------------
+def test_coverage_counts_lockbox_matches_their_pre_kickoff_predictions_and_closing_captures() -> None:
+    other = KICKOFF + timedelta(hours=3)
+    kicked_off = {5001: KICKOFF, 5002: KICKOFF, 5003: other, 19728228: KICKOFF,
+                  4000: PROTOCOL.start - timedelta(days=1)}  # an examined match and one before the start are not counted
+    records = [_record(), _record(fixture_id=5003, kickoff_at=other.isoformat(), logged_at=other.isoformat())]  # 5003: late
+    result = lockbox.coverage(kicked_off, records, closing_tried={5001, 5002, 4000}, closing_priced={5001})
+    assert result == lockbox.Coverage(matches=3, predicted=1, closing_tried=2, closing_priced=1)
+    line = lockbox.coverage_line(result)
+    assert line.startswith("Lockbox coverage (kickoff from 27 Oct): 3 matches kicked off; 1 with a prediction")
+    assert "WARNING: 2 missed: machine off, or the scan failed" in line and "closing capture ran for 2, prices for 1" in line
+    assert lockbox.coverage_line(lockbox.coverage({}, [], set(), set())).endswith("no lockbox match has kicked off yet")
+    assert "WARNING" not in lockbox.coverage_line(lockbox.Coverage(2, 2, 0, 0))

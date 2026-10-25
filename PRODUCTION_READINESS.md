@@ -11,7 +11,30 @@ settlements, closing prices) that code cannot produce. They take calendar time a
 
 Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not executed where it will run · **[N]** not built.
 
-## Status on 2026-10-25 (c): contract criteria enforced; still no evidence (read this first)
+## Status on 2026-10-25 (d): closing-price trail reviewed (read this first)
+
+**Still PAPER ONLY; no gate passed; real-price tips stay withheld.**
+
+**What the closing-price trail had produced:**
+- League One/Two: one capture, 10 Oct: 20 matches, 0 prices, because no bookmaker quotes those markets.
+- Pilot: never ran in a kickoff window. The 10-minute poll ran on only 1-29% of each day since 5 Oct, not at all on 17, 19,
+  20, 23 and 24 Oct, and all three tipped kickoffs (11 Oct 20:30, 12 Oct 22:30, 13 Oct 00:00 UTC) fell in gaps in the log.
+- The CLV formulas are the PRD's (`closing_line_value`: odds taken x de-vigged close - 1).
+
+| Weak point | Change [T] |
+|---|---|
+| With tips withheld, the pilot capture (tipped selections only) would never run again, and League One/Two picks were not kept | Withheld picks are kept unsent as **shadow picks** (`alerts/shadow_picks.py`); the pilot capture prices them; `scripts/value_evidence.py` reports their same-book closing value (price and de-vigged) with fixture-clustered 90% intervals; reported, never judged, not Gate 3 evidence |
+| CLV fell back to another bookmaker's close | Only the bet's own bookmaker's close is used (`ledger.closing_value`, `pilot_ledger.closing_price`), as the PRD's ledger writer specifies |
+| A match missed while the machine was off left no trace | The 4-hourly status report has a **lockbox coverage** line: matches kicked off, how many had a prediction logged before kickoff (missed ones flagged as WARNING), how many had a closing capture and prices (`lockbox.coverage`) |
+
+**Still open:**
+- **Uptime.** An always-on host is needed: Oracle chosen 2026-10-25, sign-up in progress; `deploy/VPS_SETUP.md` not yet run
+  [U]. Until then, keep the laptop on mains power and awake through matchdays.
+- **One-sided ladders.** The "k+" ladders can be de-vigged only at the 0.5 line, so PRD CLV is available only there; the
+  shadow report shows the price value beside it.
+- **Nothing to capture for League One/Two** until a bookmaker quotes those markets (odds probe, 31 Oct).
+
+## Status on 2026-10-25 (c): contract criteria enforced; still no evidence
 
 **Still PAPER ONLY; no go-live gate passed; real-price tips stay withheld.**
 - Brazil Serie A tips: every pilot tip is a paper bet (`pilot_ledger.record_tips`) and carries the PILOT label. No execution

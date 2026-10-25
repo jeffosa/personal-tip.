@@ -274,3 +274,25 @@ def test_messages_name_the_data_vendor_the_settlement_actually_reads() -> None:
 
     for text in (status.STATUS_NOTE, replies.AUTO_BASIS):
         assert status.DATA_VENDOR_NAME in text and "TheStatsAPI" not in text
+
+
+def test_the_report_counts_lockbox_matches_missed_by_the_prediction_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Closing-price review 2026-10-25: a lockbox match the machine was off for leaves no prediction and no closing capture;
+    the coverage line counts it from the database's stored matches."""
+    from dataclasses import replace
+
+    from prop_alpha.evaluation.lockbox import PROTOCOL
+
+    kickoff = PROTOCOL.start + timedelta(days=1, hours=19)
+    snapshot = replace(SNAPSHOT, lockbox_kickoffs=((5001, kickoff), (5002, kickoff)))
+    monkeypatch.setattr(status, "read_snapshot", lambda dsn: snapshot)
+    (tmp_path / "predictions.jsonl").write_text(json.dumps({
+        "logged_at": (kickoff - timedelta(hours=2)).isoformat(), "window_start": (kickoff - timedelta(hours=3)).isoformat(),
+        "kickoff_at": kickoff.isoformat(), "fixture_id": 5001, "lineup_basis": "estimated",
+        "player_id": 7, "market": "tackles", "line": 1.5, "p_win": 0.4, "p_lose": 0.5, "p_void": 0.1,
+        "digest": PROTOCOL.pricing_digest, "data_vendor": "sportmonks"}) + "\n", encoding="utf-8")
+    (tmp_path / "closing_captured.json").write_text("[5001]", encoding="utf-8")
+    lines = status.database_section("postgresql://unused", tmp_path)
+    assert lines[-1] == ("Lockbox coverage (kickoff from 27 Oct): 2 matches kicked off; 1 with a prediction logged before "
+                         "kickoff (WARNING: 1 missed: machine off, or the scan failed); closing capture ran for 1, prices for 0")
+    assert not any(line.startswith("Lockbox coverage") for line in status.database_section("postgresql://unused"))

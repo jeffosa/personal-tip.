@@ -73,6 +73,8 @@ STATE_FILES: Final[tuple[str, ...]] = (
     "pilot_sent_alerts.jsonl", "pilot_alert_messages.jsonl", "pilot_alert_deliveries.jsonl", "pilot_paper_bets.jsonl",
     "pilot_tips.jsonl", "pilot_predictions.jsonl", "pilot_closing_quotes.jsonl", "pilot_closing_handled.json",
     "pilot_refused.json", "pilot_last_scan.json",
+    # The withheld picks kept unsent for their closing-line value (alerts/shadow_picks.py, 2026-10-25).
+    "shadow_picks.jsonl", "pilot_shadow_picks.jsonl",
 )
 # Folders copied whole: the raw bookmaker responses are the evidence for closing-line analysis (PRD Gate 3).
 # and the pre-match analyses the maintainer asked to keep (2026-10-15: the model's prices for upcoming matches, as CSV files

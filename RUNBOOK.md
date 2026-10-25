@@ -149,6 +149,11 @@ npx --yes pyright@1.1.406
   predictions, 0 own-book settlements, 0 closing prices. Run it after each matchday; it makes no value claim below the Gate 3 sample.
 - **Prospective Gate 2 lockbox:** the reviewed protocol starts 2026-10-27 00:00 UTC on Sportmonks data. The 24 examined 2026-10-10 matches and all 2,715 predictions from them are excluded. The scorer uses only eligible predictions logged before kickoff and captures outcomes once after the revision grace. No new eligible predictions exist yet; Gate 2 needs at least 500 scored predictions per line, and its market benchmark and lineup requirements remain open. See `LOCKBOX_PROTOCOL.md`.
 - **No tackles or fouls price at a League One/Two bookmaker has been seen**, so no League One/Two alert, closing price or paper bet exists.
+- **Uptime decides the evidence** (closing-price review, 2026-10-25): predictions need a scan in the 4 hours before
+  kickoff, and closing prices need the poll 0-15 minutes before it. The status report's "Lockbox coverage" line counts
+  the lockbox matches that kicked off without a logged prediction (WARNING) and those with a closing capture. Withheld
+  real-price picks are kept as shadow picks (`shadow_picks.jsonl`, `pilot_shadow_picks.jsonl`); `scripts/value_evidence.py`
+  reports their same-book closing value.
 - **Vendor and leagues:** current scheduled paths use Sportmonks with `prop_alpha` (League One/Two) and `prop_alpha_pilot` (Brazil Serie A, Scottish Premiership, English Championship). The Starter trial is recorded through 2026-11-08; confirm paid coverage and cost before relying on ingestion after it.
 - **Pilot leagues are unvalidated:** Brazil Serie A is in `TIP_LEAGUES`, but its tips are withheld by the contract gate (above); the settlement definition and model-vs-market evidence remain unresolved. Scottish leagues are priced but never tipped. Do not treat any pilot result as validated betting performance.
 - **Never run:** migration 002 on a real v2 database; the live T-60 line-up path; the 14-branch pruning of the backup repository.

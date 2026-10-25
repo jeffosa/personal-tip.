@@ -117,3 +117,34 @@ def test_evidence_scores_eligible_predictions_against_book_outcomes_by_selection
     assert split["tips"]["tackles over 1.5"]["roi"] == pytest.approx(15.0 / 60.0) and not split["tips"]["tackles"]["value_shown"]
     with pytest.raises(ValueError):
         value_evidence.over_probability({"p_win": 0.0, "p_lose": 0.0})
+
+
+# ---------------- shadow picks' closing value (closing-price review, 2026-10-25) ----------------
+def _pick(fixture_id: int = 1, player_id: int = 7, odds: float = 3.0, book: str = "bet365") -> dict[str, Any]:
+    return {"recorded_at": "2026-11-01T12:00:00+00:00", "kickoff_at": "2026-11-01T15:00:00+00:00", "fixture_id": fixture_id,
+            "player_id": player_id, "market": "tackles", "line": 1.5, "side": "over", "book": book, "odds": odds}
+
+
+def _close(over: float, under: float | None, at: str, book: str = "bet365", player_id: int = 7) -> dict[str, Any]:
+    return {"fixture_id": 1, "player_id": player_id, "market": "tackles", "line": 1.5, "book": book, "over": over,
+            "under": under, "captured_at": at}
+
+
+def test_a_shadow_picks_closing_value_uses_its_own_books_last_close_before_kickoff() -> None:
+    closing = [
+        _close(2.6, None, "2026-11-01T14:40:00+00:00"),
+        _close(2.5, 1.5, "2026-11-01T14:50:00+00:00"),            # the last close before kickoff: used
+        _close(1.9, 1.9, "2026-11-01T15:05:00+00:00"),            # after kickoff: never
+        _close(2.0, 1.8, "2026-11-01T14:55:00+00:00", book="betway"),  # another book: never
+        _close(9.0, 1.1, "2026-11-01T11:00:00+00:00"),            # before the pick was made: never
+    ]
+    [(fixture, price, clv)] = value_evidence.shadow_closing_values([_pick()], closing)
+    assert fixture == 1 and price == pytest.approx(3.0 / 2.5 - 1.0)
+    assert clv == pytest.approx(3.0 * (1 / 2.5) / (1 / 2.5 + 1 / 1.5) - 1.0)
+    assert value_evidence.shadow_closing_values([_pick(book="skybet")], closing) == []
+    one_sided = value_evidence.shadow_closing_values([_pick()], closing[:1])
+    assert one_sided == [(1, pytest.approx(3.0 / 2.6 - 1.0), None)]
+    entry = value_evidence.shadow_evidence([_pick(), _pick(player_id=8)], closing, np.random.default_rng(1))
+    assert (entry["picks"], entry["with_close"], entry["with_two_way_close"], entry["judged"]) == (2, 1, 1, False)
+    assert entry["price_value"] == pytest.approx(0.2) and entry["clv"] == pytest.approx(clv)
+    assert "clv" not in value_evidence.shadow_evidence([_pick()], closing[:1], np.random.default_rng(1))
