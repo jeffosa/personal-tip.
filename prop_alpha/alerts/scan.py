@@ -43,7 +43,7 @@ from prop_alpha.alerts.closing import save_scan_fixtures
 from prop_alpha.alerts.fx import BOOK_CURRENCY, SUPPORTED_CURRENCIES, ExchangeRate, bankroll_currency, book_to_bankroll
 from prop_alpha.alerts.fx import identity as fx_identity
 from prop_alpha.alerts.ledger import PlacedBetStore, combined_exposure
-from prop_alpha.alerts.market_contract import WITHHELD_NOTE, contract_status, withhold_unverified
+from prop_alpha.alerts.market_contract import MODEL_STATISTICS, WITHHELD_NOTE, contract_status, withhold_unverified
 from prop_alpha.alerts.predictions import PredictionLog
 from prop_alpha.alerts.replies import USAGE, AlertItem
 from prop_alpha.alerts.telegram import (
@@ -675,7 +675,7 @@ def run_scan(
     combined.directives.sort(key=lambda d: (-d.ev_per_unit, d.fixture_id, d.player_id, d.market_type, d.line_value))
     if odds == "oddspapi":
         # No tip on a real price without a verified settlement contract (market_contract, audit 2026-10-25).
-        combined.directives, summary.withheld = withhold_unverified(combined.directives)
+        combined.directives, summary.withheld = withhold_unverified(combined.directives, MODEL_STATISTICS)
     if notifier is not None:
         summary.alerts_sent, _ = notifier.notify_digest(
             combined, all_projections, bankroll_currency=currency, label=label, descriptions=all_descriptions,

@@ -105,7 +105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             not_tips["no own-book won/lost settlement"] += 1
         else:
             value = ledger.closing_value(bet, quotes)
-            tips.append(value_evidence.Tip(bet.fixture_id, bet.market, bet.stake, profit(bet, settlement),
+            tips.append(value_evidence.Tip(bet.fixture_id, bet.market, bet.line, bet.stake, profit(bet, settlement),
                                            None if value is None else value.clv))
     if pilot_settled:
         not_tips["pilot paper tip (pilot matches are not evidence)"] += len(pilot_settled)

@@ -63,7 +63,7 @@ from prop_alpha.alerts import pilot_ledger, scan
 from prop_alpha.alerts.fx import BOOK_CURRENCY, SUPPORTED_CURRENCIES, ExchangeRate, bankroll_currency, book_to_bankroll
 from prop_alpha.alerts.fx import identity as fx_identity
 from prop_alpha.alerts.ledger import PlacedBetStore
-from prop_alpha.alerts.market_contract import WITHHELD_NOTE, contract_status, withhold_unverified
+from prop_alpha.alerts.market_contract import MODEL_STATISTICS, WITHHELD_NOTE, contract_status, withhold_unverified
 from prop_alpha.alerts.predictions import PredictionLog
 from prop_alpha.alerts.telegram import (
     PAPER_LABEL,
@@ -160,6 +160,9 @@ MARKET_CHECK_MARGIN: Final[float | None] = 0.10
 # (alerts/market_contract.py) stops every real-price tip until a contract is verified; this setting still decides which
 # leagues' prices go through the allocator and screen, so the summary counts what would have been tipped.
 TIP_LEAGUES: Final[frozenset[str]] = frozenset({"Brazil Serie A"})
+# The counts the pilot prices, per market: a bookmaker contract must settle on these for a pilot tip to be sent
+# (market_contract.withhold_unverified).
+PILOT_STATISTICS: Final[Mapping[str, str]] = {**MODEL_STATISTICS, "tackles": pilot_ledger.PILOT_TACKLES_SQL}
 BOOKMAKERS_ENV: Final[str] = "LADDER_BOOKMAKERS"
 # Brazil Serie A: Betway lists the tackles and fouls ladders for every fixture seen on 2026-10-11 (7 of 7), bet365 for 4 of 13.
 DEFAULT_BOOKMAKERS: Final[tuple[str, ...]] = ("bet365", "betway")
@@ -670,7 +673,7 @@ def _scan_slate(
     combined.directives.sort(key=lambda d: (-d.ev_per_unit, d.fixture_id, d.player_id, d.market_type, d.line_value))
     if odds == "oddspapi":
         # No tip, paper or not, on a real price without a verified settlement contract (market_contract, audit 2026-10-25).
-        combined.directives, summary.withheld = withhold_unverified(combined.directives)
+        combined.directives, summary.withheld = withhold_unverified(combined.directives, PILOT_STATISTICS)
     if notifier is not None:
         fixtures_by_id = {f.fixture_id: f for f in fixtures}
 

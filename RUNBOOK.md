@@ -135,7 +135,14 @@ npx --yes pyright@1.1.406
   (Opta), tackle and foul definitions and non-starter void rule are leads from search summaries (help.bet365.com cannot be read from
   here); Betway's rules were not found. `alerts/market_contract.VERIFIED_CONTRACTS` is empty, so both scans withhold every real-price
   tip ("Tips withheld: N ..." in the scan summary) while still pricing, screening and logging. A contract is added only by the
-  maintainer, with the evidence of `MARKET_CONTRACT.md` section 10, in a PR. Of 10 settled paper tips, 0 have a bet365 result; the 5
+  maintainer, with the evidence of `MARKET_CONTRACT.md` section 10, in a PR.
+  The evidence lives in `contract_evidence/<book>_<market>.json`, and CI fails a listed contract whose evidence misses a
+  criterion. `python scripts/contract_evidence.py --book bet365 --market tackles [--write]` shows progress: on 2026-10-25,
+  0 same-book examples and no first-hand rule for bet365 or Betway. Record a bookmaker's own result with the book named
+  (`result <tip> won bet365`, or `pilot_ledger --record <tip> won --book bet365`); another book's result never counts.
+  Betway's own rules document (v42, 10/02/2022) is recorded in `contract_evidence/betway_*.json`. It voids players who do
+  not start, while the scans price "void only if he does not play", so Betway tips stay withheld even with full evidence
+  until the maintainer decides how Betway quotes are priced (`MARKET_CONTRACT.md` section 12). Of 10 settled paper tips, 0 have a bet365 result; the 5
   SportyBet results are reported as another book's (`pilot_ledger --reconcile`: "OTHER BOOK"), never as agreement.
 - **Model value not shown:** `python scripts/value_evidence.py` (read-only; writes `.prop_alpha_state/analysis/value_evidence_<date>.json`)
   reports settlement agreement, eligible predictions, bookmaker-settled outcomes, closing prices, ROI and CLV. On 2026-10-25: 0 eligible

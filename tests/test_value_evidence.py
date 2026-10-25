@@ -88,17 +88,17 @@ def test_a_line_gets_no_metric_below_the_floor_and_no_judgement_below_the_gate_s
 
 def test_tips_show_value_only_on_the_gate3_sample_with_the_clv_lower_bound_above_zero() -> None:
     rng = np.random.default_rng(11)
-    small = value_evidence.tip_evidence([Tip(1, "tackles", 10.0, 15.0, 0.08)] * 20, rng)
+    small = value_evidence.tip_evidence([Tip(1, "tackles", 1.5, 10.0, 15.0, 0.08)] * 20, rng)
     assert small["value_shown"] is False and small["note"].startswith("no value claim: 20 settled tips in 1 fixtures")
     noise = np.random.default_rng(2)
-    good = [Tip(i % 80, "tackles", 10.0, float(noise.choice([15.0, -10.0])), float(0.05 + noise.normal(0, 0.02)))
+    good = [Tip(i % 80, "tackles", 1.5, 10.0, float(noise.choice([15.0, -10.0])), float(0.05 + noise.normal(0, 0.02)))
             for i in range(320)]
     entry = value_evidence.tip_evidence(good, rng)
     assert entry["gate3_sample"] and entry["clv_low"] > 0.0 and entry["value_shown"] is True
-    bad = [Tip(t.fixture_id, t.market, t.stake, t.profit, -0.05) for t in good]
+    bad = [Tip(t.fixture_id, t.market, t.line, t.stake, t.profit, -0.05) for t in good]
     assert value_evidence.tip_evidence(bad, rng)["value_shown"] is False
     with pytest.raises(ValueError):
-        Tip(1, "tackles", 0.0, 1.0, None)
+        Tip(1, "tackles", 1.5, 0.0, 1.0, None)
 
 
 def test_evidence_scores_eligible_predictions_against_book_outcomes_by_selection() -> None:
@@ -111,5 +111,9 @@ def test_evidence_scores_eligible_predictions_against_book_outcomes_by_selection
     assert (line["eligible_predictions"], line["n"], line["n_fixtures"]) == (80, 40, 40)
     assert line["mean_predicted"] == pytest.approx(0.4) and line["observed_rate"] == pytest.approx(0.5)
     assert report["lines"]["tackles over 0.5"]["n"] == 0 and report["tips"]["tackles"]["n"] == 0
+    tips = [Tip(f, "tackles", 1.5, 10.0, 15.0 if f % 2 else -10.0, None) for f in range(6)] + [Tip(9, "tackles", 0.5, 10.0, 4.0, None)]
+    split = value_evidence.evidence(predictions, outcomes, {}, tips, {"tackles": (0.5, 1.5)}, np.random.default_rng(5))
+    assert [split["tips"][key]["n"] for key in ("tackles over 0.5", "tackles over 1.5", "tackles")] == [1, 6, 7]
+    assert split["tips"]["tackles over 1.5"]["roi"] == pytest.approx(15.0 / 60.0) and not split["tips"]["tackles"]["value_shown"]
     with pytest.raises(ValueError):
         value_evidence.over_probability({"p_win": 0.0, "p_lose": 0.0})

@@ -70,6 +70,7 @@ class Tip:
 
     fixture_id: int
     market: str
+    line: float
     stake: float
     profit: float
     clv: float | None
@@ -226,5 +227,7 @@ def evidence(predictions: Sequence[Mapping[str, Any]], outcomes: Mapping[Selecti
             close = [closing.get(key) for key, _ in keyed if key in outcomes]
             report["lines"][f"{market} over {line:g}"] = {"eligible_predictions": len(chosen),
                                                           **line_evidence(rows, close, rng)}
+            report["tips"][f"{market} over {line:g}"] = tip_evidence(
+                [t for t in tips if t.market == market and t.line == float(line)], rng)
         report["tips"][market] = tip_evidence([t for t in tips if t.market == market], rng)
     return report
