@@ -1,0 +1,230 @@
+"""Model-value evidence (audit 2026-10-25): what the logged predictions and the tips are worth, measured only on rows that
+can be evidence.
+
+Rows that count:
+* predictions: lockbox-eligible lines only (evaluation/lockbox.py: the frozen digest, Sportmonks, logged before kickoff,
+  kickoff from the protocol start, never an examined match, earliest log of a selection), never a re-price;
+* outcomes: the result a bookmaker settled for that selection, read off the book by the maintainer and recorded against
+  the tip of the same book (ledger `settled`, `result`, `pilot_ledger --record --book`); another book's result, a
+  provisional automatic result and a void are not outcomes here;
+* closing prices: two-way closing prices captured before kickoff (alerts/closing.py), de-vigged, for the market benchmark
+  and closing-line value (PRD Gate 3: CLV = odds taken x de-vigged closing probability - 1).
+
+No threshold below is tuned on these rows; the sample floors are the PRD's (Gate 2: 500 per line and 200 for the
+benchmark; Gate 3: 300 settled bets across 60 fixtures), and below them a metric is reported as not judged, never as a
+pass. ROI and CLV intervals resample whole fixtures (10,000 resamples, the caller's generator).
+
+Pure: no I/O, no clock; randomness only through the `rng` argument.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, Final, Mapping, Sequence
+
+import numpy as np
+
+from prop_alpha.alerts.replies import same_book
+from prop_alpha.evaluation.backtest import brier_score
+from prop_alpha.evaluation.gate2 import (
+    BOOTSTRAP_RESAMPLES,
+    INTERVAL_PERCENTILES,
+    MIN_BENCHMARK_PREDICTIONS,
+    MIN_PREDICTIONS,
+    calibration_fit,
+    clustered_skill_interval,
+    market_benchmark,
+)
+from prop_alpha.scanner.market_scanner import devig_two_way
+
+# PRD Gate 3 criterion 1.
+MIN_SETTLED_BETS: Final[int] = 300
+MIN_BET_FIXTURES: Final[int] = 60
+# Below this many rows with an outcome no metric is computed at all (a Brier score of a handful of rows is noise).
+MIN_ROWS_FOR_METRICS: Final[int] = 30
+SelectionKey = tuple[int, int, str, float]
+
+
+@dataclass(frozen=True)
+class BookResult:
+    """A bookmaker's settlement of one selection, from the book the tip was priced at: `over_won` is 1 when the Over won,
+    0 when it lost (a push or a void is not an outcome and is never stored here)."""
+
+    fixture_id: int
+    player_id: int
+    market: str
+    line: float
+    book: str
+    over_won: int
+
+    def __post_init__(self) -> None:
+        if self.over_won not in (0, 1) or not self.book:
+            raise ValueError("a book result is a named bookmaker's win (1) or loss (0) of the Over")
+
+
+@dataclass(frozen=True)
+class Tip:
+    """One tip with its price and a bookmaker's settlement from the same book: `profit` per `stake` (0 for a void)."""
+
+    fixture_id: int
+    market: str
+    stake: float
+    profit: float
+    clv: float | None
+
+    def __post_init__(self) -> None:
+        if not (math.isfinite(self.stake) and self.stake > 0.0 and math.isfinite(self.profit)):
+            raise ValueError("a tip needs a positive stake and a finite profit")
+        if self.clv is not None and not math.isfinite(self.clv):
+            raise ValueError("closing-line value must be finite")
+
+
+def book_results(settled: Sequence[tuple[Any, Any]]) -> tuple[dict[SelectionKey, int], dict[str, int]]:
+    """Pure: the Over outcome per selection from (PlacedBet, Settlement) pairs, and how many pairs were left out and why.
+    Only a manual settlement from the bet's own book counts (replies.same_book); conflicting results for one selection
+    leave it out."""
+    outcomes: dict[SelectionKey, set[int]] = defaultdict(set)
+    left_out: dict[str, int] = defaultdict(int)
+    for bet, settlement in settled:
+        if settlement.source != "manual":
+            left_out["automatic result (assumed rules, provisional)"] += 1
+        elif not same_book(bet.book, settlement.book):
+            left_out["another bookmaker's result"] += 1
+        elif settlement.result == "void":
+            left_out["void (not an outcome)"] += 1
+        else:
+            won = settlement.result == "won"
+            outcomes[(int(bet.fixture_id), int(bet.player_id), str(bet.market), float(bet.line))].add(
+                int(won if bet.side == "over" else not won))
+    result = {key: next(iter(values)) for key, values in outcomes.items() if len(values) == 1}
+    conflicting = sum(1 for values in outcomes.values() if len(values) > 1)
+    if conflicting:
+        left_out["conflicting results for one selection"] = conflicting
+    return result, dict(left_out)
+
+
+def clustered_mean_interval(fixtures: Sequence[int], values: Sequence[float], weights: Sequence[float],
+                            rng: np.random.Generator, resamples: int = BOOTSTRAP_RESAMPLES) -> tuple[float, float, float]:
+    """Pure: the weighted mean sum(values) / sum(weights) and its 90% interval, resampling whole fixtures. For ROI the values
+    are profits and the weights stakes; for mean CLV the weights are ones."""
+    v, w = np.asarray(values, dtype=np.float64), np.asarray(weights, dtype=np.float64)
+    ids = np.asarray(fixtures)
+    if not (v.shape == w.shape == ids.shape) or v.size == 0 or not np.isfinite(v).all() or not (w > 0).all():
+        raise ValueError("one fixture, finite value and positive weight per row, at least one row")
+    _, cluster = np.unique(ids, return_inverse=True)
+    n = int(cluster.max()) + 1
+    num, den = np.bincount(cluster, weights=v, minlength=n), np.bincount(cluster, weights=w, minlength=n)
+    counts = rng.multinomial(n, np.full(n, 1.0 / n), size=resamples).astype(np.float64)
+    means = (counts @ num) / (counts @ den)
+    low, high = np.percentile(means, INTERVAL_PERCENTILES)
+    return float(v.sum() / w.sum()), float(low), float(high)
+
+
+def required_clusters(fixtures: Sequence[int], values: Sequence[float]) -> float:
+    """Pure: PRD Gate 3 criterion 3, n >= (1.645 sigma_c / mean)^2 effective clusters, with sigma_c the standard deviation of
+    the per-fixture mean; inf when the mean is not positive or a single fixture gives no spread."""
+    per: dict[int, list[float]] = defaultdict(list)
+    for fixture, value in zip(fixtures, values):
+        per[int(fixture)].append(float(value))
+    means = np.array([float(np.mean(v)) for v in per.values()])
+    mean = float(np.mean(values)) if len(values) else math.nan
+    if len(means) < 2 or not mean > 0.0:
+        return math.inf
+    return float((1.645 * float(np.std(means, ddof=1)) / mean) ** 2)
+
+
+def line_evidence(rows: Sequence[tuple[int, float, int]], closing: Sequence[float | None],
+                  rng: np.random.Generator) -> dict[str, Any]:
+    """Pure: the metrics of one market and line from (fixture, model probability, Over outcome) rows and each row's
+    de-vigged closing Over probability (None when no two-way closing price was captured)."""
+    if len(rows) != len(closing):
+        raise ValueError("one closing entry per row")
+    n = len(rows)
+    entry: dict[str, Any] = {"n": n, "n_fixtures": len({r[0] for r in rows}),
+                             "n_closing": sum(1 for c in closing if c is not None), "judged": False}
+    if n < MIN_ROWS_FOR_METRICS:
+        entry["note"] = f"{n} rows with a bookmaker-settled outcome; no metric below {MIN_ROWS_FOR_METRICS}"
+        return entry
+    fixtures, p, y = (list(column) for column in zip(*rows))
+    base = float(np.mean(y))
+    entry.update(mean_predicted=float(np.mean(p)), observed_rate=base, brier=brier_score(p, y))
+    if 0.0 < base < 1.0:
+        entry["brier_skill"] = 1.0 - entry["brier"] / (base * (1.0 - base))
+        entry["brier_skill_90"] = clustered_skill_interval(fixtures, p, y, rng)
+        fit = calibration_fit(p, y)
+        entry.update(calibration_slope=fit.slope, calibration_intercept=fit.intercept, calibration_note=fit.note)
+    with_close = [(c, pi, yi) for c, pi, yi in zip(closing, p, y) if c is not None]
+    if with_close:
+        q, pm, ym = (list(column) for column in zip(*with_close))
+        entry.update(brier_model_on_closing_rows=brier_score(pm, ym), brier_close=brier_score(q, ym),
+                     mean_close=float(np.mean(q)))
+        if len(with_close) >= MIN_BENCHMARK_PREDICTIONS:
+            bench = market_benchmark(q, pm, ym)
+            entry["market_benchmark"] = {"n": bench.n, "b_model": bench.b_model, "p_value": bench.p_value,
+                                         "passed": bench.passed, "note": bench.note}
+    entry["judged"] = n >= MIN_PREDICTIONS
+    if not entry["judged"]:
+        entry["note"] = f"{n} of the {MIN_PREDICTIONS} rows Gate 2 needs per line: reported, not judged"
+    return entry
+
+
+def tip_evidence(tips: Sequence[Tip], rng: np.random.Generator) -> dict[str, Any]:
+    """Pure: ROI and closing-line value of tips settled by their own book, with fixture-clustered 90% intervals and the
+    Gate 3 sample and power checks. Never a value claim below the Gate 3 sample."""
+    entry: dict[str, Any] = {"n": len(tips), "n_fixtures": len({t.fixture_id for t in tips}),
+                             "n_clv": sum(1 for t in tips if t.clv is not None)}
+    enough = entry["n"] >= MIN_SETTLED_BETS and entry["n_fixtures"] >= MIN_BET_FIXTURES
+    if tips:
+        entry["roi"], entry["roi_low"], entry["roi_high"] = clustered_mean_interval(
+            [t.fixture_id for t in tips], [t.profit for t in tips], [t.stake for t in tips], rng)
+    priced = [t for t in tips if t.clv is not None]
+    if priced:
+        fixtures, values = [t.fixture_id for t in priced], [float(t.clv) for t in priced if t.clv is not None]
+        entry["clv"], entry["clv_low"], entry["clv_high"] = clustered_mean_interval(
+            fixtures, values, [1.0] * len(values), rng)
+        entry["clv_required_fixtures"] = required_clusters(fixtures, values)
+    entry["gate3_sample"] = enough
+    entry["value_shown"] = bool(enough and priced and entry["clv_low"] > 0.0
+                                and entry["clv_required_fixtures"] <= len({t.fixture_id for t in priced}))
+    entry["note"] = ("CLV lower bound above 0 on the Gate 3 sample" if entry["value_shown"] else
+                     f"no value claim: {entry['n']} settled tips in {entry['n_fixtures']} fixtures (Gate 3 needs "
+                     f"{MIN_SETTLED_BETS} in {MIN_BET_FIXTURES}), {entry['n_clv']} with a two-way closing price")
+    return entry
+
+
+def closing_over(quotes: Sequence[Mapping[str, Any]]) -> dict[SelectionKey, float]:
+    """Pure: the de-vigged closing Over probability per (match, player, market, line), from the latest two-way capture (a
+    one-sided ladder price cannot be de-vigged and is left out)."""
+    latest: dict[SelectionKey, Mapping[str, Any]] = {}
+    for quote in sorted(quotes, key=lambda q: str(q["captured_at"])):
+        if quote.get("over") is not None and quote.get("under") is not None:
+            latest[(int(quote["fixture_id"]), int(quote["player_id"]), str(quote["market"]), float(quote["line"]))] = quote
+    return {key: devig_two_way(float(q["over"]), float(q["under"]))[0] for key, q in latest.items()}
+
+
+def over_probability(record: Mapping[str, Any]) -> float:
+    """Pure: the logged Over probability given the bet settles (the player plays): p_win / (p_win + p_lose)."""
+    settled = float(record["p_win"]) + float(record["p_lose"])
+    if not settled > 0.0:
+        raise ValueError("a prediction that never settles has no Over probability")
+    return float(record["p_win"]) / settled
+
+
+def evidence(predictions: Sequence[Mapping[str, Any]], outcomes: Mapping[SelectionKey, int],
+             closing: Mapping[SelectionKey, float], tips: Sequence[Tip], lines: Mapping[str, Sequence[float]],
+             rng: np.random.Generator) -> dict[str, Any]:
+    """Pure: per market and line, the predictions' metrics against bookmaker-settled outcomes and closing prices, and per
+    market the tips' ROI and CLV. `predictions` must already be the eligible ones (lockbox.eligible)."""
+    report: dict[str, Any] = {"lines": {}, "tips": {}}
+    for market, market_lines in lines.items():
+        for line in market_lines:
+            chosen = [r for r in predictions if str(r["market"]) == market and float(r["line"]) == float(line)]
+            keyed = [((int(r["fixture_id"]), int(r["player_id"]), market, float(line)), r) for r in chosen]
+            rows = [(key[0], over_probability(r), outcomes[key]) for key, r in keyed if key in outcomes]
+            close = [closing.get(key) for key, _ in keyed if key in outcomes]
+            report["lines"][f"{market} over {line:g}"] = {"eligible_predictions": len(chosen),
+                                                          **line_evidence(rows, close, rng)}
+        report["tips"][market] = tip_evidence([t for t in tips if t.market == market], rng)
+    return report

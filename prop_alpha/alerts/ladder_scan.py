@@ -19,8 +19,10 @@ It is the League One/Two scan (alerts/scan.py) with these differences, and nothi
   league's own fit on Sportmonks data, 2026-10-08 to 2026-10-21); Scottish Championship tackles are not priced (UNPRICED_MARKETS). These are NOT the frozen League One/Two settings and are not frozen themselves: the model_freeze
   fingerprint and the League One/Two lockbox are untouched, and no pilot lockbox exists.
 * Tips: only leagues in TIP_LEAGUES can produce a tip: Brazil Serie A (turned on by the maintainer on 2026-10-11, paused on
-  2026-10-12 while the gap between the model and the bookmakers' prices was diagnosed, resumed on 2026-10-15). Every pilot
-  league is scanned, priced and logged for evaluation; the Scottish leagues are never tipped.
+  2026-10-12 while the gap between the model and the bookmakers' prices was diagnosed, resumed on 2026-10-15). Since
+  2026-10-25 a real-price tip is also withheld unless its bookmaker's market has a verified settlement contract
+  (alerts/market_contract.py; none has), so none is sent. Every pilot league is scanned, priced and logged for evaluation; the
+  Scottish leagues are never tipped.
 * Odds are ladders (oddspapi.ladder_prices) or over/under lines (oddspapi.prop_prices): both parsers read the same
   reply. A "k+" step is the Over of line k - 0.5 on its own; the "0" step is the Under of 0.5. They go through the same
   quote building, allocator and high-value screen as the other scan.
@@ -61,6 +63,7 @@ from prop_alpha.alerts import pilot_ledger, scan
 from prop_alpha.alerts.fx import BOOK_CURRENCY, SUPPORTED_CURRENCIES, ExchangeRate, bankroll_currency, book_to_bankroll
 from prop_alpha.alerts.fx import identity as fx_identity
 from prop_alpha.alerts.ledger import PlacedBetStore
+from prop_alpha.alerts.market_contract import WITHHELD_NOTE, contract_status, withhold_unverified
 from prop_alpha.alerts.predictions import PredictionLog
 from prop_alpha.alerts.telegram import (
     PAPER_LABEL,
@@ -153,6 +156,9 @@ MARKET_CHECK_MARGIN: Final[float | None] = 0.10
 # prices the plain tackles count that SportyBet's settlements support (MARKET_CONTRACT.md 2e), the PLAUSIBLE_EDGE_CAP guard
 # leaves out implausible edges, and Brazil's k was refitted on TheStatsAPI data. Still open: bet365's settlement rule, and the
 # mean expected profit of about -37% the archived bet365 ladders leave on this count. Tips stay PAPER bets (pilot_ledger).
+# WITHHELD since 2026-10-25 (audit: the settled statistic and void rule are not established): the contract gate
+# (alerts/market_contract.py) stops every real-price tip until a contract is verified; this setting still decides which
+# leagues' prices go through the allocator and screen, so the summary counts what would have been tipped.
 TIP_LEAGUES: Final[frozenset[str]] = frozenset({"Brazil Serie A"})
 BOOKMAKERS_ENV: Final[str] = "LADDER_BOOKMAKERS"
 # Brazil Serie A: Betway lists the tackles and fouls ladders for every fixture seen on 2026-10-11 (7 of 7), bet365 for 4 of 13.
@@ -466,13 +472,15 @@ def summary_text(summary: scan.ScanSummary, label: str) -> str:
         if summary.unquoted_matches:
             lines.append(f"Tip-league matches with no bookmaker price (nothing to qualify against): {summary.unquoted_matches}")
     lines += summary.odds_notes
+    if summary.withheld:
+        lines.append(WITHHELD_NOTE.format(count=summary.withheld))
     if summary.fixtures and summary.tip_override is not None:
         lines.append(f"Tipped FOR THIS RUN ONLY (maintainer's choice): {', '.join(sorted(ALERT_MARKETS))} in "
                      f"{', '.join(summary.tip_override) or 'nothing'}; the standing setting is "
                      + (", ".join(sorted(TIP_LEAGUES)) if TIP_LEAGUES else "paused"))
     elif summary.fixtures:
-        lines.append(f"Tipped: {', '.join(sorted(ALERT_MARKETS))} in {', '.join(sorted(TIP_LEAGUES))} only (fouls are priced, never tipped)"
-                     if TIP_LEAGUES else "Tipped: nothing (tipping paused by the maintainer on 2026-10-12); every pilot league is "
+        lines.append(f"Tipped: {', '.join(sorted(ALERT_MARKETS))} in {', '.join(sorted(TIP_LEAGUES))} only (fouls are priced, never tipped); "
+                     + contract_status() if TIP_LEAGUES else "Tipped: nothing (tipping paused by the maintainer on 2026-10-12); every pilot league is "
                      "priced and logged for evaluation")
     lines += [f"Could not price {failure}" for failure in summary.failures]
     lines.append(PAPER_LABEL)
@@ -660,6 +668,9 @@ def _scan_slate(
         summary.odds_notes.append(f"Prices left out as implausible (the model above the book by more than "
                                   f"{PLAUSIBLE_EDGE_CAP:.0%} if the player plays): {sum(implausible)}")
     combined.directives.sort(key=lambda d: (-d.ev_per_unit, d.fixture_id, d.player_id, d.market_type, d.line_value))
+    if odds == "oddspapi":
+        # No tip, paper or not, on a real price without a verified settlement contract (market_contract, audit 2026-10-25).
+        combined.directives, summary.withheld = withhold_unverified(combined.directives)
     if notifier is not None:
         fixtures_by_id = {f.fixture_id: f for f in fixtures}
 

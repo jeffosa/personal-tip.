@@ -352,4 +352,5 @@ def test_record_names_the_bookmaker_the_result_was_read_from(tmp_path: Path, mon
     assert pilot_ledger.main(["--record", "1", "lost", "--book", "sportybet"]) == 0
     [(_, settlement)] = store.settled_bets()
     assert (settlement.result, settlement.source) == ("lost", "manual") and "(sportybet)" in settlement.detail
+    assert settlement.book == "sportybet"  # stored as a field, so reconcile can tell it from bet365's own result
     assert "(sportybet)" in capsys.readouterr().out

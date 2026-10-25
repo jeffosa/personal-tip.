@@ -38,6 +38,7 @@ from typing import Any, Callable, Final, Iterator, Mapping, Sequence
 from prop_alpha.alerts.closing import load_closing_quotes
 from prop_alpha.alerts.fx import BOOK_CURRENCY, CURRENCY_SYMBOLS, ExchangeRate, bankroll_currency, cached_rate, is_fresh
 from prop_alpha.alerts.replies import (
+    RECONCILE_FAILURES,
     RESULTS,
     SETTLEMENT_COLUMNS,
     SETTLEMENT_SOURCES,
@@ -51,6 +52,7 @@ from prop_alpha.alerts.replies import (
     SettleCommand,
     Settlement,
     UndoCommand,
+    book_from_detail,
     confirmation,
     grade,
     parse_reply,
@@ -153,6 +155,9 @@ def _settlement_from_record(raw: Mapping[str, Any], where: str) -> Settlement:
         detail=str(raw.get("detail", "")), settled_at=datetime.fromisoformat(str(raw["at"])),
         count=_optional_int(raw.get("count"), where), minutes=_optional_int(raw.get("minutes"), where),
         update_id=_optional_int(raw.get("update_id"), where),
+        # Records written before settlements carried a bookmaker name it in their detail (audit 2026-10-25).
+        book=(None if raw.get("source") != "manual" else
+              str(raw["book"]) if raw.get("book") is not None else book_from_detail(str(raw.get("detail", "")))),
     )
 
 
@@ -230,6 +235,7 @@ class PlacedBetStore:
             "event": "settled", "bet_id": settlement.bet_id, "result": settlement.result,
             "source": settlement.source, "detail": settlement.detail, "at": settlement.settled_at.isoformat(),
             "count": settlement.count, "minutes": settlement.minutes, "update_id": settlement.update_id,
+            "book": settlement.book,
         })
 
     def open_bets(self, now: datetime) -> list[PlacedBet]:
@@ -444,7 +450,7 @@ def process_updates(
                     book = command.book or "book not given"
                     settlement = Settlement(command.bet_id, command.result, "manual",
                                             f"bookmaker result ({book}) recorded from Telegram",
-                                            _message_time(message, now), update_id=update_id)
+                                            _message_time(message, now), update_id=update_id, book=command.book)
                     if pilot_lock is None:
                         pilot_store.record_settlement(settlement)
                     else:
@@ -815,7 +821,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(report)
         if args.send:
             TelegramNotifier(load_config()).send_message("SETTLEMENT CHECK\n" + report)
-        return 1 if any(item.outcome == "discrepancy" for _, item in items) else 0
+        return 1 if any(item.outcome in RECONCILE_FAILURES for _, item in items) else 0
     currency = bankroll_currency()
     rate = None if currency == BOOK_CURRENCY else cached_rate()
     fresh = rate if rate is not None and is_fresh(rate, now.date()) else None

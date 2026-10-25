@@ -43,6 +43,7 @@ from prop_alpha.alerts.closing import save_scan_fixtures
 from prop_alpha.alerts.fx import BOOK_CURRENCY, SUPPORTED_CURRENCIES, ExchangeRate, bankroll_currency, book_to_bankroll
 from prop_alpha.alerts.fx import identity as fx_identity
 from prop_alpha.alerts.ledger import PlacedBetStore, combined_exposure
+from prop_alpha.alerts.market_contract import WITHHELD_NOTE, contract_status, withhold_unverified
 from prop_alpha.alerts.predictions import PredictionLog
 from prop_alpha.alerts.replies import USAGE, AlertItem
 from prop_alpha.alerts.telegram import (
@@ -223,6 +224,9 @@ class ScanSummary:
     # The pilot scan's leagues tipped for this run only (its --tip, maintainer's per-run choice), when not the standing
     # setting; None means the standing setting (ladder_scan.TIP_LEAGUES) applied.
     tip_override: tuple[str, ...] | None = None
+    # Real-price tips the allocator and screen passed but market_contract.withhold_unverified stopped (no verified
+    # settlement contract for the book's market, audit 2026-10-25).
+    withheld: int = 0
 
     def text(self, label: str) -> str:
         lines = [
@@ -242,8 +246,11 @@ class ScanSummary:
             elif self.unquoted_matches:
                 lines.append(f"Matches with no bookmaker quote (no price to qualify against): {self.unquoted_matches}")
         lines += self.odds_notes
+        if self.withheld:
+            lines.append(WITHHELD_NOTE.format(count=self.withheld))
         if self.fixtures:
-            lines.append(f"Tipped markets: {', '.join(sorted(ALERT_MARKETS))} (the others fail Gate 2 calibration)")
+            lines.append(f"Tipped markets: {', '.join(sorted(ALERT_MARKETS))} (the others fail Gate 2 calibration); "
+                         + contract_status())
         lines += [f"Could not price {failure}" for failure in self.failures]
         lines.append(PAPER_LABEL)
         return "\n".join(lines)
@@ -666,6 +673,9 @@ def run_scan(
         all_projections.update(projections)
         all_descriptions.update(descriptions(fixture, inputs, projections))
     combined.directives.sort(key=lambda d: (-d.ev_per_unit, d.fixture_id, d.player_id, d.market_type, d.line_value))
+    if odds == "oddspapi":
+        # No tip on a real price without a verified settlement contract (market_contract, audit 2026-10-25).
+        combined.directives, summary.withheld = withhold_unverified(combined.directives)
     if notifier is not None:
         summary.alerts_sent, _ = notifier.notify_digest(
             combined, all_projections, bankroll_currency=currency, label=label, descriptions=all_descriptions,

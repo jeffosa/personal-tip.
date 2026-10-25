@@ -74,6 +74,10 @@ PURE_MODULES: tuple[str, ...] = (
     "prop_alpha/evaluation/gate2.py",
     # Gate 2 lockbox protocol (2026-10-25): eligibility, outcome capture and scoring rows; the caller passes the clock.
     "prop_alpha/evaluation/lockbox.py",
+    # Settlement-contract gate (2026-10-25): which (book, market) tips may be sent.
+    "prop_alpha/alerts/market_contract.py",
+    # Model-value evidence (2026-10-25): calibration, Brier, ROI and CLV on prospective, verified rows.
+    "prop_alpha/evaluation/value_evidence.py",
 )
 IO_LIBRARIES = frozenset({
     "psycopg2", "requests", "urllib3", "socket", "http", "sqlite3", "threading", "concurrent", "asyncio", "subprocess",

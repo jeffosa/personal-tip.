@@ -11,7 +11,67 @@ settlements, closing prices) that code cannot produce. They take calendar time a
 
 Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not executed where it will run · **[N]** not built.
 
-## Status on 2026-10-25: Gate 2 lockbox audited and restarted (read this first)
+## Status on 2026-10-25 (b): settlement rules and model value audited (read this first)
+
+**Still PAPER ONLY; no go-live gate passed. Real-price tipping is now disabled** until a bookmaker's settlement contract is
+verified (`alerts/market_contract.py`). No pricing, staking, risk default or settlement grading changed; `FROZEN_DIGEST` is
+unchanged, so the lockbox protocol below is unaffected. Details: `MARKET_CONTRACT.md` sections 7-10.
+
+**How a pick becomes a tip (traced in the code, 2026-10-25):**
+
+| Step | Where | What it does | Verified? |
+|---|---|---|---|
+| Model probability | frozen `slate.build_projections` (League One/Two) or `ladder_scan.price_pilot`; `FactorProjection.side_probabilities` | P(win), P(lose), P(void) of each line from the player's Sportmonks `tackles_attempted` / `fouls_committed` history, under the quote's void rule | Statistic = Opta "Tackles" on one Brazil match (29/29) and 8 tips; never compared on a League One/Two match |
+| Bookmaker price | OddsPapi, `slate.quotes_from_prices` | Over/under lines, or "k+" ladder steps read as Over k-0.5; every real quote is given `VOID_IF_NO_APPEARANCE` | The void rule is an assumption; bet365 (lead) voids non-starters |
+| De-vigging | `market_scanner.devig_two_way` | Only when both sides are quoted; ladder steps are one-sided, so the screen compares with 1/odds (margin included) | Correct as built; one-sided prices cannot be de-vigged |
+| Other-book check (pilot) | `ladder_scan.beating_other_books` | Needs another book at least 10% shorter (median) | A judgement, not fitted |
+| Edge guard (pilot) | `ladder_scan.without_implausible_edges` | Drops prices where the model's return if he plays exceeds 25% | A judgement, not fitted |
+| Allocator | `InstitutionalAssetManager.allocate` | Joint mean-variance, caps net of exposure, 0.03 loss floor | Risk defaults unchanged |
+| High-value screen | `value_screen.assess_high_value` (in `notify_digest`) | Mispriced, EV >= 4%, survival > 60% | Survival uses the model's own posterior |
+| **Contract gate (new)** | `market_contract.withhold_unverified` in `scan.run_scan` and `ladder_scan._scan_slate` | A real-price directive is sent only for a `(book, market)` with a verified contract and the same void rule; the summary counts what was withheld and says the estimates are unverified | `VERIFIED_CONTRACTS` is empty: nothing is sent; mock runs are not gated |
+| Prediction log | `PredictionLog.record` per fixture, before any send | Gate 2 lines with digest, data source and time | Lockbox-eligible only from 2026-10-27 |
+
+**Evidence measured today (`scripts/value_evidence.py`, report `.prop_alpha_state/analysis/value_evidence_2026-10-25.json`):**
+
+| Evidence | Count | Reading |
+|---|---|---|
+| Bookmaker rules read first-hand | bet365 0 (help.bet365.com blocked: 403 and pane refusal); Sky Bet's Opta definitions read in full | Contract **unverified** for bet365 and Betway |
+| Settled paper bets | 10 (pilot, bet365 prices, 4 matches) | At bet365: **0 agree, 0 discrepancies, 10 unresolved**; SportyBet results on 5: 5 agree (another book, not counted); 5 automatic only |
+| Prospective predictions eligible as evidence | **0** (2,715 League One/Two lines all for examined matches; 2,190 pilot lines not evidence: no frozen pricing or protocol, matches inspected on 2026-10-25) | No calibration, Brier skill or benchmark can be computed |
+| Bookmaker-settled outcomes for eligible predictions | 0 | n/a |
+| Captured closing prices | 0 (`closing_quotes.jsonl` empty; no pilot closing price) | No CLV, no market benchmark |
+| Tips settled by their own book | 0 | ROI and CLV not computable; Gate 3 needs 300 bets in 60 fixtures with the CLV 90% lower bound above 0 |
+
+**Defects fixed (with tests that fail without the fix):**
+- `--reconcile` counted another bookmaker's result as agreement with the tipped book (the 5 SportyBet results on bet365 tips
+  were reported "5 AGREE"). A manual settlement now carries its bookmaker (`Settlement.book`; older records are read from
+  their detail), and `replies.reconcile` reports another book's result as `other_book_agree` / `other_book_discrepancy`, never as
+  agreement; either discrepancy fails the run (exit 1). `tests/test_settlement_reconciliation.py`, `tests/test_pilot_ledger.py`.
+- Real-price tips were sent (pilot: Brazil Serie A since 2026-10-15) although the statistic and void rule the bookmaker settles
+  on are not established. The contract gate withholds them; Brazil Serie A stays in `TIP_LEAGUES`, so its prices are still
+  priced, screened, logged and counted. `tests/test_market_contract.py`, `tests/test_ladder_scan.py`.
+- New, pure: `evaluation/value_evidence.py` (outcomes only from the tipped book's own settlement, de-vigged two-way closing
+  prices, calibration, Brier skill with a fixture-clustered 90% interval, ROI and CLV with fixture-clustered intervals, the Gate 3
+  power check, no metric below 30 rows, no judgement below the PRD samples). `tests/test_value_evidence.py`.
+
+**Not changed, on purpose:** the void rule priced and graded (`VOID_IF_NO_APPEARANCE`; bet365's non-starter rule is only a lead,
+and changing it changes pricing and settlement semantics: AGENT.md A7, and a pricing change needs a new freeze and a later
+lockbox start); the model; the risk defaults; the pilot's other-book margin and edge cap (no evaluation window to judge them on
+that is not already inspected).
+
+**To pass the gates, still needed:**
+1. **Settlement contract (blocks all tipping and Gate 3 criterion 4):** for bet365 and Betway, the rules first-hand (maintainer
+   pastes the pages, or bet365 support's written reply, `MARKET_CONTRACT.md` section 5), then at least 20 own-book settlements per
+   market, including discriminating legs (tip 10, Wallace Yan 1+: 1 tackle attempted, 0 won), a substitute and a non-starter, all
+   AGREE (section 10).
+2. **Gate 2:** 500 scored lockbox predictions per line from 2026-10-27; 200+ two-way closing prices per market for the benchmark;
+   `yellow_card`; team-sheet line-ups.
+3. **Gate 3:** 300 paper bets settled by their own book across 60 fixtures, CLV 90% lower bound above 0 and the power check met,
+   100% reconciliation with no overrides. None exists: no League One/Two tackles or fouls price has been seen at any bookmaker,
+   and tips are disabled until (1).
+4. **Statistic check on League One/Two:** compare Sportmonks with an Opta-based source for at least one League One/Two match (by hand, where one publishes player counts).
+
+## Status on 2026-10-25: Gate 2 lockbox audited and restarted
 
 **Still PAPER ONLY; no go-live gate passed.** At the maintainer's instruction the Gate 2 evidence process was audited and
 repaired (`LOCKBOX_PROTOCOL.md`). No pricing, staking, settlement or risk setting changed; `FROZEN_DIGEST` is unchanged.

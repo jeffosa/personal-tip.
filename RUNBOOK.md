@@ -72,7 +72,7 @@ Get-ScheduledTask -TaskPath '\prop_alpha\' | Get-ScheduledTaskInfo | Format-Tabl
 ```
 
 `schtasks /Query` has exited with an error from some automation shells; use the PowerShell form from a normal session. Tasks are
-created and stopped only by the maintainer (`schtasks /Delete /TN "prop_alpha\<name>" /F` stops one). The pilot-leagues scan (`python -m prop_alpha.alerts.ladder_scan`: Brazil Serie A, Scottish Premiership, Scottish Championship; only Brazil Serie A is tipped) runs as
+created and stopped only by the maintainer (`schtasks /Delete /TN "prop_alpha\<name>" /F` stops one). The pilot-leagues scan (`python -m prop_alpha.alerts.ladder_scan`: Brazil Serie A, Scottish Premiership, Scottish Championship; only Brazil Serie A can be tipped, and since 2026-10-25 its real-price tips are withheld until a settlement contract is verified) runs as
 a step of `Telegram status`, after `python -m prop_alpha.ingestion.results --pilot`; its failed steps are `pilot-results`, `pilot-scan-no-odds`,
 `pilot-scan-stale` and `pilot-scan`.
 
@@ -131,10 +131,17 @@ npx --yes pyright@1.1.406
 
 ## 9. Unresolved evidence and open blockers
 
-- **Market contract unverified** (`MARKET_CONTRACT.md`): which statistic and provider settle bet365's "player tackles" and "player fouls",
-  and the void rule, are not identified. Championship tackles and fouls remain unsupported and are outside the current scan plan.
+- **Market contract unverified; real-price tipping disabled** (`MARKET_CONTRACT.md` sections 7-10, audit 2026-10-25): bet365's provider
+  (Opta), tackle and foul definitions and non-starter void rule are leads from search summaries (help.bet365.com cannot be read from
+  here); Betway's rules were not found. `alerts/market_contract.VERIFIED_CONTRACTS` is empty, so both scans withhold every real-price
+  tip ("Tips withheld: N ..." in the scan summary) while still pricing, screening and logging. A contract is added only by the
+  maintainer, with the evidence of `MARKET_CONTRACT.md` section 10, in a PR. Of 10 settled paper tips, 0 have a bet365 result; the 5
+  SportyBet results are reported as another book's (`pilot_ledger --reconcile`: "OTHER BOOK"), never as agreement.
+- **Model value not shown:** `python scripts/value_evidence.py` (read-only; writes `.prop_alpha_state/analysis/value_evidence_<date>.json`)
+  reports settlement agreement, eligible predictions, bookmaker-settled outcomes, closing prices, ROI and CLV. On 2026-10-25: 0 eligible
+  predictions, 0 own-book settlements, 0 closing prices. Run it after each matchday; it makes no value claim below the Gate 3 sample.
 - **Prospective Gate 2 lockbox:** the reviewed protocol starts 2026-10-27 00:00 UTC on Sportmonks data. The 24 examined 2026-10-10 matches and all 2,715 predictions from them are excluded. The scorer uses only eligible predictions logged before kickoff and captures outcomes once after the revision grace. No new eligible predictions exist yet; Gate 2 needs at least 500 scored predictions per line, and its market benchmark and lineup requirements remain open. See `LOCKBOX_PROTOCOL.md`.
 - **No tackles or fouls price at a League One/Two bookmaker has been seen**, so no League One/Two alert, closing price or paper bet exists.
 - **Vendor and leagues:** current scheduled paths use Sportmonks with `prop_alpha` (League One/Two) and `prop_alpha_pilot` (Brazil Serie A, Scottish Premiership, English Championship). The Starter trial is recorded through 2026-11-08; confirm paid coverage and cost before relying on ingestion after it.
-- **Pilot leagues are unvalidated:** Brazil Serie A is enabled for paper tips only; the settlement definition and model-vs-market evidence remain unresolved. Scottish leagues are priced but never tipped. Do not treat any pilot result as validated betting performance.
+- **Pilot leagues are unvalidated:** Brazil Serie A is in `TIP_LEAGUES`, but its tips are withheld by the contract gate (above); the settlement definition and model-vs-market evidence remain unresolved. Scottish leagues are priced but never tipped. Do not treat any pilot result as validated betting performance.
 - **Never run:** migration 002 on a real v2 database; the live T-60 line-up path; the 14-branch pruning of the backup repository.
