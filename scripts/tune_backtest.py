@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 import quick_backtest as qb  # noqa: E402
+from prop_alpha.evaluation.lockbox import PROTOCOL  # noqa: E402
 from prop_alpha.evaluation.backtest import (  # noqa: E402
     PlayerMatchObservation,
     brier_score,
@@ -42,6 +43,9 @@ from prop_alpha.modeling.league_level import SeasonTotals, level_scaled_minutes,
 
 TUNE_START: Final[datetime] = datetime(2026, 1, 1, tzinfo=timezone.utc)
 TEST_START: Final[datetime] = datetime(2026, 9, 12, tzinfo=timezone.utc)
+# No League One/Two match from the Gate 2 lockbox start is ever scored by a tuning run (LOCKBOX_PROTOCOL.md, 2026-10-25):
+# the test window used to be open-ended, so a run after the start read lockbox outcomes.
+LOCKBOX_CUTOFF: Final[datetime] = PROTOCOL.start
 PRIOR_STRENGTHS: Final[tuple[float, ...]] = (6.0, 3.0, 1.5)
 BLEND_MINUTES: Final[tuple[float, ...]] = (90_000.0, 30_000.0)
 CURRENT: Final[tuple[float, float]] = (6.0, 90_000.0)
@@ -94,7 +98,8 @@ def predict(
         for history in by_player.values():
             history.sort(key=lambda o: (o.kickoff_at, o.fixture_id))
             for i, target in enumerate(history):
-                if target.kickoff_at < TUNE_START or not target.started or i < qb.MIN_PRIOR_APPEARANCES:
+                if (target.kickoff_at < TUNE_START or target.kickoff_at >= LOCKBOX_CUTOFF or not target.started
+                        or i < qb.MIN_PRIOR_APPEARANCES):
                     continue
                 prior = [o for o in history[:i] if o.kickoff_at < target.kickoff_at]
                 on_pitch = [o for o in prior if o.minutes_played > 0.0]

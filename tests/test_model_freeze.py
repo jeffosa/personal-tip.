@@ -118,4 +118,4 @@ def test_identical_outcomes_are_refused_not_scored() -> None:
 
 
 def test_lockbox_constants_are_timezone_aware() -> None:
-    assert model_freeze.LOCKBOX_START == datetime(2026, 10, 6, tzinfo=timezone.utc)
+    assert model_freeze.LOCKBOX_START == datetime(2026, 10, 27, tzinfo=timezone.utc)  # LOCKBOX_PROTOCOL.md, 2026-10-25

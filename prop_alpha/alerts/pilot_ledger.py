@@ -9,7 +9,8 @@ see these files. The paper P&L is "had the tip been taken at the alerted price a
 
     python -m prop_alpha.alerts.pilot_ledger --settle [--send]   # grade open paper bets from the pilot database
     python -m prop_alpha.alerts.pilot_ledger --list              # open and settled paper bets, with closing-price value
-    python -m prop_alpha.alerts.pilot_ledger --record 3 won      # the bookmaker's result for paper bet 3 (you read it off the site)
+    python -m prop_alpha.alerts.pilot_ledger --record 3 won [--book sportybet]   # the bookmaker's result for paper bet 3
+    (or reply "result 3 won [book]" in the Telegram chat: the 10-minute poll records it the same way, since 2026-10-25)
     python -m prop_alpha.alerts.pilot_ledger --reconcile         # your recorded results v automatic settlement; exit 1 on a discrepancy
 
 Automatic settlement is the assumed market contract (tackles = PILOT_TACKLES_SQL, the count the pilot prices: Sportmonks
@@ -255,6 +256,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     action.add_argument("--record", nargs=2, metavar=("BET_ID", "RESULT"), help="the bookmaker's result: won, lost or void")
     action.add_argument("--reconcile", action="store_true", help="compare recorded bookmaker results with automatic settlement")
     parser.add_argument("--send", action="store_true", help="with --settle: send the new results to Telegram")
+    parser.add_argument("--book", help="with --record: the bookmaker the result was read from (default: not given)")
     args = parser.parse_args(argv)
     now = datetime.now(timezone.utc)
     store = PlacedBetStore(PILOT_BETS_FILE)
@@ -279,8 +281,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if bet_id not in bets:
             parser.error(f"no paper bet #{bet_id}")
         # update_id 0: the settlement is the maintainer's, not a Telegram reply (a manual result needs one).
-        store.record_settlement(Settlement(bet_id, result, "manual", "bookmaker result recorded by hand", now, update_id=0))
-        print(f"recorded {result.upper()} for paper bet #{bet_id} as the bookmaker's result")
+        book = args.book or "book not given"
+        store.record_settlement(Settlement(bet_id, result, "manual", f"bookmaker result ({book}) recorded by hand", now,
+                                           update_id=0))
+        print(f"recorded {result.upper()} for paper bet #{bet_id} as the bookmaker's result ({book})")
         return 0
     if args.reconcile:
         items = ledger.reconcile_settlements(store, dsn, now, PILOT_SETTLEMENT_SQL)
@@ -289,7 +293,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1 if any(item.outcome == "discrepancy" for _, item in items) else 0
     # The real ledger's lock as well: the notice goes through its answer queue (ledger_answers.jsonl), which only one writer
     # may touch at a time.
-    with ledger.ledger_lock(lock_for(store)), ledger.ledger_lock(ledger.DEFAULT_LOCK_FILE):
+    # Keep the same global lock order as ledger.poll: real ledger first, then pilot store. The poll records Telegram
+    # pilot results while holding the real-ledger lock, so reversing the order here could deadlock concurrent runs.
+    with ledger.ledger_lock(ledger.DEFAULT_LOCK_FILE), ledger.ledger_lock(lock_for(store)):
         settled = ledger.settle(store, dsn, now, PILOT_SETTLEMENT_SQL)
         lines = [settlement_text(bet, settlement) for bet, settlement in settled]
         print("\n".join(lines) if lines else "no open paper bet has a final match in the pilot database")

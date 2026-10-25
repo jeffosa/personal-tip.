@@ -1,4 +1,10 @@
-"""PRD Gate 2 on the lockbox: score the frozen scan model on League One/Two matches from LOCKBOX_START on.
+"""RETIRED 2026-10-25 (LOCKBOX_PROTOCOL.md): PRD Gate 2 on the lockbox by repricing; kept, with its records, for the history.
+
+It repriced matches after the fact instead of scoring the predictions logged before kickoff, read outcomes from the live
+database on every run, and could be run (and looked at) at any time; its 2026-10-11 run examined the 24 matches of
+2026-10-10. The prospective protocol is scored by scripts/gate2_prospective.py; `main` refuses to run.
+
+PRD Gate 2 on the lockbox: score the frozen scan model on League One/Two matches from LOCKBOX_START on.
 
 Every final lockbox fixture is priced exactly as the scan prices it (alerts/scan.py load_slate_inputs and
 price_fixture, with data strictly before kickoff), and each regular starter's Over probability, given that he
@@ -46,7 +52,7 @@ from prop_alpha.evaluation.gate2 import MIN_BENCHMARK_PREDICTIONS, market_benchm
 from prop_alpha.scanner.market_scanner import devig_two_way  # noqa: E402
 from prop_alpha.ingestion.sportmonks import SCAN_LEAGUES  # noqa: E402
 from prop_alpha.modeling.model_freeze import FROZEN_DIGEST, GATE2_LINES, LOCKBOX_START, pricing_digest  # noqa: E402
-from prop_alpha.alerts.predictions import PredictionLog, counts_for_lockbox  # noqa: E402
+from prop_alpha.alerts.predictions import PredictionLog  # noqa: E402
 from prop_alpha.scanner.slate import UpcomingFixture  # noqa: E402
 
 SEED: Final[int] = 20261005
@@ -88,13 +94,25 @@ def benchmark_rows(market: str, lines: tuple[float, ...], predictions: dict[tupl
             if (fixture_id, player_id, market, line) in closing]
 
 
+# The rule this script counted a logged line by when it ran (2026-10-11): the frozen digest, a kickoff from the then
+# lockbox start (2026-10-06), logged before kickoff. Kept here so the retired script's history stays reproducible after the
+# protocol of 2026-10-25 replaced it (alerts/predictions.counts_for_lockbox now follows evaluation/lockbox.PROTOCOL).
+RETIRED_LOCKBOX_START: Final[datetime] = datetime(2026, 10, 6, tzinfo=timezone.utc)
+
+
+def counted_on_2026_10_11(record: Mapping[str, Any]) -> bool:
+    kickoff = datetime.fromisoformat(str(record["kickoff_at"]))
+    return (record["digest"] == FROZEN_DIGEST and kickoff >= RETIRED_LOCKBOX_START
+            and datetime.fromisoformat(str(record["logged_at"])) < kickoff)
+
+
 def compare_with_log(repriced: Mapping[PredictionKey, float], logged: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Pure: repriced P(over | plays) against the earliest logged one (only records that count towards the lockbox), on the
     (fixture, player, market, line) both have. Reports how many agree, the largest difference and the keys that differ, and
     how many repriced matches have no logged prediction (priced before the log existed, or not scanned)."""
     first: dict[PredictionKey, tuple[str, float]] = {}
     for record in logged:
-        if not counts_for_lockbox(record):
+        if not counted_on_2026_10_11(record):
             continue
         total = float(record["p_win"]) + float(record["p_lose"])
         if total <= 0.0:
@@ -113,6 +131,12 @@ def compare_with_log(repriced: Mapping[PredictionKey, float], logged: Sequence[M
 
 
 def main() -> int:
+    print("REFUSED: scripts/gate2_lockbox.py is retired (LOCKBOX_PROTOCOL.md, 2026-10-25); the lockbox is scored once by "
+          "scripts/gate2_prospective.py from the predictions logged before kickoff.")
+    return 2
+
+
+def _retired_main() -> int:
     import psycopg2
 
     digest = pricing_digest()

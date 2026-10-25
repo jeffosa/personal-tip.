@@ -47,6 +47,7 @@ from prop_alpha.alerts.replies import (
     PlacedBet,
     Reconciliation,
     ReplyError,
+    ResultCommand,
     SettleCommand,
     Settlement,
     UndoCommand,
@@ -93,7 +94,7 @@ EDIT_NOTICE: Final[str] = (
     "Edits are not applied. If the original reply recorded a bet, send undo <bet id>, then send the corrected reply "
     "as a new reply to the alert."
 )
-COMMAND_WORDS: Final[tuple[str, ...]] = ("placed", "undo", "settle")
+COMMAND_WORDS: Final[tuple[str, ...]] = ("placed", "undo", "settle", "result")
 # A bot command ("/status", "/bets@my_bot ..."): read-only questions the poll answers (alerts/bot_commands.py, 2026-10-15).
 BOT_COMMAND_PREFIX: Final[str] = "/"
 # A bet still open this long after it was placed is flagged for settling by hand (postponed, abandoned, or a
@@ -205,6 +206,18 @@ class PlacedBetStore:
             else:
                 raise ValueError(f"{self.path.name} line {number} is not a placed, undo or settled record")
         return bets, cancelled, seen, settlements
+
+    def settlement_update_ids(self) -> set[int]:
+        """The Telegram update of every settlement recorded from a reply (a re-delivered result is recorded once). Kept
+        apart from load()'s seen set: a paper bet's update_id is its own number, not a Telegram update."""
+        if not self.path.is_file():
+            return set()
+        found: set[int] = set()
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            record: Any = json.loads(line) if line.strip() else None
+            if isinstance(record, dict) and record.get("event") == "settled" and isinstance(record.get("update_id"), int):
+                found.add(int(record["update_id"]))
+        return found
 
     def record_bet(self, bet: PlacedBet) -> None:
         self._append({"event": "placed", **asdict(bet), "placed_at": bet.placed_at.isoformat()})
@@ -359,13 +372,18 @@ def process_updates(
     currency: str = "",
     book_rate: ExchangeRate | None = None,
     bot_commands: list[tuple[int, str]] | None = None,
+    pilot_store: PlacedBetStore | None = None,
+    pilot_lock: Path | None = None,
 ) -> tuple[list[tuple[int, str]], int | None]:
     """Record the bets in `updates` and return (replies to send as (message id to answer, text), next offset).
     Messages from other chats, non-text messages and chat that is not a command are skipped. Stakes are recorded
     in `currency` (the bankroll's); one typed with the books' sign is converted at `book_rate`. With `bot_commands`, each
     "/command" from the chat is appended to it as (message id, command name) for the caller to answer; without, it is
-    skipped as before."""
+    skipped as before. With `pilot_store` (the pilot's paper-bet store) a "result <tip> won|lost|void [book]" message
+    records the bookmaker's result for that paper tip, under `pilot_lock` when given (held only for the write)."""
     replies: list[tuple[int, str]] = []
+    pilot_bets: dict[int, PlacedBet] | None = None
+    pilot_seen: set[int] = set()
     next_offset: int | None = None
     bets, cancelled, seen = store.load()
     next_id = max(bets, default=0) + 1
@@ -410,6 +428,35 @@ def process_updates(
                 store.record_undo(command.bet_id, update_id, _message_time(message, now))
                 cancelled.add(command.bet_id)
                 replies.append((own_id, f"Cancelled bet #{command.bet_id}."))
+        elif isinstance(command, ResultCommand):
+            if pilot_store is None:
+                replies.append((own_id, "Pilot results are not recorded by this poll."))
+            else:
+                if pilot_bets is None:
+                    pilot_bets = pilot_store.load()[0]
+                    pilot_seen = pilot_store.settlement_update_ids()
+                if update_id in pilot_seen:
+                    continue
+                if command.bet_id not in pilot_bets:
+                    replies.append((own_id, f"No pilot paper tip #{command.bet_id} (tip numbers: /pilot)."))
+                else:
+                    tip = pilot_bets[command.bet_id]
+                    book = command.book or "book not given"
+                    settlement = Settlement(command.bet_id, command.result, "manual",
+                                            f"bookmaker result ({book}) recorded from Telegram",
+                                            _message_time(message, now), update_id=update_id)
+                    if pilot_lock is None:
+                        pilot_store.record_settlement(settlement)
+                    else:
+                        with ledger_lock(pilot_lock):
+                            pilot_store.record_settlement(settlement)
+                    pilot_seen.add(update_id)
+                    other = (f" Note: the tip was {tip.book}'s price; this result is {command.book}'s."
+                             if command.book and command.book.lower() != tip.book.lower() else "")
+                    replies.append((own_id, f"Recorded the bookmaker's result for pilot paper tip #{command.bet_id}: "
+                                            f"{command.result.upper()} ({book}). {tip.player}, {tip.side.upper()} "
+                                            f"{tip.line:g} {tip.market}, {tip.match}.{other} It stays a paper tip; "
+                                            "pilot_ledger --reconcile compares it with the automatic result."))
         elif isinstance(command, SettleCommand):
             if command.bet_id not in bets or command.bet_id in cancelled:
                 replies.append((own_id, f"No recorded bet #{command.bet_id} to settle."))
@@ -506,6 +553,7 @@ def poll(
     currency: str = "", book_rate: ExchangeRate | None = None, *, outbox: AnswerOutbox | None = None,
     deliveries: DeliveryLog | None = None, heartbeat_file: Path | None = None,
     answer_command: Callable[[str, datetime], str] | None = None,
+    pilot_store: PlacedBetStore | None = None, pilot_lock: Path | None = None,
 ) -> int:
     """Read new replies, record bets, answer each in the chat. Returns the number of answers sent.
 
@@ -531,7 +579,8 @@ def poll(
         messages.update(confirm_quoted_deliveries(updates, notifier.chat_id, messages, deliveries, index, now))
     commands: list[tuple[int, str]] = []
     replies, next_offset = process_updates(updates, notifier.chat_id, messages, store, now, currency, book_rate,
-                                           bot_commands=commands if answer_command is not None else None)
+                                           bot_commands=commands if answer_command is not None else None,
+                                           pilot_store=pilot_store, pilot_lock=pilot_lock)
     queued = [(outbox.queue(reply_to, text, now) if outbox is not None else 0, reply_to, text)
               for reply_to, text in replies]
     if next_offset is not None:
@@ -772,11 +821,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     fresh = rate if rate is not None and is_fresh(rate, now.date()) else None
     # Imported here: bot_commands builds the status report, and alerts/status.py imports this module.
     from prop_alpha.alerts.bot_commands import answer
+    from prop_alpha.alerts.pilot_ledger import PILOT_BETS_FILE, lock_for
+
+    pilot_store = PlacedBetStore(PILOT_BETS_FILE)
 
     with ledger_lock():
         sent = poll(TelegramNotifier(load_config()), MessageIndex(), store, DEFAULT_OFFSET_FILE, now, currency, fresh,
                     outbox=AnswerOutbox(), deliveries=DeliveryLog(), heartbeat_file=DEFAULT_HEARTBEAT_FILE,
-                    answer_command=answer)
+                    answer_command=answer, pilot_store=pilot_store, pilot_lock=lock_for(pilot_store))
     print(f"answered {sent} message(s)")
     return 0
 

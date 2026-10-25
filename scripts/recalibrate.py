@@ -57,7 +57,8 @@ def predictions(rows: Sequence[tuple[Any, ...]], market: str) -> list[Prediction
         for history in by_player.values():
             history.sort(key=lambda o: (o.kickoff_at, o.fixture_id))
             for i, target in enumerate(history):
-                if target.kickoff_at < tb.TUNE_START or not target.started or i < qb.MIN_PRIOR_APPEARANCES:
+                if (target.kickoff_at < tb.TUNE_START or target.kickoff_at >= tb.LOCKBOX_CUTOFF or not target.started
+                        or i < qb.MIN_PRIOR_APPEARANCES):  # never a Gate 2 lockbox match (LOCKBOX_PROTOCOL.md)
                     continue
                 on_pitch = [o for o in history[:i] if o.kickoff_at < target.kickoff_at and o.minutes_played > 0.0]
                 starts = [o.minutes_played for o in on_pitch if o.started]

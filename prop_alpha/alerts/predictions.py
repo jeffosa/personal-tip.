@@ -6,12 +6,15 @@ The opportunity scan (alerts/scan.py) calls `PredictionLog.record` for every fix
 sent. One line per fixture, player, market and line goes to `.prop_alpha_state/predictions.jsonl` (append-only,
 gitignored, covered by the daily backup): the time it was made, the kickoff, the model's probability that the count goes
 over the line (win, lose and void shares of the over side, void if the player does not appear), the lineup basis
-("estimated": the scan prices before team sheets exist) and the digest of the pricing code that made it. A line counts
-towards the lockbox only if the fixture kicked off on or after LOCKBOX_START and its digest equals FROZEN_DIGEST
-(modeling/model_freeze.py), so a price made by code that has since changed is never counted by accident.
+("estimated": the scan prices before team sheets exist), the digest of the pricing code that made it and, since
+2026-10-25, the data source it was priced from (`data_vendor`). Whether a line counts towards the lockbox is decided by
+the prospective protocol (evaluation/lockbox.py, LOCKBOX_PROTOCOL.md): the frozen digest, the protocol's data source, a
+kickoff from the lockbox start and a time logged before kickoff, among other rules.
 
-Every fixture is written once per pricing digest, whatever the scan window (audit 2026-10-11: a retried run, a late catch-up
-run or overlapping windows used to log the same fixture again, double counting it towards the lockbox). A failed
+Every fixture is written once per pricing digest and kickoff, whatever the scan window (audit 2026-10-11: a retried run, a
+late catch-up run or overlapping windows used to log the same fixture again, double counting it towards the lockbox). A
+match moved to a new kickoff (postponed or rescheduled) is logged again when it is next scanned (since 2026-10-25: until
+then it never got a second prediction); the protocol scores only the line logged for the kickoff the match was played at. A failed
 write raises, so the scan stops before it alerts: no alert is sent on a price that was not recorded.
 
 I/O: the log file, and the repository's pricing source files through `model_freeze.pricing_digest`. It records the
@@ -28,6 +31,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
 
+from prop_alpha.evaluation.lockbox import record_reason
 from prop_alpha.modeling.engine import FactorProjection, VoidRule
 from prop_alpha.modeling.model_freeze import FROZEN_DIGEST, GATE2_LINES, LOCKBOX_START, pricing_digest
 from prop_alpha.scanner.slate import UpcomingFixture
@@ -49,10 +53,10 @@ def _require_utc(value: datetime, name: str) -> None:
 
 def prediction_records(
     fixture: UpcomingFixture, projections: Mapping[ProjectionKey, FactorProjection], logged_at: datetime,
-    window_start: datetime, digest: str,
+    window_start: datetime, digest: str, data_vendor: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Pure: one record per projection key and Gate 2 line. Raises if a logged time is not before kickoff, since a
-    prediction made after the match began is not a prediction."""
+    """Pure: one record per projection key and Gate 2 line, with `data_vendor` when given. Raises if a logged time is not
+    before kickoff, since a prediction made after the match began is not a prediction."""
     _require_utc(logged_at, "logged_at")
     _require_utc(window_start, "window_start")
     if logged_at >= fixture.kickoff_at:
@@ -72,20 +76,23 @@ def prediction_records(
                 "kickoff_at": fixture.kickoff_at.isoformat(), "fixture_id": fixture_id, "player_id": player_id,
                 "market": market, "line": line, "p_win": over.p_win, "p_lose": over.p_lose, "p_void": over.p_void,
                 "lineup_basis": LINEUP_BASIS_ESTIMATED, "digest": digest,
+                **({} if data_vendor is None else {"data_vendor": data_vendor}),
             })
     return records
 
 
 def counts_for_lockbox(record: Mapping[str, Any]) -> bool:
-    """Pure: made by the frozen code, for a match from LOCKBOX_START on, before that match began."""
-    kickoff = datetime.fromisoformat(str(record["kickoff_at"]))
-    logged = datetime.fromisoformat(str(record["logged_at"]))
-    return record["digest"] == FROZEN_DIGEST and kickoff >= LOCKBOX_START and logged < kickoff
+    """Pure: the line meets the prospective protocol on its own (evaluation/lockbox.record_reason): the frozen digest and
+    data source, a kickoff from the lockbox start, not an examined match, logged before kickoff, a protocol line. The
+    scorer (scripts/gate2_prospective.py) also drops duplicates and lines for a kickoff that moved."""
+    return record_reason(record) is None
 
 
 class PredictionLog:
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(self, path: Path | None = None, data_vendor: str | None = None) -> None:
+        """`data_vendor` (e.g. "sportmonks") is written on every line this log records."""
         self.path = path if path is not None else STATE_DIR / PREDICTIONS_NAME
+        self.data_vendor = data_vendor
 
     def load(self) -> list[dict[str, Any]]:
         """Every logged prediction. A damaged or incomplete line raises: a log that cannot be trusted is not scored."""
@@ -105,12 +112,15 @@ class PredictionLog:
         self, fixture: UpcomingFixture, projections: Mapping[ProjectionKey, FactorProjection], logged_at: datetime,
         window_start: datetime, digest: str | None = None,
     ) -> int:
-        """Append the fixture's predictions unless it is already logged under the same digest (the earliest prediction
-        stands; a new digest after a re-freeze is a different model and is logged); returns lines written."""
+        """Append the fixture's predictions unless it is already logged under the same digest for the same kickoff (the
+        earliest prediction stands; a new digest after a re-freeze is a different model, and a new kickoff a postponed or
+        rescheduled match, and both are logged); returns lines written."""
         made_by = pricing_digest() if digest is None else digest
-        if any(r["fixture_id"] == fixture.fixture_id and r["digest"] == made_by for r in self.load()):
+        kickoff = fixture.kickoff_at.isoformat()
+        if any(r["fixture_id"] == fixture.fixture_id and r["digest"] == made_by and r["kickoff_at"] == kickoff
+               for r in self.load()):
             return 0
-        records = prediction_records(fixture, projections, logged_at, window_start, made_by)
+        records = prediction_records(fixture, projections, logged_at, window_start, made_by, self.data_vendor)
         if not records:
             return 0
         self.path.parent.mkdir(parents=True, exist_ok=True)
