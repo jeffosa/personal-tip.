@@ -12,11 +12,11 @@ from typing import Any, Mapping
 
 import pytest
 
-from prop_alpha.alerts import ladder_scan, pilot_ledger, scan
+from prop_alpha.alerts import ladder_scan, market_contract, pilot_ledger, scan
 from prop_alpha.alerts.fx import identity as fx_identity
 from prop_alpha.alerts.telegram import SentAlertStore, TelegramConfig, TelegramNotifier
 from prop_alpha.ingestion import oddspapi, sportmonks
-from prop_alpha.modeling.engine import QuantEngine
+from prop_alpha.modeling.engine import QuantEngine, VoidRule
 from prop_alpha.scanner.market_scanner import LiveOddsQuote
 from prop_alpha.scanner.slate import (
     Appearance,
@@ -138,10 +138,17 @@ def _run(tmp_path: Path, notifier: _Recording, store: SentAlertStore, **kwargs: 
 def _tip_brazil(monkeypatch: pytest.MonkeyPatch) -> None:
     """The tests of the tipping path set Brazil as the tip league themselves (it was paused 2026-10-12 to 2026-10-15). Their
     prices are exaggerated to make a tip certain, so they also lift the implausible-edge guard, and they quote one bookmaker,
-    so they turn the bookmaker check off; both have tests of their own."""
+    so they turn the bookmaker check off; both have tests of their own. A real-price tip is sent only for a verified
+    settlement contract (market_contract, 2026-10-25; none is verified), so they declare one for bet365 tackles."""
     monkeypatch.setattr(ladder_scan, "TIP_LEAGUES", frozenset({"Brazil Serie A"}))
     monkeypatch.setattr(ladder_scan, "PLAUSIBLE_EDGE_CAP", 100.0)
     monkeypatch.setattr(ladder_scan, "MARKET_CHECK_MARGIN", None)
+    _verified_contract(monkeypatch)
+
+
+def _verified_contract(monkeypatch: pytest.MonkeyPatch, *books: str) -> None:
+    monkeypatch.setattr(market_contract, "VERIFIED_CONTRACTS",
+                        {(book, "tackles"): VoidRule.VOID_IF_NO_APPEARANCE.value for book in books or ("bet365",)})
 
 
 def _quote(over: float | None, under: float | None) -> LiveOddsQuote:
@@ -216,6 +223,7 @@ def _two_book_body(bet365: tuple[float, float, float], betway: tuple[float, floa
 
 def test_a_real_price_well_above_the_other_book_is_tipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ladder_scan, "TIP_LEAGUES", frozenset({"Brazil Serie A"}))
+    _verified_contract(monkeypatch, "bet365", "betway")
     monkeypatch.setattr(ladder_scan, "PLAUSIBLE_EDGE_CAP", 100.0)  # the exaggerated test price; the guard has its own tests
     _patch_database(monkeypatch, stored={FINISHED_UID})
     _names_cache(tmp_path)
@@ -802,3 +810,28 @@ def test_tip_is_refused_without_fixtures_given_by_hand(capsys: pytest.CaptureFix
     with pytest.raises(SystemExit):
         ladder_scan.main(["--odds", "mock", "--fixture", "Brazil Serie A|1|2"])
     assert "invalid parse_manual_fixture value: 'Brazil Serie A|1|2'" in capsys.readouterr().err
+
+
+# ---------------- the settlement-contract gate (audit 2026-10-25) ----------------
+def test_without_a_verified_contract_a_real_price_tip_is_withheld_and_no_paper_bet_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The juicy ladder of the tip test, every other gate open, but no verified settlement contract (the standing state):
+    the allocator and screen still run, the prediction is logged, nothing is sent and the summary says why."""
+    _tip_brazil(monkeypatch)
+    monkeypatch.setattr(market_contract, "VERIFIED_CONTRACTS", {})
+    _patch_database(monkeypatch, stored={FINISHED_UID})
+    _names_cache(tmp_path)
+    store = SentAlertStore(tmp_path / "pilot.jsonl")
+    notifier = _Recording(store)
+    summary = _run(tmp_path, notifier, store, odds="oddspapi",
+                   odds_client=_FakeOdds(_ladder_body({"Regular Starter": (2.6, 9.0, 1.45)})))
+    assert summary.directives >= 1 and summary.withheld >= 1 and summary.alerts_sent == 0
+    assert notifier.texts == [] and store.load() == []
+    text = ladder_scan.summary_text(summary, "")
+    assert f"Tips withheld: {summary.withheld} (the bookmaker's settlement rules" in text
+    # A contract for the right book but another void rule (bet365 voids non-starters, a lead) is not this contract.
+    monkeypatch.setattr(market_contract, "VERIFIED_CONTRACTS", {("bet365", "tackles"): VoidRule.VOID_IF_NOT_STARTING.value})
+    again = _run(tmp_path, _Recording(store), store, odds="oddspapi",
+                 odds_client=_FakeOdds(_ladder_body({"Regular Starter": (2.6, 9.0, 1.45)})))
+    assert again.alerts_sent == 0 and again.withheld >= 1

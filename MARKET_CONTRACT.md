@@ -1,7 +1,10 @@
 # Market contract: what bet365's player tackles and fouls markets settle on
 
-Status: **UNVERIFIED. Treat the Championship tackles and fouls ladders as unsupported** until the table in section 3 is
-filled from an authoritative source and section 4's decision is made. Nothing here changes the frozen League One/Two model.
+Status (audit 2026-10-25): **UNVERIFIED for every bookmaker and market. Tipping on real prices is disabled**
+(`alerts/market_contract.py`: `VERIFIED_CONTRACTS` is empty, so both scans withhold every real-price tip and say so in their
+summary). No bookmaker's tackles or fouls settlement rule has been read first-hand from the bookmaker, and no bookmaker has
+settled a bet on a price this system tipped (0 of 10 paper tips). Sections 7-10 record the rules found, the settled-bet audit,
+the model-statistic question and what would verify a contract. Nothing here changes the frozen League One/Two model.
 
 Written 2026-10-10. Betting stays manual; this file only decides whether a bookmaker's quotes can be compared with the
 model's statistics.
@@ -221,9 +224,96 @@ include players who started, who came on, and who did not play.
 ## 6. Open items
 
 - [ ] Maintainer reads bet365's soccer rules pages (Settlement; Match/Team/Player Statistics; Player Performance Markets;
-      What is Opta) and pastes the relevant paragraphs here.
+      What is Opta) and pastes the relevant paragraphs here. Still blocked for Claude on 2026-10-25 (section 7).
 - [ ] Written reply from bet365 support (section 5).
 - [ ] Section 3 filled for at least 5 players, including a substitute and a non-player.
 - [ ] Decision under section 4 recorded, with the date.
-- [ ] Section 2b lead tested against settled results: for named Brazil players, a public Opta-based count (or a bet365
-      settlement) compared with Sportmonks `tackles_attempted`, `+ dribbled_past` and `+ interceptions` for the same match.
+- [x] Section 2b lead tested against settled results (2026-10-13, section 2e): SportyBet's settlements count neither
+      challenges lost nor interceptions. Not tested at bet365 or Betway.
+- [ ] Section 10's evidence collected for each book the scans price (bet365, Betway): first-hand rules and own-book settlements.
+
+## 7. Rules found, by bookmaker (checked 2026-10-25)
+
+How each source was read matters, so it is stated per row. "Summary" means a web-search tool's summary of the page, not the
+page itself: help.bet365.com still answers HTTP 403 to a fetch and is refused by the browser pane ("not allowed due to safety
+restrictions"), and web.archive.org cannot be fetched from here. Quotes are kept short; the rest is paraphrase.
+
+| Book | Question | Rule found | Source, URL, how read | Status |
+|---|---|---|---|---|
+| bet365 | Provider | Match, team and player statistics markets are settled on Opta data and Opta's definitions, or the official competition website outside Opta's coverage | "Settlement - Soccer", https://help.bet365.com/s/en-us/sportsrules/soccer/soccer-settlement, and "Match/Team/Player Statistics - Soccer Rules", https://help.bet365.com/s/en-us/sportsrules/soccer/match-statistics; summary, 2026-10-25 | Lead (two summaries agree; not read first-hand) |
+| bet365 | What a tackle is | Opta's definition: a legal ground-level challenge that "successfully takes the ball away from the opposition player", who must be in controlled possession; interceptions are not tackles | "What is Opta FAQ", https://help.bet365.com/s/en-us/sports/how-is-my-bet-settled; summary, 2026-10-25 | Lead. It does not say whether Opta's "tackle lost" (ball taken, then straight back to an opponent) counts; see section 9 |
+| bet365 | What a foul committed is | An infringement the referee penalises as foul play that results in a free kick or penalty; advantage played and then a caution does not count unless a free kick or penalty is taken | Same FAQ, and the Spanish soccer rules page https://help.bet365.com/s/es-us/sportsrules/soccer/match-statistics; summary, 2026-10-25 | Lead |
+| bet365 | Player participation | A selected player who does not start: void ("no action"); the Swedish page excepts competitions with rolling substitutes. Pages differ by region | https://help.bet365.com/s/en-us/sportsrules/soccer/match-statistics and https://help.bet365.com/s/en-se/sportsrules/soccer/match-statistics; summary, 2026-10-25 | Lead, region-dependent. **Conflicts with the project's assumption** (void only if the player does not play; section 9) |
+| bet365 | Extra time | Player match markets include extra time where played | Match-statistics page; summary, 2026-10-25 | Lead (league matches have no extra time, so the scanned leagues are not affected) |
+| bet365 | Abandoned or postponed match; corrections after settlement | Not found | n/a | Open |
+| Sky Bet (not a book the scans price) | Opta definitions | A tackle is a player connecting with the ball in a legal ground-level challenge; **tackles won and lost both count** (lost: the tackle is made but the ball goes to an opponent). Fouls as bet365's, offsides excluded. Settled after 90 minutes plus injury time; extra time and shoot-outs excluded unless stated; Opta may amend statistics later | "Opta Football Statistics - Definitions", https://support.skybet.com/app/answers/detail/opta-football-statistics-definitions; **read in full** (fetch), 2026-10-25; no date on the page | Sky Bet's published rule; evidence about Opta's definition, not about bet365's market |
+| Betway | Any rule | No published tackles or fouls rule found | Web search, 2026-10-25 | Open |
+| SportyBet | Any rule | No published rule found; the market is labelled "Player tackles (incl. overtime)" | Web search, 2026-10-25; market label from the maintainer's tickets | Open; its settlements are in section 2e |
+| Sportradar (a feed many books use; not shown to be Betway's or SportyBet's) | Player markets | A soccer player not in the starting line-up: void; overtime included, shoot-outs excluded | https://docs.sportradar.com/uof/data-and-features/player-markets/pre-match-player-markets-rules-and-faqs; read in full (fetch), 2026-10-25 | Industry practice only |
+
+## 8. Settled paper bets audited against the automatic settlement (2026-10-25)
+
+All 10 paper tips (pilot, Brazil Serie A, all bet365 prices, 11-12 Oct) have a settled result. Their stored Sportmonks counts were
+re-read from `prop_alpha_pilot` (the five provisional results had been graded from TheStatsAPI on 2026-10-15) and compared with
+Opta's counts where FotMob was read (section 2e). Every player started, so the void-rule conflict of section 7 did not arise.
+
+| Tip | Player, bet (bet365 price) | Bookmaker result | Automatic (Sportmonks: tackles attempted / won, minutes) | Opta (FotMob) tackles | Class |
+|---|---|---|---|---|---|
+| 1 | Fernando 3+ @ 7.50 | lost (SportyBet) | lost (0 / 0, 90) | 0 | other book, agrees |
+| 2 | Fernando 2+ @ 3.40 | lost (SportyBet) | lost (0 / 0, 90) | 0 | other book, agrees |
+| 3 | Yago Felipe 3+ @ 5.50 | none | lost (0 / 0, 70) | not read | unconfirmed |
+| 4 | Yago Felipe 2+ @ 2.50 | none | lost (0 / 0, 70) | not read | unconfirmed |
+| 5 | Léo Pereira 2+ @ 4.33 | lost (SportyBet) | lost (1 / 1, 90) | 1 | other book, agrees |
+| 6 | Arthur Dias 3+ @ 6.00 | lost (SportyBet) | lost (0 / 0, 46) | 0 | other book, agrees |
+| 7 | Arthur Dias 2+ @ 2.62 | none | lost (0 / 0, 46) | 0 | unconfirmed |
+| 8 | Vitor Roque 2+ @ 4.33 | lost (SportyBet) | lost (1 / 1, 69) | 1 | other book, agrees |
+| 9 | Marcinho 1+ @ 1.41 | none | lost (0 / 0, 46) | 0 | unconfirmed |
+| 10 | Wallace Yan 1+ @ 1.41 | none | won (1 / **0**, 66) | 1 | unconfirmed; **discriminating** |
+
+- **At the tipped book (bet365): 0 agree, 0 discrepancies, 10 unresolved** (5 with another book's result, 5 with none). Paper
+  tips are not placed, so bet365 never settles them; only a bet365 result the maintainer can see (a placed bet, or a settled
+  market shown in the account history) would count.
+- **Another book (SportyBet): 5 agree, 0 disagree.** Until today they were reconciled as if they were bet365 results ("5 AGREE");
+  `--reconcile` now reports them as "OTHER BOOK" and never counts them as agreement with bet365 (`replies.reconcile`,
+  `Settlement.book`).
+- **Mismatches investigated:** none between bookmaker and automatic results. Between data sources: TheStatsAPI's minutes were
+  45 / 45 / 65 where Sportmonks has 46 / 46 / 66 (Arthur Dias, Marcinho, Wallace Yan); no result changes. Sportmonks agrees
+  with Opta (FotMob) on all 8 tips where FotMob was read.
+- **Tip 10 tells the two readings of bet365's wording apart:** 1 tackle attempted, 0 won. If bet365 settled it won, the market
+  counts Opta's tackles (attempted, as the model prices); if lost, tackles won. Nobody has seen bet365's result.
+- The sample is 10 tips on 4 matches; it cannot verify anything, and no further settled bets exist (tipping has produced no paper
+  tip since 12 Oct and is now disabled).
+
+## 9. Does the model predict the statistic the bookmaker settles?
+
+- **The model's statistic.** The frozen League One/Two model and the pilot price `player_match_stats.tackles_attempted` and
+  `fouls_committed` (Sportmonks). On one Brazil match Sportmonks matched Opta (FotMob) for 29 of 29 players on tackles and fouls
+  (section 2d), and on the 8 tips above where FotMob was read; **no League One/Two match has been compared with Opta.**
+- **The book's statistic.** bet365 (lead) settles on Opta. Under Opta's scheme a tackle is a ball won from an opponent in a
+  ground challenge; "won" and "lost" then describe who has the ball afterwards, and Sky Bet's Opta page says both count. Read
+  that way bet365's tackles = Opta tackles = Sportmonks `tackles_attempted`, which SportyBet's settlements also fit (2e). Read
+  literally, bet365's wording could mean tackles won only (Sportmonks `tackles_won`, fewer), and bet365's prices already run
+  far *above* the attempted count (section 2b), which a won-only count would make worse, not better. Neither reading is
+  established: no bet365 settlement has been seen.
+- **The void rule.** Pricing and settlement assume a bet is void only if the player does not play (`VOID_IF_NO_APPEARANCE`, set
+  on every real quote in `scanner/slate.py`). bet365's rule (lead) voids a player who does not start. The engine can price that
+  rule (`VOID_IF_NOT_STARTING`), but nothing uses it; changing it changes pricing and settlement semantics (AGENT.md A7) and
+  waits for the rule to be verified.
+- **Conclusion: not established.** Every model-versus-price "expected profit" is an **unverified estimate**, and real-price tips
+  stay disabled (`market_contract.VERIFIED_CONTRACTS` empty).
+
+## 10. What verifies a contract (proposal for the maintainer; nothing is verified until it is met and recorded here)
+
+For one bookmaker and one market:
+1. **The rule, first-hand:** the bookmaker's own page text (pasted here by the maintainer, with the URL and date) or a written
+   support reply (section 5), naming the data provider, the statistic, the void rule and the period, and saying what happens
+   to abandoned and postponed matches.
+2. **Own-book settlements:** at least 20 settled results from that bookmaker on selections whose stored counts the project can
+   grade, including at least 3 that discriminate (for tackles: attempted and won fall on different sides of the line, like tip
+   10), at least 1 substitute appearance and at least 1 player who did not start; recorded with `result <tip> won|lost|void
+   <book>` or `pilot_ledger --record --book`.
+3. **Reconciliation:** `pilot_ledger --reconcile` / `ledger --reconcile` report every one of them AGREE at that book, with no
+   DISCREPANCY and no override; any discrepancy is investigated and resolved here before the count restarts.
+4. **Then** the maintainer adds `(book, market): void rule` to `market_contract.VERIFIED_CONTRACTS`, with a test, in a PR. If the
+   verified statistic or void rule differs from what the model prices, the pricing change needs a new freeze and a later lockbox
+   start first (`LOCKBOX_PROTOCOL.md`).

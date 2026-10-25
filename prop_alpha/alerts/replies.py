@@ -288,7 +288,9 @@ def confirmation(bet: PlacedBet) -> str:
 class Settlement:
     """The result of one recorded bet. `source` "auto" comes from the stored statistics (`grade`); "manual" from a
     `settled` reply, which overrides any automatic result. `count` and `minutes` are the statistics an automatic
-    result used (None for a manual one); `update_id` is the Telegram update of a manual one."""
+    result used (None for a manual one); `update_id` is the Telegram update of a manual one. `book` is the bookmaker
+    whose result a manual one is, when it was given (`result <tip> won <book>`, `pilot_ledger --record --book`); None
+    means the bet's own book (a `settled` reply about a bet the maintainer placed)."""
 
     bet_id: int
     result: str
@@ -298,6 +300,7 @@ class Settlement:
     count: int | None = None
     minutes: int | None = None
     update_id: int | None = None
+    book: str | None = None
 
     def __post_init__(self) -> None:
         _require_utc(self.settled_at, "settled_at")
@@ -305,6 +308,8 @@ class Settlement:
             raise ValueError("settlement needs a positive bet id, a known result and a known source")
         if self.source == "manual" and self.update_id is None:
             raise ValueError("a manual settlement carries the Telegram update that recorded it")
+        if self.book is not None and (self.source != "manual" or not self.book.strip() or self.book != self.book.strip()):
+            raise ValueError("only a manual settlement names a bookmaker, by a non-empty trimmed name")
         for name, value in (("count", self.count), ("minutes", self.minutes)):
             if value is not None and value < 0:
                 raise ValueError(f"{name} must not be negative")
@@ -363,7 +368,29 @@ def settlement_text(bet: PlacedBet, settlement: Settlement, closing: ClosingValu
 # Settlement reconciliation (maintainer task 6, 2026-10-05): every bookmaker result the maintainer reports with a
 # `settled` reply is compared with what automatic settlement (`grade`, the assumed market contract) gives from the
 # stored statistics. Only "agree" is a pass. PRD Gate 3 criterion 4 needs every paper bet to reconcile.
-RECONCILE_OUTCOMES: Final[tuple[str, ...]] = ("agree", "discrepancy", "unverifiable", "unconfirmed")
+# Audit 2026-10-25: a result the maintainer read at another bookmaker (SportyBet results recorded for bet365 paper tips) is
+# that book's settlement, not the tipped book's: it is compared, but reported as "other_book_agree" or
+# "other_book_discrepancy" and never counted as agreement with the tipped book's rules.
+RECONCILE_OUTCOMES: Final[tuple[str, ...]] = ("agree", "discrepancy", "other_book_agree", "other_book_discrepancy",
+                                              "unverifiable", "unconfirmed")
+# The outcomes that fail a reconciliation run (exit code 1): any bookmaker disagreeing with automatic settlement.
+RECONCILE_FAILURES: Final[tuple[str, ...]] = ("discrepancy", "other_book_discrepancy")
+COMPARED_OUTCOMES: Final[tuple[str, ...]] = ("agree", "discrepancy", "other_book_agree", "other_book_discrepancy")
+# The detail older records carry instead of a `book` field: "bookmaker result (<book> ...) recorded ...".
+_DETAIL_BOOK: Final[re.Pattern[str]] = re.compile(r"^bookmaker result \((?P<book>[^()\s]+)")
+
+
+def book_from_detail(detail: str) -> str | None:
+    """Pure: the bookmaker named by a manual settlement's detail as the result command and `pilot_ledger --record` write
+    it ("bookmaker result (<book> ...) recorded ..."), for records written before settlements carried `book`; None when
+    it names none ("book not given", or a `settled` reply)."""
+    found = _DETAIL_BOOK.match(detail)
+    return None if found is None or found["book"] == "book" else found["book"]
+
+
+def same_book(bet_book: str, result_book: str | None) -> bool:
+    """Pure: whether a result's bookmaker is the bet's (no named bookmaker means the bet's own)."""
+    return result_book is None or result_book.strip().lower() == bet_book.strip().lower()
 
 
 @dataclass(frozen=True)
@@ -388,12 +415,12 @@ class Reconciliation:
         for name, value in (("bookmaker_result", self.bookmaker_result), ("automatic_result", self.automatic_result)):
             if value is not None and value not in RESULTS:
                 raise ValueError(f"{name} {value!r} is not a result")
-        if (self.outcome in ("agree", "discrepancy")) != (self.bookmaker_result is not None
-                                                          and self.automatic_result is not None):
+        if (self.outcome in COMPARED_OUTCOMES) != (self.bookmaker_result is not None
+                                                   and self.automatic_result is not None):
             raise ValueError(f"outcome {self.outcome!r} does not fit the results it compares")
-        if self.outcome == "agree" and self.bookmaker_result != self.automatic_result:
+        if self.outcome in ("agree", "other_book_agree") and self.bookmaker_result != self.automatic_result:
             raise ValueError("an agreeing reconciliation needs equal results")
-        if self.outcome == "discrepancy" and self.bookmaker_result == self.automatic_result:
+        if self.outcome in ("discrepancy", "other_book_discrepancy") and self.bookmaker_result == self.automatic_result:
             raise ValueError("a discrepancy needs different results")
 
 
@@ -419,12 +446,17 @@ def reconcile(bet: PlacedBet, settlement: Settlement, row: tuple[str, int | None
         reason = f"match status {status}" if status != "final" else "no stored row for the player in this match"
         return Reconciliation(bet.bet_id, "unverifiable", settlement.result, None, reason, overridden)
     outcome = "agree" if automatic.result == settlement.result else "discrepancy"
+    if not same_book(bet.book, settlement.book):
+        return Reconciliation(bet.bet_id, f"other_book_{outcome}", settlement.result, automatic.result,
+                              f"{settlement.book}'s result, not {bet.book}'s (the tipped book), so it says nothing about "
+                              f"{bet.book}'s rules; {automatic.detail}", overridden)
     return Reconciliation(bet.bet_id, outcome, settlement.result, automatic.result, automatic.detail, overridden)
 
 
 def reconciliation_text(bet: PlacedBet, item: Reconciliation) -> str:
     """One line per bet for the reconciliation report."""
-    label = {"agree": "AGREE", "discrepancy": "DISCREPANCY", "unverifiable": "NOT CHECKED",
+    label = {"agree": "AGREE", "discrepancy": "DISCREPANCY", "other_book_agree": "OTHER BOOK, AGREES",
+             "other_book_discrepancy": "OTHER BOOK, DISAGREES", "unverifiable": "NOT CHECKED",
              "unconfirmed": "UNCONFIRMED"}[item.outcome]
     results = (f"bookmaker {item.bookmaker_result or '-'} v automatic {item.automatic_result or '-'}"
                + (" (your reply overrode the recorded automatic result)" if item.overridden else ""))
@@ -436,9 +468,13 @@ def reconciliation_summary(items: Sequence[Reconciliation]) -> str:
     """Counts per outcome. A discrepancy is a failure of the assumed market contract, never a pass."""
     counts = {outcome: sum(1 for item in items if item.outcome == outcome) for outcome in RECONCILE_OUTCOMES}
     checked = counts["agree"] + counts["discrepancy"] + counts["unverifiable"]
-    verdict = ("FAIL: the assumed market rules disagree with a bookmaker's settlement" if counts["discrepancy"]
-               else "no discrepancy so far" if counts["agree"] else "nothing verified yet")
-    return (f"Settlement check: {checked} bookmaker result(s): {counts['agree']} agree, {counts['discrepancy']} "
-            f"DISCREPANCY, {counts['unverifiable']} could not be checked; {counts['unconfirmed']} automatic result(s) "
+    other = counts["other_book_agree"] + counts["other_book_discrepancy"]
+    verdict = ("FAIL: the assumed market rules disagree with a bookmaker's settlement"
+               if counts["discrepancy"] or counts["other_book_discrepancy"]
+               else "no discrepancy so far" if counts["agree"] else "nothing verified yet at the tipped book")
+    return (f"Settlement check: {checked} result(s) from the tipped book: {counts['agree']} agree, "
+            f"{counts['discrepancy']} DISCREPANCY, {counts['unverifiable']} could not be checked; {other} result(s) from "
+            f"another book ({counts['other_book_agree']} agree, {counts['other_book_discrepancy']} DISAGREE; never "
+            f"counted as agreement with the tipped book); {counts['unconfirmed']} automatic result(s) "
             f"not yet confirmed by a bookmaker; {sum(1 for item in items if item.overridden)} override(s). {verdict}. "
             "PRD Gate 3 needs every bet to reconcile.")

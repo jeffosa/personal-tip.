@@ -40,7 +40,7 @@ from prop_alpha.evaluation import lockbox  # noqa: E402
 from prop_alpha.evaluation.backtest import calibration_table  # noqa: E402
 from prop_alpha.evaluation.gate2 import MIN_BENCHMARK_PREDICTIONS, market_benchmark, score_line  # noqa: E402
 from prop_alpha.modeling.model_freeze import FROZEN_DIGEST, LOCKBOX_START, pricing_digest  # noqa: E402
-from prop_alpha.scanner.market_scanner import devig_two_way  # noqa: E402
+from prop_alpha.evaluation.value_evidence import closing_over  # noqa: E402
 
 STATE: Final[Path] = ROOT / ".prop_alpha_state"
 OUTCOMES_FILE: Final[Path] = STATE / "lockbox_outcomes.jsonl"
@@ -72,15 +72,6 @@ def load_outcomes(path: Path) -> dict[tuple[int, int], dict[str, Any]]:
             raise ValueError(f"{path.name} line {number} is not an outcome record")
         captured.setdefault((int(record["fixture_id"]), int(record["player_id"])), record)
     return captured
-
-
-def closing_over(quotes: Sequence[Mapping[str, Any]]) -> dict[tuple[int, int, str, float], float]:
-    """Devigged closing Over probability per (match, player, market, line), from the latest two-way capture."""
-    latest: dict[tuple[int, int, str, float], Mapping[str, Any]] = {}
-    for quote in sorted(quotes, key=lambda q: str(q["captured_at"])):
-        if quote.get("over") is not None and quote.get("under") is not None:
-            latest[(int(quote["fixture_id"]), int(quote["player_id"]), str(quote["market"]), float(quote["line"]))] = quote
-    return {key: devig_two_way(float(q["over"]), float(q["under"]))[0] for key, q in latest.items()}
 
 
 def score(scoring: lockbox.ScoringRows, closing: Mapping[tuple[int, int, str, float], float]) -> dict[str, Any]:

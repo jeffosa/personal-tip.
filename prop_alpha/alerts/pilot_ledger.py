@@ -38,12 +38,14 @@ from typing import Any, Collection, Final, Mapping, Sequence
 from prop_alpha.alerts import ledger
 from prop_alpha.alerts.ledger import PlacedBetStore
 from prop_alpha.alerts.replies import (
+    RECONCILE_FAILURES,
     RESULTS,
     PlacedBet,
     Settlement,
     profit,
     reconciliation_summary,
     reconciliation_text,
+    same_book,
     settlement_text,
 )
 from prop_alpha.alerts.telegram import TelegramNotifier, TipLine, load_config
@@ -232,9 +234,11 @@ def results_text(settled: Sequence[tuple[PlacedBet, Settlement]], closing: Seque
     by_result = {result: sum(1 for _, s in settled if s.result == result) for result in RESULTS}
     roi = f", return on stake {total / staked:+.1%}" if staked > 0 else ""
     confirmed = [(bet, s) for bet, s in settled if s.source != "auto"]
+    elsewhere = sum(1 for bet, s in confirmed if not same_book(bet.book, s.book))
     return (f"{len(settled)} settled paper bet(s) ({by_result['won']} won, {by_result['lost']} lost, {by_result['void']} void): "
             f"staked {staked:.2f}, paper profit {total:+.2f}{roi}; {len(settled) - len(confirmed)} provisional (automatic, assumed "
-            f"market rules), {len(confirmed)} with a bookmaker result you recorded; "
+            f"market rules), {len(confirmed)} with a bookmaker result you recorded"
+            + (f" ({elsewhere} of them another book's, not the tipped book's)" if elsewhere else "") + "; "
             f"{clv_summary([bet for bet, _ in settled], closing)}" + _model_scored(settled, reconstructed))
 
 
@@ -283,14 +287,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         # update_id 0: the settlement is the maintainer's, not a Telegram reply (a manual result needs one).
         book = args.book or "book not given"
         store.record_settlement(Settlement(bet_id, result, "manual", f"bookmaker result ({book}) recorded by hand", now,
-                                           update_id=0))
+                                           update_id=0, book=(args.book or "").strip() or None))
         print(f"recorded {result.upper()} for paper bet #{bet_id} as the bookmaker's result ({book})")
         return 0
     if args.reconcile:
         items = ledger.reconcile_settlements(store, dsn, now, PILOT_SETTLEMENT_SQL)
         lines = [reconciliation_text(bet, item) for bet, item in items if item.outcome != "unconfirmed"]
         print("\n".join([*lines, reconciliation_summary([item for _, item in items])]))
-        return 1 if any(item.outcome == "discrepancy" for _, item in items) else 0
+        return 1 if any(item.outcome in RECONCILE_FAILURES for _, item in items) else 0
     # The real ledger's lock as well: the notice goes through its answer queue (ledger_answers.jsonl), which only one writer
     # may touch at a time.
     # Keep the same global lock order as ledger.poll: real ledger first, then pilot store. The poll records Telegram

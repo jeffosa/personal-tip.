@@ -4,6 +4,8 @@ Only agreement passes; a disagreement is a discrepancy, and a bet that cannot be
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -13,9 +15,11 @@ import pytest
 from prop_alpha.alerts import ledger
 from prop_alpha.alerts.ledger import PlacedBetStore
 from prop_alpha.alerts.replies import (
+    RECONCILE_FAILURES,
     PlacedBet,
     Reconciliation,
     Settlement,
+    book_from_detail,
     reconcile,
     reconciliation_summary,
     reconciliation_text,
@@ -93,7 +97,7 @@ def test_summary_never_reports_a_discrepancy_or_an_unchecked_bet_as_a_pass() -> 
         return Reconciliation(1, outcome, bookmaker, automatic, "", overridden)
 
     clean = reconciliation_summary([item("agree", "won", "won"), item("unconfirmed", None, "lost")])
-    assert "1 bookmaker result(s): 1 agree, 0 DISCREPANCY, 0 could not be checked" in clean
+    assert "1 result(s) from the tipped book: 1 agree, 0 DISCREPANCY, 0 could not be checked" in clean
     assert "1 automatic result(s) not yet confirmed" in clean and "no discrepancy so far" in clean
     failing = reconciliation_summary([item("agree", "won", "won"), item("discrepancy", "lost", "won", True)])
     assert "1 DISCREPANCY" in failing and "FAIL" in failing and "1 override(s)" in failing
@@ -145,3 +149,48 @@ def test_the_reconcile_command_exits_1_on_a_discrepancy(tmp_path: Path, monkeypa
     monkeypatch.setattr(ledger, "PlacedBetStore", lambda: agreeing)
     assert ledger.main(["--reconcile"]) == 0
     assert "no discrepancy so far" in capsys.readouterr().out
+
+
+# ---------------- another bookmaker's result (audit 2026-10-25) ----------------
+def test_another_books_result_is_compared_but_never_counted_as_agreement_with_the_tipped_book() -> None:
+    bet = _bet()  # tipped at skybet
+    sportybet = Settlement(1, "won", "manual", "bookmaker result (sportybet) recorded by hand", NOW, update_id=0,
+                           book="sportybet")
+    agreeing = reconcile(bet, sportybet, ("final", 90, 2, 0), None, NOW)
+    assert agreeing.outcome == "other_book_agree" and "sportybet's result, not skybet's" in agreeing.detail
+    disagreeing = reconcile(bet, replace(sportybet, result="lost"), ("final", 90, 2, 0), None, NOW)
+    assert disagreeing.outcome == "other_book_discrepancy"
+    # The tipped book's own result, named in any case, or no book named (a settled reply), is the tipped book's.
+    assert reconcile(bet, replace(sportybet, book="SkyBet"), ("final", 90, 2, 0), None, NOW).outcome == "agree"
+    assert reconcile(bet, replace(sportybet, book=None), ("final", 90, 2, 0), None, NOW).outcome == "agree"
+    summary = reconciliation_summary([agreeing, disagreeing])
+    assert "0 result(s) from the tipped book: 0 agree" in summary and "2 result(s) from another book (1 agree, 1 DISAGREE" in summary
+    assert summary.endswith("PRD Gate 3 needs every bet to reconcile.") and "FAIL" in summary
+    assert "nothing verified yet at the tipped book" in reconciliation_summary([agreeing])
+    assert "OTHER BOOK, DISAGREES" in reconciliation_text(bet, disagreeing)
+    assert set(RECONCILE_FAILURES) == {"discrepancy", "other_book_discrepancy"}
+
+
+def test_a_settlement_names_its_bookmaker_only_when_manual_and_trimmed() -> None:
+    with pytest.raises(ValueError, match="names a bookmaker"):
+        Settlement(1, "won", "auto", "auto", NOW, 2, 90, book="bet365")
+    for bad in ("", " bet365"):
+        with pytest.raises(ValueError, match="names a bookmaker"):
+            Settlement(1, "won", "manual", "x", NOW, update_id=1, book=bad)
+
+
+def test_older_records_name_their_bookmaker_in_the_detail(tmp_path: Path) -> None:
+    assert book_from_detail("bookmaker result (sportybet (maintainer's ticket 11-12 Oct, MARKET_CONTRACT.md 2d/2e)) "
+                            "recorded by hand") == "sportybet"
+    assert book_from_detail("bookmaker result (betway) recorded from Telegram") == "betway"
+    assert book_from_detail("bookmaker result (book not given) recorded by hand") is None
+    assert book_from_detail("reported") is None
+    store = PlacedBetStore(tmp_path / "bets.jsonl")
+    store.record_bet(_bet(1))
+    store.record_bet(_bet(2))
+    store.path.open("a", encoding="utf-8").write(json.dumps({  # written before settlements carried "book"
+        "event": "settled", "bet_id": 1, "result": "lost", "source": "manual", "update_id": 0,
+        "detail": "bookmaker result (sportybet (ticket)) recorded by hand", "at": NOW.isoformat()}) + "\n")
+    store.record_settlement(Settlement(2, "won", "manual", "bookmaker result (bet365) recorded by hand", NOW,
+                                       update_id=0, book="bet365"))
+    assert {bet.bet_id: settlement.book for bet, settlement in store.settled_bets()} == {1: "sportybet", 2: "bet365"}
