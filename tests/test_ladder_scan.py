@@ -147,8 +147,10 @@ def _tip_brazil(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _verified_contract(monkeypatch: pytest.MonkeyPatch, *books: str) -> None:
-    monkeypatch.setattr(market_contract, "VERIFIED_CONTRACTS",
-                        {(book, "tackles"): VoidRule.VOID_IF_NO_APPEARANCE.value for book in books or ("bet365",)})
+    monkeypatch.setattr(market_contract, "VERIFIED_CONTRACTS", {
+        (book, "tackles"): market_contract.Contract(pilot_ledger.PILOT_TACKLES_SQL, VoidRule.VOID_IF_NO_APPEARANCE.value,
+                                                    f"{book}_tackles.json")
+        for book in books or ("bet365",)})
 
 
 def _quote(over: float | None, under: float | None) -> LiveOddsQuote:
@@ -831,7 +833,15 @@ def test_without_a_verified_contract_a_real_price_tip_is_withheld_and_no_paper_b
     text = ladder_scan.summary_text(summary, "")
     assert f"Tips withheld: {summary.withheld} (the bookmaker's settlement rules" in text
     # A contract for the right book but another void rule (bet365 voids non-starters, a lead) is not this contract.
-    monkeypatch.setattr(market_contract, "VERIFIED_CONTRACTS", {("bet365", "tackles"): VoidRule.VOID_IF_NOT_STARTING.value})
+    monkeypatch.setattr(market_contract, "VERIFIED_CONTRACTS", {("bet365", "tackles"): market_contract.Contract(
+        pilot_ledger.PILOT_TACKLES_SQL, VoidRule.VOID_IF_NOT_STARTING.value, "bet365_tackles.json")})
     again = _run(tmp_path, _Recording(store), store, odds="oddspapi",
                  odds_client=_FakeOdds(_ladder_body({"Regular Starter": (2.6, 9.0, 1.45)})))
     assert again.alerts_sent == 0 and again.withheld >= 1
+
+    # A contract on another count (tackles won) is not the count the pilot prices: still withheld.
+    monkeypatch.setattr(market_contract, "VERIFIED_CONTRACTS", {("bet365", "tackles"): market_contract.Contract(
+        "s.tackles_won", VoidRule.VOID_IF_NO_APPEARANCE.value, "bet365_tackles.json")})
+    other_count = _run(tmp_path, _Recording(store), store, odds="oddspapi",
+                       odds_client=_FakeOdds(_ladder_body({"Regular Starter": (2.6, 9.0, 1.45)})))
+    assert other_count.alerts_sent == 0 and other_count.withheld >= 1

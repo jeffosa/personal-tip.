@@ -314,6 +314,44 @@ For one bookmaker and one market:
    <book>` or `pilot_ledger --record --book`.
 3. **Reconciliation:** `pilot_ledger --reconcile` / `ledger --reconcile` report every one of them AGREE at that book, with no
    DISCREPANCY and no override; any discrepancy is investigated and resolved here before the count restarts.
-4. **Then** the maintainer adds `(book, market): void rule` to `market_contract.VERIFIED_CONTRACTS`, with a test, in a PR. If the
+4. **Then** the maintainer adds `(book, market): Contract(statistic, void rule, evidence file)` to `market_contract.VERIFIED_CONTRACTS` in a PR, and `tests/test_market_contract.py` checks the evidence (section 11). If the
    verified statistic or void rule differs from what the model prices, the pricing change needs a new freeze and a later lockbox
    start first (`LOCKBOX_PROTOCOL.md`).
+
+## 11. Second pass (2026-10-25, later): criteria enforced in code; evidence still absent
+
+**Verified: nothing.** No bookmaker or market meets section 10, and `VERIFIED_CONTRACTS` stays empty.
+
+- **First-hand rules, attempted again and blocked:**
+  - help.bet365.com (en-gb and en-us pages): HTTP 403 to a direct fetch.
+  - betway.com: refused by the browser pane ("not allowed due to safety restrictions").
+  - Betway's regional rules pages (betway.co.za redirects to betway.com.ng): rendered by script, so a fetch returns no text.
+  - Search summaries of Betway's African pages say a player who does not start voids his bets. Those are summaries, of a
+    regional site whose relation to OddsPapi's `betway` is unknown, so they do not count (section 10.1).
+  - **The maintainer must supply the wording:** paste each page into the evidence file with its URL and date, or obtain a
+    written support reply (section 5).
+- **Same-book settlements: 0** for bet365 and Betway, in either market. Paper tips are never settled by a bookmaker. Examples
+  can only come from bets the maintainer places by hand, or from settled selections the maintainer can read in a bookmaker
+  account, recorded with the bookmaker named:
+  - `result <tip> won|lost|void bet365` in Telegram, or `pilot_ledger --record <tip> <result> --book bet365`, for pilot tips;
+  - `settled <id> <result>` for bets recorded with `placed`.
+- **The criteria are now code, not prose** (`alerts/market_contract.py`):
+  - A contract is `Contract(statistic, void_rule, evidence)`. `evidence_failures` checks the evidence file
+    `contract_evidence/<book>_<market>.json` for:
+    - first-hand wording on all five rule topics;
+    - at least 20 same-book examples, deduplicated;
+    - every example agreeing with the contract;
+    - at least 3 discriminating examples;
+    - every rival count (`RIVAL_STATISTICS`: tackles won, tackles plus challenges lost, tackles plus interceptions, tackles
+      won plus interceptions; fouls plus fouls drawn) contradicted by an example;
+    - a substitute appearance;
+    - a named player who did not start or play.
+  - `tests/test_market_contract.py` fails if a listed contract's evidence misses any criterion.
+  - The gate sends a tip only when the contract settles on the very count and void rule the model priced
+    (`MODEL_STATISTICS`; the pilot's `PILOT_STATISTICS`). A contract that settles on another count, or voids non-starters
+    while the scans price "void only if he does not play", keeps the tips withheld until the pricing is changed under a new
+    freeze and a later lockbox start.
+- **Progress report:** `python scripts/contract_evidence.py --book bet365 --market tackles` gathers the same-book results in
+  both ledgers, adds their stored counts and prints what is missing; `--write` saves a draft for the maintainer to complete.
+  A pilot result counts only if it names the bookmaker. On 2026-10-25 all four book-market pairs had 0 examples, and every
+  rule topic was missing.

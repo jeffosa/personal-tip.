@@ -11,7 +11,36 @@ settlements, closing prices) that code cannot produce. They take calendar time a
 
 Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not executed where it will run · **[N]** not built.
 
-## Status on 2026-10-25 (b): settlement rules and model value audited (read this first)
+## Status on 2026-10-25 (c): contract criteria enforced; still no evidence (read this first)
+
+**Still PAPER ONLY; no go-live gate passed; real-price tips stay withheld.**
+- Brazil Serie A tips: every pilot tip is a paper bet (`pilot_ledger.record_tips`) and carries the PILOT label. No execution
+  component exists, and every real-price tip is now withheld by the contract gate.
+- No pricing, risk default or settlement grading changed; `FROZEN_DIGEST` is unchanged.
+- Nothing in the pilot results, backtests, screen replay, edge calibration or model-v-book comparisons is evidence of an edge.
+  The edge calibration found the model's favoured prices mostly the model's errors.
+
+| Requirement | State | Evidence |
+|---|---|---|
+| First-hand rules per book and market | **Not met** for bet365 and Betway, tackles and fouls | bet365 help pages answer 403; betway.com is refused by the browser pane; Betway's regional pages render no text (`MARKET_CONTRACT.md` section 11) |
+| 20+ same-book settlements per market, discriminating, a substitute, a non-starter | **0 of 20** for every pair | `scripts/contract_evidence.py` on 2026-10-25 |
+| Reconciliation | 0 same-book results; 5 SportyBet results on bet365 tips are another book's, never counted | `pilot_ledger --reconcile` |
+| Contract listed | none (`VERIFIED_CONTRACTS` empty); a listed contract now fails CI without evidence meeting every criterion [T] | `tests/test_market_contract.py` |
+| Model statistic and void rule match the contract | cannot be judged without a contract. The gate now requires the contract's count and void rule to equal the ones priced [T] | `market_contract.contract_verified` |
+| Prospective predictions, same-book outcomes, two-way closing prices | 0, 0, 0 | `scripts/value_evidence.py` |
+| Calibration, Brier skill, benchmark, ROI, CLV per market and line | **not judged**: no rows. ROI and CLV are now also reported per line [T] | `evaluation/value_evidence.py` |
+
+**Changes in this pass** (tests fail without them):
+- `market_contract.Contract`, `evidence_failures` and `expected_result`; the gate checks the priced count.
+- `contract_evidence/` (README, TEMPLATE).
+- `scripts/contract_evidence.py`: same-book results only; a pilot result must name its bookmaker.
+- Tips' ROI and CLV are reported per line.
+
+**Gates that could not be completed, and why:** first-hand rules (blocked from here; the maintainer's paste or a support
+reply is needed); same-book settlements (none exist; they need bets placed by hand or results read in a bookmaker account);
+every value metric (the lockbox opens 2026-10-27 and no closing price or same-book outcome exists).
+
+## Status on 2026-10-25 (b): settlement rules and model value audited
 
 **Still PAPER ONLY; no go-live gate passed. Real-price tipping is now disabled** until a bookmaker's settlement contract is
 verified (`alerts/market_contract.py`). No pricing, staking, risk default or settlement grading changed; `FROZEN_DIGEST` is
