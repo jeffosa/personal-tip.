@@ -398,3 +398,13 @@ substitute's Betway bet on his count where Betway voids it.
   - In the pilot (not frozen) it needs no lockbox restart.
   - The frozen League One/Two model would need a new freeze and a later lockbox start, if a Betway League One/Two market ever
     appears.
+
+**Second Betway document reviewed (2026-10-25): no tackles or fouls rules.**
+- Document: "Betway – Betting Rules" for Malawi: limits in Kwacha; section dates 2014-2019; file created 2022-08-29; 102 pages.
+  Supplied by the maintainer as `BettingRules_MW_en.pdf`, SHA-256
+  `ce5f95596c565c5117c7322a2568032616e5d5f284c307775fae30da34900639`.
+- Its football section has no player tackles or fouls market: no tackle definition, no player fouls, and no rule on player
+  proposition participation. Nothing from it is recorded in `contract_evidence/`.
+- It shows Betway's rules differ by operator. For example, a postponed league match stands for 24 hours in this document but is
+  void if not played that day in v42. So the operator behind OddsPapi's `betway` must be identified before any Betway
+  rule document can count.
