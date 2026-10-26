@@ -2,9 +2,13 @@
 generator).
 
 Per market and line: Brier skill against climatology with a fixture-clustered bootstrap 90% interval, the logistic
-calibration slope, and the worst calibration bin with at least MIN_BIN_PREDICTIONS predictions. For a binary
+calibration slope, and the calibration bins with at least MIN_BIN_PREDICTIONS predictions. For a binary
 outcome the climatology Brier score of a sample is ybar (1 - ybar), so each resample's skill is computed from
 per-fixture sums without re-scoring every prediction. Thresholds are the PRD's (prop_alpha_PRD_v3.1.md, Gate 2).
+
+The bin criterion is the count-weighted mean gap of those bins, at most MAX_BIN_GAP (PRD amendment, maintainer
+2026-10-26: Option 3 of GATE2_CALIBRATION_DECISION_MEMO.md). It replaced "every bin within MAX_BIN_GAP", which a
+perfectly calibrated model almost never passes at the lockbox's sample sizes. The worst bin is still reported.
 """
 
 from __future__ import annotations
@@ -110,6 +114,16 @@ def worst_bin_gap(probabilities: ArrayLike, outcomes: ArrayLike) -> float:
     return max(gaps) if gaps else math.nan
 
 
+def mean_bin_gap(probabilities: ArrayLike, outcomes: ArrayLike) -> float:
+    """|mean predicted - observed| averaged over calibration bins with >= MIN_BIN_PREDICTIONS, each weighted by its
+    count (the PRD Gate 2 bin criterion since 2026-10-26); nan if no bin has that many."""
+    p, y = _arrays(probabilities, outcomes)
+    bins = [b for b in calibration_table(p, y) if b.n >= MIN_BIN_PREDICTIONS]
+    if not bins:
+        return math.nan
+    return sum(b.n * abs(b.mean_predicted - b.observed_rate) for b in bins) / sum(b.n for b in bins)
+
+
 @dataclass(frozen=True)
 class LineScore:
     n: int
@@ -124,6 +138,7 @@ class LineScore:
     calibration_intercept: float
     calibration_slope: float
     worst_bin_gap: float
+    mean_bin_gap: float
     calibration_note: str = ""
 
     @property
@@ -134,7 +149,8 @@ class LineScore:
             "skill (90% lower bound > 0)": self.skill_low > 0.0,
             "calibration slope in [0.9, 1.1]": not math.isnan(self.calibration_slope)
             and CALIBRATION_SLOPE_RANGE[0] <= self.calibration_slope <= CALIBRATION_SLOPE_RANGE[1],
-            "every bin of >= 50 within 0.03": not math.isnan(self.worst_bin_gap) and self.worst_bin_gap <= MAX_BIN_GAP,
+            "weighted mean gap of bins of >= 50 within 0.03": not math.isnan(self.mean_bin_gap)
+            and self.mean_bin_gap <= MAX_BIN_GAP,
         }
 
     @property
@@ -155,7 +171,7 @@ def score_line(fixtures: Sequence[int], probabilities: ArrayLike, outcomes: Arra
         n=len(p), n_fixtures=len(set(int(f) for f in fixtures)), base_rate=base, brier=brier,
         brier_climatology=climatology, skill=1.0 - brier / climatology, skill_low=low, skill_high=high,
         log_loss=log_loss(p, y), calibration_intercept=fit.intercept, calibration_slope=fit.slope,
-        worst_bin_gap=worst_bin_gap(p, y), calibration_note=fit.note,
+        worst_bin_gap=worst_bin_gap(p, y), mean_bin_gap=mean_bin_gap(p, y), calibration_note=fit.note,
     )
 
 

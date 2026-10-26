@@ -746,12 +746,14 @@ def results_summary(settled: Sequence[tuple[PlacedBet, Settlement]],
 
 
 @contextmanager
-def ledger_lock(path: Path = DEFAULT_LOCK_FILE) -> Iterator[None]:
+def ledger_lock(path: Path = DEFAULT_LOCK_FILE, *, wait: bool = False) -> Iterator[None]:
     """Hold an exclusive OS lock for a run that writes the ledger (--poll, --settle). Delivery audit 2026-10-05: the
     scheduled task runs one instance at a time, but a manual --poll during it could read the same Telegram update in
     both runs before either recorded it, recording one bet twice. The lock is released by the OS if the process dies,
     so a crash never leaves it stuck. A second writer fails at once (OSError from the lock call), recorded by the
-    scheduled script as a failed step, rather than waiting or writing."""
+    scheduled script as a failed step, rather than waiting or writing. With `wait` (task_health, 2026-10-26: two tasks
+    catching up after the laptop wakes report at the same moment) the second one waits instead: on Windows the OS retries
+    for about 10 seconds before raising OSError; elsewhere it blocks until the lock is free (the unit's timeout bounds it)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+b")
     try:
@@ -759,11 +761,11 @@ def ledger_lock(path: Path = DEFAULT_LOCK_FILE) -> Iterator[None]:
             import msvcrt
 
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK, 1)
         else:
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
         logger.info("ledger lock taken (%s)", path.name)
         yield
         if sys.platform == "win32":

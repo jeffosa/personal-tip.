@@ -4,12 +4,15 @@ Scores the predictions the scan logged before kickoff (alerts/predictions.py), n
 outcome captured once into `.prop_alpha_state/lockbox_outcomes.jsonl` (append-only; captured 72 hours after kickoff from
 Sportmonks' counts in `prop_alpha`; a later vendor revision is reported, never applied).
 
-Until every Gate 2 line has PROTOCOL.min_scored_per_line scored predictions it reports counts only: eligible, scored,
-pending, missing, void and excluded by reason, so the lockbox cannot be looked at, or tuned on, before it is complete.
-Then it computes every Gate 2 metric once (evaluation/gate2.py: Brier skill with its fixture-clustered 90% interval,
-calibration slope and intercept, the calibration bins, the worst bin of >= 50, and the closing-market benchmark where at
-least MIN_BENCHMARK_PREDICTIONS two-way closing prices exist) and writes `.prop_alpha_state/gate2_prospective_result.json`;
-a later run prints that result and refuses to score again. A missing benchmark or sample is a fail, never a pass.
+Until every Gate 2 line has PROTOCOL.min_scored_per_line scored predictions from PROTOCOL.min_scored_fixtures_per_line
+distinct matches (amendment of 2026-10-26: 500 from 320; only kickoffs before PROTOCOL.end count) it reports counts only:
+eligible, scored, pending, missing, void and excluded by reason, so the lockbox cannot be looked at, or tuned on, before it
+is complete. Then it computes every Gate 2 metric once (evaluation/gate2.py: Brier skill with its fixture-clustered 90%
+interval, calibration slope and intercept, the calibration bins, their count-weighted mean gap (the criterion) and worst
+bin of >= 50, and the closing-market benchmark where at least MIN_BENCHMARK_PREDICTIONS two-way closing prices exist) and
+writes `.prop_alpha_state/gate2_prospective_result.json`; a later run prints that result and refuses to score again. A
+missing benchmark or sample is a fail, never a pass. A lockbox that closes (PROTOCOL.end plus PROTOCOL.missing_after)
+short of the threshold gets a one-time NOT PASSED result in the same file, with no metric computed: it is never scored.
 
 Refuses to run on pricing code other than the protocol's. Read-only on the database; writes only the outcome ledger
 (not with --dry-run) and the one result file.
@@ -112,6 +115,24 @@ def score(scoring: lockbox.ScoringRows, closing: Mapping[tuple[int, int, str, fl
     return result
 
 
+def expired_result(scoring: lockbox.ScoringRows, now: datetime) -> dict[str, Any]:
+    """The result of a lockbox that closed short of the threshold: NOT PASSED, no metric computed."""
+    protocol = lockbox.PROTOCOL
+    counts = {f"{market} over {line}": {"scored": len(rows), "matches": len({r[0] for r in rows})}
+              for (market, line), rows in sorted(scoring.rows.items())}
+    return {"scored_at": now.isoformat(), "expired": True, "passed": False, "counts": counts,
+            "blockers": [f"the lockbox closed short of {protocol.min_scored_per_line} scored predictions from "
+                         f"{protocol.min_scored_fixtures_per_line} matches on every line (kickoffs before "
+                         f"{protocol.end:%Y-%m-%d}): NOT PASSED, never scored"]}
+
+
+def stored_summary(stored: Mapping[str, Any]) -> list[str]:
+    """How a stored result is shown on every later run."""
+    head = (f"Lockbox closed unscored on {stored['scored_at']}: NOT PASSED; it is never scored." if stored.get("expired")
+            else f"Scored once on {stored['scored_at']}: {'PASS' if stored['passed'] else 'NOT PASSED'}; not scored again.")
+    return [head, *(f"  - {blocker}" for blocker in stored["blockers"])]
+
+
 def write_result_once(result: Mapping[str, Any]) -> dict[str, Any] | None:
     """Atomically enforce the protocol's one-look rule across concurrent scorer processes."""
     with ledger_lock(RESULT_LOCK_FILE):
@@ -185,19 +206,26 @@ def main(argv: Sequence[str] | None = None) -> int:
           f"revised at the source since capture (not applied): {len(changed)}")
     for (market, line), rows in sorted(scoring.rows.items()):
         print(f"  {market} over {line}: {len(rows)} scored of {protocol.min_scored_per_line} needed, "
-              f"{len({r[0] for r in rows})} matches")
+              f"{len({r[0] for r in rows})} matches of {protocol.min_scored_fixtures_per_line} needed")
+    print(f"  lockbox end: kickoffs before {protocol.end:%Y-%m-%d}; it closes unscored on "
+          f"{protocol.end + protocol.missing_after:%Y-%m-%d} if the threshold is not reached")
     if args.capture_only:
         print("Capture only: outcomes captured, nothing scored (scoring is a separate, deliberate run).")
         return 0
     if RESULT_FILE.is_file():
         stored = json.loads(RESULT_FILE.read_text(encoding="utf-8"))
-        print(f"Scored once on {stored['scored_at']}: {'PASS' if stored['passed'] else 'NOT PASSED'}; not scored again.")
-        for blocker in stored["blockers"]:
-            print(f"  - {blocker}")
+        print("\n".join(stored_summary(stored)))
         return 0
+    if lockbox.expired(scoring, now):
+        if args.dry_run:
+            print("Closed short of the threshold: NOT PASSED; a run without --dry-run records that once.")
+            return 1
+        stored = write_result_once(expired_result(scoring, now))
+        print("\n".join(stored_summary(stored if stored is not None else expired_result(scoring, now))))
+        return 1
     if not lockbox.ready_to_score(scoring):
-        print("NOT SCORED: the metrics are computed once, when every line has the required scored predictions; "
-              "until then only counts are shown. Gate 2 is not passed.")
+        print("NOT SCORED: the metrics are computed once, when every line has the required scored predictions from the "
+              "required matches; until then only counts are shown. Gate 2 is not passed.")
         print(f"  Also open whatever the lockbox shows: {', '.join(UNPRICED_TARGET_MARKETS)} is not priced; the market "
               "benchmark needs closing prices (none captured so far); predictions use estimated line-ups, not team sheets.")
         return 1
@@ -211,9 +239,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                    "revised_since_capture": len(changed)})
     stored = write_result_once(result)
     if stored is not None:
-        print(f"Scored once on {stored['scored_at']}: {'PASS' if stored['passed'] else 'NOT PASSED'}; not scored again.")
-        for blocker in stored["blockers"]:
-            print(f"  - {blocker}")
+        print("\n".join(stored_summary(stored)))
         return 0 if stored["passed"] else 1
     print(f"Scored once: {'PASS' if result['passed'] else 'NOT PASSED'} (written to {RESULT_FILE.name})")
     for blocker in result["blockers"]:

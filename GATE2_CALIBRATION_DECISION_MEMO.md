@@ -1,9 +1,11 @@
 # Gate 2 calibration criterion: audit and pre-registered decision memo
 
-**Status: FOR MAINTAINER DECISION. No gate or model setting has been changed, and no option is recommended or in force.**
-- The PRD threshold, the bins, the frozen model, the lockbox start (2026-10-27 00:00 UTC) and the scorer are exactly as they were at commit `7e06938`.
-- This memo records two analyses and a set of alternatives. None takes effect until the maintainer approves one specific option in writing (section 7).
-- An approved option would be implemented, with tests, in a separate change.
+**Status: DECIDED 2026-10-26. The maintainer chose Option 3, with 320 matches and a stop date of 31 May 2027 (section 7).**
+- The decision was made at 20:44 UTC, before the lockbox started (2026-10-27 00:00 UTC) and before any lockbox prediction or outcome existed.
+- It is implemented in `evaluation/gate2.py`, `evaluation/lockbox.py` and `scripts/gate2_prospective.py`, with `tests/test_gate2_calibration_rule.py`.
+- It is recorded in the PRD (Gate 2 criterion 3) and in `LOCKBOX_PROTOCOL.md` section 4.
+- The frozen model, `FROZEN_DIGEST`, the lockbox start, the bins and the 0.03 tolerance are unchanged.
+- Sections 1 to 6 below are the analysis as it stood when the decision was made.
 
 Prepared 2026-10-26 (UTC); revision history at the end. Reproduce from the repository root:
 
@@ -297,12 +299,15 @@ These figures support a decision not to score at the current trigger. On their o
 
 ## 7. Decision record (maintainer)
 
-- Option chosen (0 / 1 / 2 / 3 / 4, or another, specified exactly):
-- Scoring threshold (fixtures and scored predictions per line) and stop date:
-- Bootstrap settings (resamples, seed) for any interval-based rule:
-- PRD wording change approved (yes/no; text):
-- Further analysis required before implementation (section 5 a–d; yes/no):
-- Decided by / date and time (UTC), recorded before any lockbox outcome was viewed:
+- **Option chosen:** 3. The bin criterion is the count-weighted mean of |mean p̂ − ȳ| over the 10 equal-width bins with ≥ 50 predictions, at most 0.03. The slope range [0.9, 1.1] and the skill rule (fixture-clustered 90% lower bound > 0) are unchanged.
+- **Scoring threshold and stop date:**
+  - Score once, when every Gate 2 line has at least 500 scored predictions from at least 320 distinct matches.
+  - Only kickoffs before 2027-06-01 00:00 UTC (stop date 31 May 2027) count.
+  - A lockbox still short of the threshold when it closes on 2027-06-15 (the end plus the 14 days for missing outcomes) is NOT PASSED, recorded once and never scored.
+- **Bootstrap settings:** none needed. The chosen rule is a point estimate; the skill interval keeps the protocol's 10,000 resamples and seed 20261027.
+- **PRD wording change approved:** yes. Gate 2 criterion 3 now reads: "Over the calibration bins (10 equal-width bins on [0, 1]) with ≥ 50 predictions, the mean of |p̄ − ȳ| weighted by each bin's count must be ≤ 0.03", with an amendment note.
+- **Further analysis required before implementation:** not requested.
+- **Decided by:** the maintainer, in this session, on 2026-10-26 at 20:44 UTC. No lockbox outcome existed: the lockbox starts 2026-10-27 00:00 UTC.
 
 **Implementation after approval** is a separate change, with tests that fail before it:
 - the new criterion in `evaluation/gate2.py` (pure);
@@ -322,3 +327,4 @@ None of these files are in `model_freeze.PRICING_CODE`, so `FROZEN_DIGEST` and t
   - added method B's ±0.10 log-odds results and the per-line size of each shift;
   - rebuilt the options table from both methods;
   - removed every recommendation.
+- **v4 (2026-10-26):** the maintainer chose Option 3 with 320 matches and stop date 31 May 2027. The status and decision record were filled in, and the decision was implemented in a separate change.

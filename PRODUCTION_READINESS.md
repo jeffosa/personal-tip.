@@ -11,7 +11,78 @@ settlements, closing prices) that code cannot produce. They take calendar time a
 
 Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not executed where it will run · **[N]** not built.
 
-## Status on 2026-10-26 (c): operational protections for the lockbox period (read this first)
+## Status on 2026-10-26 (e): scheduler reliability: missed runs verified, silence and battery now detected (read this first)
+
+**Uptime is NOT fixed.** These changes make silence visible; only an always-on, plugged-in, online and logged-in machine
+prevents it.
+
+**Missed runs, verified from local evidence** (`status.log`, `ledger.log`, `backup.log`, the Windows System and
+NetworkProfile event logs, `powercfg`, the task definitions):
+
+| Day (UTC) | 4-hourly status reports completed (of 6) |
+|---|---|
+| 16 Oct | 2 |
+| 17 Oct | 0 |
+| 18 Oct | 1 |
+| 19, 20 Oct | 0 |
+| 21 Oct | 3 |
+| 22 Oct | 1 |
+| 23, 24 Oct | 0 |
+| 25 Oct | 5 |
+| 26 Oct | 3 (the 20:00 run's report failed: Telegram connect timeout) |
+
+- **Ledger poll:** active in 2–54 of 144 ten-minute slots on the days it ran, and none on 17, 19, 20, 23 and 24 Oct.
+- **Backups:** written on 16, 18, 21, 22, 25 and 26 Oct.
+
+**Causes found in the event logs** (local time UTC+1):
+- **Battery.** The laptop was on battery for long spells, for example 21 Oct 19:16 to 24 Oct 12:42. The power plan sleeps on battery after 180 seconds idle (DC STANDBYIDLE 0xb4), with wake timers off (DC RTCWAKE 0). CLAUDE.md had said 180 minutes, which was wrong.
+- **Sleep.** Spells of up to 17 hours, e.g. 22 Oct 00:03 to 16:51.
+- **No network.** No connection from 22 Oct 19:21 to 25 Oct 04:18; every task requires one.
+- **Logged off.** From 22 Oct 21:10 to 23 Oct 15:19; the tasks need a logged-on user.
+- **Unclean shutdowns** (Kernel-Power 41), probably a flat battery: off from 19 Oct 07:23 to 21 Oct 09:00.
+
+**The task definitions are unchanged.** Every 4 hours from 12:00 UTC, every 10 minutes, and daily at 02:30 UTC; all wake the machine, catch up and require a network and a logged-on user.
+
+| Change [T] | What it gives |
+|---|---|
+| `task_health`: on the first report after no task ran for over 40 minutes, SCHEDULER WAS SILENT (start, end, hours, the 4-hourly runs, polls and backups inside it), appended to `scheduler_gaps.jsonl` (in the backup). The per-task "not running" flags it explains are not sent separately | A silent spell is always reported once the laptop is back, with what it cost |
+| `task_health`: every run reads the power source (Windows `GetSystemPowerStatus`) and sends ON BATTERY once per battery spell (again after 6 hours) | A warning before the laptop sleeps, not after |
+| `task_health` takes an OS lock while it reports (`ledger_lock(..., wait=True)`: the OS's own bounded wait, no new exception handler) | Two tasks catching up at the same moment do not both alert one gap |
+| Status report: silent periods of the last 7 days (WARNING when the latest ended within 24 hours), the power source (WARNING on battery), and "Next status report due by HH:MM UTC" | While the laptop is silent nothing on it can alert; a missing report by that time is the signal |
+| A gap record cut short by a power loss is dropped before the next write, and ignored when read | The status report cannot be broken by a half-written gap record |
+
+**Seen live:** at 21:02 UTC on 26 Oct, the scheduled poll ran the new code from this working tree. It read "battery (26%)", sent the ON BATTERY alert and saved its state under the new lock.
+
+**Still needs live verification [U]:**
+- a SCHEDULER WAS SILENT alert after a real sleep or shutdown;
+- the new status-report lines in a sent report;
+- two tasks reporting at the same moment after a wake.
+
+**Not addressed** (needs a decision or another machine):
+- paging while the laptop is silent (an outside monitor);
+- the power plan, a system setting left for the maintainer: on battery it sleeps after 3 minutes with wake timers off;
+- the network and logon dependencies.
+
+**Found while verifying, not fixed:** `slate.scan_window` covers [now, next boundary). A kickoff exactly on a 4-hour boundary (20:00 or 00:00 UTC) falls between two runs and is never scanned. Monday's 20:00 UTC Walsall v Salford got a T-60 team sheet but was not in the 20:00 scan.
+
+## Status on 2026-10-26 (d): Gate 2 calibration rule amended before the lockbox start
+
+**Still PAPER ONLY; no gate passed.** The maintainer decided at 20:44 UTC on 2026-10-26, before the lockbox started and
+before any lockbox prediction or outcome existed. The decision was Option 3 of `GATE2_CALIBRATION_DECISION_MEMO.md`, with
+320 matches and a stop date of 31 May 2027.
+
+| Change [T] | Why |
+|---|---|
+| PRD Gate 2 criterion 3: the bin rule is the count-weighted mean gap of bins of 50+, at most 0.03 (`gate2.mean_bin_gap`); the worst bin is still reported | "Every bin of 50+ within 0.03" almost never passes a perfectly calibrated model: 0 of 1,000 and 0 of 2,000 simulations at the old trigger; 0.1–1.6% at 320 matches |
+| The single look waits for 500 scored predictions from 320 matches on every line (`PROTOCOL.min_scored_fixtures_per_line`) | At about 21 matches (the old trigger), the slope rule alone passes a perfect model 2.5% of the time |
+| Only kickoffs before 2027-06-01 count (`PROTOCOL.end`). A lockbox still short of the threshold when it closes (2027-06-15) is recorded NOT PASSED once and never scored (`lockbox.expired`) | A pre-registered stop: no open-ended wait, and no second look |
+
+- **Unchanged:** the frozen model, `FROZEN_DIGEST`, the lockbox start, the eligibility rules, the bins, the 0.03 tolerance, and the slope and skill rules.
+- **Expected performance at 320 matches** (memo, section 5): a perfect model passes 0.71–0.90 of the time, depending on dependence within matches. Errors above the tolerance pass at most 0.11, and clearly wrong slopes never.
+- **What still blocks Gate 2:** the market benchmark (no League One/Two closing prices), `yellow_card`, and team-sheet line-ups.
+- **Time to collect:** 320 matches take about 11–13 weeks with every match captured, and longer at October's uptime.
+
+## Status on 2026-10-26 (c): operational protections for the lockbox period
 
 **Still PAPER ONLY.** Only fail-closed operational and evidence-integrity changes; the pricing digest (`839e97ce...`), the
 lockbox start (2026-10-27 00:00 UTC) and the protocol are unchanged.

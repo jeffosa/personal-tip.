@@ -52,18 +52,20 @@ Findings:
 | Item | Value |
 |---|---|
 | Start | kickoff on or after 2026-10-27 00:00 UTC |
+| End (amendment of 2026-10-26) | kickoff before 2027-06-01 00:00 UTC (stop date 31 May 2027); the lockbox closes 14 days later (2027-06-15) |
+| Scoring threshold (amendment of 2026-10-26) | 500 scored predictions from 320 distinct matches on every Gate 2 line |
 | Pricing code | digest `839e97ce504eaecd29a7b435fea9980e0a3d3401e648d4cee70a39b1ca63275f` (frozen 2026-10-05; settings are part of the fingerprinted code: game-state k 6 / 1000, tackles multiplier 0.9483, prior strength 6, 30,000 pseudo-minutes) |
 | Data source | Sportmonks (`DATA_VENDOR=sportmonks`), database `prop_alpha` |
 | Leagues | League One, League Two |
 | Markets and lines | tackles over 0.5, 1.5, 2.5; fouls over 0.5, 1.5 (`model_freeze.GATE2_LINES`) |
 | Outcome | `tackles_attempted`, `fouls_committed` in `player_match_stats`; a player who did not play (0 minutes or no row) is void and not scored |
 | Probability scored | the logged over probability given the player plays: p_win / (p_win + p_lose) |
-| Scoring | `evaluation/gate2.py` (PRD Gate 2 thresholds), fixture-clustered bootstrap, seed 20261027 |
+| Scoring | `evaluation/gate2.py` (PRD Gate 2 thresholds; bin criterion: count-weighted mean gap of bins of 50+ within 0.03, since the 2026-10-26 amendment), fixture-clustered bootstrap, seed 20261027 |
 
 **Eligible prediction:** a logged line with
 1. the protocol's digest;
 2. data vendor `sportmonks` recorded on it;
-3. kickoff on or after the start;
+3. kickoff on or after the start and before the end;
 4. not one of the examined matches;
 5. logged strictly before kickoff;
 6. a protocol market and line;
@@ -81,10 +83,46 @@ Findings:
 - The old `gate2_lockbox.py` is retired: it refuses to run, and its records are kept.
 
 **Scored once:**
-- `scripts/gate2_prospective.py` reports only counts (eligible, scored, pending, excluded by reason) until every Gate 2 line has at least 500 scored predictions.
+- `scripts/gate2_prospective.py` reports only counts (eligible, scored, pending, excluded by reason) until every Gate 2 line has at least 500 scored predictions from at least 320 distinct matches.
 - It then computes the Gate 2 metrics once and writes `.prop_alpha_state/gate2_prospective_result.json`; a later run refuses to score again.
-- The report gives, per market and line: sample counts, Brier skill with its 90% interval, the calibration slope and intercept, the calibration bins, the worst bin of at least 50, and the closing-market benchmark where at least 200 two-way closing prices exist.
+- The report gives, per market and line:
+  - sample counts;
+  - Brier skill with its 90% interval;
+  - the calibration slope and intercept;
+  - the calibration bins, their count-weighted mean gap (the criterion) and the worst bin of at least 50 (reported, not judged);
+  - the closing-market benchmark, where at least 200 two-way closing prices exist.
 - A missing benchmark or sample is a fail, never a pass.
+- **Expiry:** a lockbox still short of the threshold when it closes (2027-06-15: the end plus the 14 days for missing outcomes) is NOT PASSED. The scorer records that once in the same result file, without computing any metric, and the lockbox is never scored.
+
+## 4. Amendment of 2026-10-26: calibration rule and scoring threshold
+
+Decided by the maintainer on 2026-10-26, before the start and before any lockbox prediction or outcome existed. It was Option 3 of `GATE2_CALIBRATION_DECISION_MEMO.md`, with 320 matches and a stop date of 31 May 2027.
+
+**The calibration rule:**
+- **Why it changed.** The PRD's bin rule, "every bin of 50+ within 0.03", almost never passes a perfectly calibrated model. Two simulations found this at the original trigger of about 21 matches, and at 320 matches. The slope rule cannot pass a good model at the original trigger either.
+- **New rule.** The PRD's bin criterion is now the count-weighted mean gap of bins of 50+, at most 0.03.
+
+**Unchanged:**
+- the bins and the 0.03 tolerance;
+- the slope range and the skill rule;
+- the pricing code and `FROZEN_DIGEST`;
+- the start and the eligibility rules;
+- the single look.
+
+**The scoring threshold:**
+- The single look waits for 500 scored predictions from 320 matches on every line.
+- Only kickoffs before 2027-06-01 count.
+
+**Operating characteristics** (memo, sections 4.5 and 5): at 320 matches this rule plus the slope rule passes a perfectly calibrated model about 0.71–0.90 of the time, depending on dependence within matches. It passes:
+- errors inside the tolerance 0.35–0.82 of the time;
+- errors above it at most 0.11;
+- clearly wrong slopes never.
+
+**Implementation:**
+- `evaluation/gate2.mean_bin_gap`;
+- the `PROTOCOL` fields `end`, `min_scored_fixtures_per_line` and `amended_on`;
+- `lockbox.ready_to_score`, `closed` and `expired`;
+- `tests/test_gate2_calibration_rule.py`.
 
 **What Gate 2 still cannot pass on, whatever the lockbox shows:**
 - **`yellow_card`:** a PRD target market the frozen model does not price.

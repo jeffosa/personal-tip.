@@ -23,6 +23,7 @@ EXAMINED_FIXTURES: Final[frozenset[int]] = frozenset({
 # Exclusion reasons, in the order they are checked.
 EXAMINED: Final[str] = "match examined before the restart"
 BEFORE_START: Final[str] = "kickoff before the lockbox start"
+AFTER_END: Final[str] = "kickoff after the lockbox end"
 OTHER_DIGEST: Final[str] = "made by other pricing code"
 OTHER_VENDOR: Final[str] = "data source not recorded or not the protocol's"
 NOT_BEFORE_KICKOFF: Final[str] = "not logged before kickoff"
@@ -51,9 +52,15 @@ class LockboxProtocol:
     missing_after: timedelta
     min_scored_per_line: int
     seed: int
+    # Amendment of 2026-10-26 (maintainer, before the start; GATE2_CALIBRATION_DECISION_MEMO.md Option 3): the one look waits
+    # until every line also has `min_scored_fixtures_per_line` distinct matches, and only kickoffs before `end` count. A
+    # lockbox still short of that once it has closed (`end` plus `missing_after`) is NOT PASSED and never scored.
+    end: datetime
+    min_scored_fixtures_per_line: int
+    amended_on: date
 
     def __post_init__(self) -> None:
-        for name in ("start", "last_examined_kickoff"):
+        for name in ("start", "last_examined_kickoff", "end"):
             value = getattr(self, name)
             if value.tzinfo is None or value.utcoffset() != timedelta(0):
                 raise ValueError(f"{name} must be a UTC datetime")
@@ -67,6 +74,10 @@ class LockboxProtocol:
             raise ValueError("every protocol market needs an outcome column")
         if self.min_scored_per_line < 1 or self.revision_grace < timedelta(0) or self.missing_after <= self.revision_grace:
             raise ValueError("invalid scoring thresholds")
+        if self.end <= self.start or self.min_scored_fixtures_per_line < 1:
+            raise ValueError("the lockbox must end after it starts and need at least one match per line")
+        if self.amended_on >= self.start.date():
+            raise ValueError("an amendment to the scoring rules must be decided before the lockbox starts")
 
 
 PROTOCOL: Final[LockboxProtocol] = LockboxProtocol(
@@ -84,6 +95,9 @@ PROTOCOL: Final[LockboxProtocol] = LockboxProtocol(
     missing_after=timedelta(days=14),
     min_scored_per_line=500,
     seed=20261027,
+    end=datetime(2027, 6, 1, tzinfo=timezone.utc),
+    min_scored_fixtures_per_line=320,
+    amended_on=date(2026, 10, 26),
 )
 
 PredictionKey = tuple[int, int, str, float]
@@ -110,6 +124,8 @@ def record_reason(record: Mapping[str, Any], protocol: LockboxProtocol = PROTOCO
         return EXAMINED
     if kickoff < protocol.start:
         return BEFORE_START
+    if kickoff >= protocol.end:
+        return AFTER_END
     if record.get("digest") != protocol.pricing_digest:
         return OTHER_DIGEST
     if record.get("data_vendor") != protocol.data_vendor:
@@ -230,9 +246,21 @@ def scoring_rows(predictions: Sequence[Mapping[str, Any]], captured: Mapping[tup
 
 
 def ready_to_score(scoring: ScoringRows, protocol: LockboxProtocol = PROTOCOL) -> bool:
-    """Pure: every protocol line has at least the required scored predictions (the lockbox is scored once, then)."""
-    return all(len(scoring.rows.get((m, line), ())) >= protocol.min_scored_per_line
-               for m, lines in protocol.lines.items() for line in lines)
+    """Pure: every protocol line has at least the required scored predictions, from at least the required distinct matches
+    (the lockbox is scored once, then)."""
+    return all(len(rows) >= protocol.min_scored_per_line
+               and len({row[0] for row in rows}) >= protocol.min_scored_fixtures_per_line
+               for rows in (scoring.rows.get((m, line), ()) for m, lines in protocol.lines.items() for line in lines))
+
+
+def closed(now: datetime, protocol: LockboxProtocol = PROTOCOL) -> bool:
+    """Pure: no more evidence can arrive: the last eligible kickoff is past and its outcomes are captured or missing."""
+    return now >= protocol.end + protocol.missing_after
+
+
+def expired(scoring: ScoringRows, now: datetime, protocol: LockboxProtocol = PROTOCOL) -> bool:
+    """Pure: the lockbox closed short of the threshold, so Gate 2 is NOT PASSED and the lockbox is never scored."""
+    return closed(now, protocol) and not ready_to_score(scoring, protocol)
 
 
 def tuning_cutoff(league: str | None, protocol: LockboxProtocol = PROTOCOL) -> datetime | None:
@@ -260,11 +288,11 @@ def coverage(kicked_off: Mapping[int, datetime], records: Sequence[Mapping[str, 
              captured: Collection[int] = (), now: datetime | None = None) -> Coverage:
     """Pure: `kicked_off` is each protocol-league match that has kicked off, as stored (vendor id -> UTC kickoff); `records`
     the prediction log; `closing_tried` the matches the closing capture ran for, `closing_priced` those it found prices for.
-    Matches before the start or examined before the restart are not lockbox matches and are left out. With `now`, the
-    predicted matches whose kickoff is at least the revision grace before it are due an outcome capture, and `captured`
+    Matches before the start, from the end on, or examined before the restart are not lockbox matches and are left out.
+    With `now`, the predicted matches whose kickoff is at least the revision grace before it are due an outcome capture, and `captured`
     (the matches with a captured outcome) says how many have one."""
     matches = {fixture_id for fixture_id, kickoff in kicked_off.items()
-               if kickoff >= protocol.start and fixture_id not in protocol.examined_fixtures}
+               if protocol.start <= kickoff < protocol.end and fixture_id not in protocol.examined_fixtures}
     predicted = {int(r["fixture_id"]) for r in eligible(records, kicked_off, protocol).eligible} & matches
     due = set() if now is None else {f for f in predicted if kicked_off[f] + protocol.revision_grace <= now}
     return Coverage(len(matches), len(predicted), len(matches & set(closing_tried)), len(matches & set(closing_priced)),
