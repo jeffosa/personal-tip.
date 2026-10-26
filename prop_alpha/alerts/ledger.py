@@ -467,8 +467,9 @@ def process_updates(
             if command.bet_id not in bets or command.bet_id in cancelled:
                 replies.append((own_id, f"No recorded bet #{command.bet_id} to settle."))
             else:
-                settlement = Settlement(command.bet_id, command.result, "manual", "settled by hand",
-                                        _message_time(message, now), update_id=update_id)
+                settlement = Settlement(command.bet_id, command.result, "manual",
+                                        f"settled by hand ({command.book or 'no bookmaker named'})",
+                                        _message_time(message, now), update_id=update_id, book=command.book)
                 store.record_settlement(settlement)
                 replies.append((own_id, "Recorded " + settlement_text(bets[command.bet_id], settlement)))
         else:
@@ -708,15 +709,17 @@ def closing_values(settled: Sequence[tuple[PlacedBet, Settlement]],
 
 def closing_value(bet: PlacedBet, quotes: Sequence[Mapping[str, Any]]) -> ClosingValue | None:
     """Pure: the bet's closing-line value from the captured closing quotes (alerts/closing.py) for its fixture,
-    player, market and line, preferring the book it was placed with, then the latest capture. None when no two-way
-    closing price was captured (CLV needs both sides to devig)."""
+    player, market and line at the book it was placed with (PRD Gate 3: the closing line of the same sportsbook; another
+    book's close has another margin and is never used, closing-price review 2026-10-25), from the latest capture. None
+    when that book's two-way closing price was not captured (CLV needs both sides to devig)."""
     candidates = [q for q in quotes
                   if (q["fixture_id"], q["player_id"], q["market"], float(q["line"]))
                   == (bet.fixture_id, bet.player_id, bet.market, bet.line)
+                  and str(q["book"]).strip().lower() == bet.book.strip().lower()
                   and q["over"] is not None and q["under"] is not None]
     if not candidates:
         return None
-    quote = max(candidates, key=lambda q: (str(q["book"]).lower() == bet.book.lower(), str(q["captured_at"])))
+    quote = max(candidates, key=lambda q: str(q["captured_at"]))
     taken, other = (quote["over"], quote["under"]) if bet.side == "over" else (quote["under"], quote["over"])
     return ClosingValue(closing_line_value(bet.odds, float(taken), float(other)), float(taken), str(quote["book"]))
 

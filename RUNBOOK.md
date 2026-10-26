@@ -59,7 +59,7 @@ logged-in user, and retries a failed run. Task Scheduler history is off.
 
 | Task | Schedule | Script | Log |
 |---|---|---|---|
-| `Telegram status` | every 4 hours from 00:00 UTC (00, 04, ... 20 UTC, since 2026-10-11) | `scripts/telegram_status.cmd`: results job, pilot results job, exchange rate, status report, League One/Two scan, pilot-leagues scan | `.prop_alpha_state\status.log` |
+| `Telegram status` | every 4 hours from 00:00 UTC (00, 04, ... 20 UTC, since 2026-10-11) | `scripts/telegram_status.cmd`: results job, pilot results job, lockbox outcome capture (`gate2_prospective.py --capture-only`, since 2026-10-26), exchange rate, status report, League One/Two scan (refuses on stale history: `scan-stale`), pilot-leagues scan | `.prop_alpha_state\status.log` |
 | `Bet ledger poll` | every 10 minutes | `scripts/ledger_poll.cmd`: reply poll, closing-price capture, T-60 team sheets, settlement, pilot closing prices, pilot paper-bet settlement | `.prop_alpha_state\ledger.log` |
 | `Daily backup` | 03:30 | `scripts/backup.cmd`: `backup.py`, then `backup_push.py` | `.prop_alpha_state\backup.log` |
 
@@ -108,6 +108,46 @@ a step of `Telegram status`, after `python -m prop_alpha.ingestion.results --pil
 - The trial warning: the status report warns from 7 days before the Sportmonks trial end recorded in `status.DATA_TRIAL_ENDS`
   (2026-11-08). Confirm paid coverage and terms before relying on ingestion after the trial.
 
+## 6a. Lockbox evidence period (from 2026-10-27 00:00 UTC): operator steps
+
+Every League One/Two match from the start needs a prediction logged before kickoff (a scan in the 4 hours before it), a
+closing-price capture 0-15 minutes before it, and an outcome captured 72 hours after it. Code cannot make up a missed one.
+
+**Before each matchday (Saturday 12:00 UTC at the latest; midweek round, the day before):**
+1. Laptop on mains power, awake, logged in, online. Wake timers do not work on battery.
+2. Check the tasks ran recently (PowerShell, read-only):
+   `Get-ScheduledTask -TaskPath '\prop_alpha\' | Get-ScheduledTaskInfo | Format-Table TaskName,LastRunTime,LastTaskResult,NextRunTime`
+   `Telegram status` should show a run within the last 4 hours and a next run at the next 4-hour boundary; `Bet ledger poll`
+   should show one within 10 minutes. LastTaskResult 0 is a clean run; 267009 means it is running now.
+3. Check the latest 4-hourly status report in Telegram has a `Lockbox coverage` line with no WARNING.
+
+**After every 4-hourly run, read the Telegram messages:**
+- **`League One/Two: not priced and no prediction logged, because ...`** (scan summary; the task's failed step `scan-stale`): the
+  last clean results run is missing, older than 9 hours, or listed no finished match. Run
+  `.venv\Scripts\python.exe -m prop_alpha.ingestion.results` and read its last lines. When it ends without FAILED lines, the next
+  scheduled run prices again. If the window still has unpriced matches before kickoff, run
+  `.venv\Scripts\python.exe -m prop_alpha.alerts.scan --odds oddspapi --send`. A "listed no finished" reason means the
+  Sportmonks plan may have stopped covering League One/Two: check the plan before anything else.
+- **`Lockbox coverage: ... (WARNING: N missed: machine off, or the scan failed)`:** those matches have no prediction and never will;
+  note the time the machine was off. Nothing can be logged after kickoff.
+- **`... outcomes captured for C of D due (WARNING: N not captured ...)`:** run
+  `.venv\Scripts\python.exe scripts\gate2_prospective.py --capture-only`. It captures and never scores.
+- **`TASK FAILING: ...`** (two failing runs in a row) names the failed steps: `results`, `lockbox-capture`, `scan-stale`, `scan`,
+  `closing-prices` and so on. The task's log is named in the message (`.prop_alpha_state\status.log` or `ledger.log`).
+
+**Weekly, read-only:**
+- `.venv\Scripts\python.exe scripts\gate2_prospective.py --dry-run` (counts only: eligible, scored, pending, excluded).
+- `.venv\Scripts\python.exe scripts\value_evidence.py` (settlement, predictions, closing prices, Gate 3 status).
+
+**Never, during the lockbox:**
+- Run a backtest, tuning or calibration script expecting lockbox matches. Each one stops before 2026-10-27, and
+  `tests/test_lockbox_isolation.py` fails if a script reads working-database outcomes without that cutoff.
+- Run `scripts/gate2_prospective.py` without a flag: that scores, once, when every line has 500 scored predictions.
+- Change pricing code or `model_freeze`: a new digest ends this lockbox.
+
+**Decisions with a date:** the Sportmonks Starter trial ends 2026-11-08. Without a paid plan, results stop loading, the scan
+refuses (`scan-stale`) and outcomes cannot be captured.
+
 ## 7. Rollback
 
 - **Code:** `git revert` the offending commit (do not rewrite history); re-run the release gate. The pricing code is frozen
@@ -139,7 +179,9 @@ npx --yes pyright@1.1.406
   The evidence lives in `contract_evidence/<book>_<market>.json`, and CI fails a listed contract whose evidence misses a
   criterion. `python scripts/contract_evidence.py --book bet365 --market tackles [--write]` shows progress: on 2026-10-25,
   0 same-book examples and no first-hand rule for bet365 or Betway. Record a bookmaker's own result with the book named
-  (`result <tip> won bet365`, or `pilot_ledger --record <tip> won --book bet365`); another book's result never counts.
+  (`result <tip> won bet365`, `settled <id> won bet365`, or `pilot_ledger --record <tip> won --book bet365`); another
+  book's result never counts, and since 2026-10-26 neither does a result naming no bookmaker ("NO BOOK NAMED":
+  unverified if it agrees, a failure if it disagrees).
   Betway's own rules document (v42, 10/02/2022) is recorded in `contract_evidence/betway_*.json`. It voids players who do
   not start, while the scans price "void only if he does not play", so Betway tips stay withheld even with full evidence
   until the maintainer decides how Betway quotes are priced (`MARKET_CONTRACT.md` section 12). Of 10 settled paper tips, 0 have a bet365 result; the 5
@@ -149,6 +191,16 @@ npx --yes pyright@1.1.406
   predictions, 0 own-book settlements, 0 closing prices. Run it after each matchday; it makes no value claim below the Gate 3 sample.
 - **Prospective Gate 2 lockbox:** the reviewed protocol starts 2026-10-27 00:00 UTC on Sportmonks data. The 24 examined 2026-10-10 matches and all 2,715 predictions from them are excluded. The scorer uses only eligible predictions logged before kickoff and captures outcomes once after the revision grace. No new eligible predictions exist yet; Gate 2 needs at least 500 scored predictions per line, and its market benchmark and lineup requirements remain open. See `LOCKBOX_PROTOCOL.md`.
 - **No tackles or fouls price at a League One/Two bookmaker has been seen**, so no League One/Two alert, closing price or paper bet exists.
+- **Uptime decides the evidence** (closing-price review, 2026-10-25): predictions need a scan in the 4 hours before
+  kickoff, and closing prices need the poll 0-15 minutes before it. The status report's "Lockbox coverage" line counts
+  the lockbox matches that kicked off without a logged prediction (WARNING) and those with a closing capture. Withheld
+  real-price picks are kept as shadow picks (`shadow_picks.jsonl`, `pilot_shadow_picks.jsonl`); `scripts/value_evidence.py`
+  reports their same-book closing value.
+- **Gate 3 in the evidence report** (2026-10-26): `scripts/value_evidence.py` prints Gate 3 as PASSED, FAILED or
+  INCOMPLETE, with each unmet criterion. Settlement integrity covers every settled paper bet of the Gate 3 population:
+  any discrepancy or manual override fails it; an unchecked, automatic-only or other-book result leaves it incomplete.
+  The CLV line is a statistical result only and never a passed gate on its own; "value shown" needs Gate 3 passed
+  and a verified contract.
 - **Vendor and leagues:** current scheduled paths use Sportmonks with `prop_alpha` (League One/Two) and `prop_alpha_pilot` (Brazil Serie A, Scottish Premiership, English Championship). The Starter trial is recorded through 2026-11-08; confirm paid coverage and cost before relying on ingestion after it.
 - **Pilot leagues are unvalidated:** Brazil Serie A is in `TIP_LEAGUES`, but its tips are withheld by the contract gate (above); the settlement definition and model-vs-market evidence remain unresolved. Scottish leagues are priced but never tipped. Do not treat any pilot result as validated betting performance.
 - **Never run:** migration 002 on a real v2 database; the live T-60 line-up path; the 14-branch pruning of the backup repository.

@@ -1,5 +1,5 @@
 """scripts/contract_evidence.py (2026-10-25): only a bookmaker's own settlement of a bet priced at that bookmaker is an
-example; a pilot paper tip's result must name the bookmaker it was read from."""
+example; a result must name the bookmaker it was read from (M2, 2026-10-26)."""
 
 from __future__ import annotations
 
@@ -38,11 +38,11 @@ def test_only_the_books_own_settlements_of_its_own_prices_are_examples() -> None
     script = _script()
     settled = [
         (_bet(1), _manual(1, "bet365")),                      # bet365's result for a bet365 price: an example
-        (_bet(2), _manual(2, None)),                          # no book named: a placed bet's own book, not a paper tip's
+        (_bet(2), _manual(2, None)),                          # no book named: never the bet's own book's (M2, 2026-10-26)
         (_bet(3), _manual(3, "sportybet")),                   # another book's result
         (_bet(4, book="betway"), _manual(4, "bet365")),       # bet365's result for a Betway price
         (_bet(5), Settlement(5, "won", "auto", "auto", NOW, 2, 90)),  # automatic
         (_bet(6, market="fouls"), _manual(6, "bet365")),      # another market
     ]
-    assert [b.bet_id for b, _ in script.same_book_results(settled, "bet365", "tackles", named_only=False)] == [1, 2]
-    assert [b.bet_id for b, _ in script.same_book_results(settled, "Bet365", "tackles", named_only=True)] == [1]
+    assert [b.bet_id for b, _ in script.same_book_results(settled, "bet365", "tackles")] == [1]
+    assert [b.bet_id for b, _ in script.same_book_results(settled, "Bet365", "tackles")] == [1]

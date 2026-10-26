@@ -42,13 +42,12 @@ ROW_SQL: Final[str] = """
 """
 
 
-def same_book_results(settled: Sequence[tuple[PlacedBet, Settlement]], book: str, market: str,
-                      named_only: bool) -> list[tuple[PlacedBet, Settlement]]:
-    """The results `book` itself settled for `market`: manual, from the bet's own book, and the bet priced at `book`. With
-    `named_only` (pilot paper tips, which no bookmaker settles unless the maintainer read the result there) a result that
-    names no bookmaker is left out; a real bet's `settled` reply names none and is its own book's."""
+def same_book_results(settled: Sequence[tuple[PlacedBet, Settlement]], book: str,
+                      market: str) -> list[tuple[PlacedBet, Settlement]]:
+    """The results `book` itself settled for `market`: manual, naming the bet's own book (replies.same_book: a result naming
+    no bookmaker never counts), and the bet priced at `book`."""
     return [(bet, s) for bet, s in settled if s.source == "manual" and bet.market == market
-            and bet.book.lower() == book.lower() and same_book(bet.book, s.book) and (s.book is not None or not named_only)]
+            and bet.book.lower() == book.lower() and same_book(bet.book, s.book)]
 
 
 def stored_row(dsn: str, bet: PlacedBet, columns: Sequence[str]) -> tuple[bool, int, dict[str, int]] | None:
@@ -82,9 +81,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 else {"book": book, "market": market, "rules": [], "examples": []})
     examples: list[dict[str, Any]] = []
     missing_rows: list[str] = []
-    for store, dsn, named_only in ((PlacedBetStore(), DEFAULT_DSN, False),
-                                   (PlacedBetStore(PILOT_BETS_FILE), DEFAULT_PILOT_DSN, True)):
-        for bet, settlement in same_book_results(store.settled_bets(), book, market, named_only):
+    for store, dsn in ((PlacedBetStore(), DEFAULT_DSN), (PlacedBetStore(PILOT_BETS_FILE), DEFAULT_PILOT_DSN)):
+        for bet, settlement in same_book_results(store.settled_bets(), book, market):
             row = stored_row(dsn, bet, columns)
             if row is None:
                 missing_rows.append(f"#{bet.bet_id} {bet.player} ({bet.match}): no stored final row")

@@ -14,7 +14,11 @@ a later run prints that result and refuses to score again. A missing benchmark o
 Refuses to run on pricing code other than the protocol's. Read-only on the database; writes only the outcome ledger
 (not with --dry-run) and the one result file.
 
-    .venv\\Scripts\\python.exe scripts\\gate2_prospective.py [--dry-run]
+    .venv\\Scripts\\python.exe scripts\\gate2_prospective.py [--dry-run | --capture-only]
+
+`--capture-only` (the 4-hourly task's `lockbox-capture` step since 2026-10-26, so each outcome is captured within about 4
+hours of the 72-hour grace rather than whenever someone runs this) captures due outcomes and prints the counts; it never
+scores, whatever the counts: scoring stays a deliberate run without the flag.
 """
 
 from __future__ import annotations
@@ -125,7 +129,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     import psycopg2
 
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    parser.add_argument("--dry-run", action="store_true", help="capture no outcome; report only")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="capture no outcome; report only")
+    mode.add_argument("--capture-only", action="store_true",
+                      help="capture due outcomes and report counts; never score (the scheduled step)")
     args = parser.parse_args(argv)
     protocol = lockbox.PROTOCOL
     digest = pricing_digest()
@@ -179,6 +186,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     for (market, line), rows in sorted(scoring.rows.items()):
         print(f"  {market} over {line}: {len(rows)} scored of {protocol.min_scored_per_line} needed, "
               f"{len({r[0] for r in rows})} matches")
+    if args.capture_only:
+        print("Capture only: outcomes captured, nothing scored (scoring is a separate, deliberate run).")
+        return 0
     if RESULT_FILE.is_file():
         stored = json.loads(RESULT_FILE.read_text(encoding="utf-8"))
         print(f"Scored once on {stored['scored_at']}: {'PASS' if stored['passed'] else 'NOT PASSED'}; not scored again.")

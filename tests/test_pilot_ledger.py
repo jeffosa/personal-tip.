@@ -92,7 +92,8 @@ def test_a_recorded_bookmaker_result_is_reconciled_against_the_automatic_one(
     monkeypatch.setattr(pilot_ledger, "PILOT_BETS_FILE", store.path)
     monkeypatch.setattr(pilot_ledger, "PILOT_CLOSING_FILE", tmp_path / "closing.jsonl")
     monkeypatch.setattr(ledger, "read_settlement_rows", lambda dsn, bets, sql=ledger.SETTLEMENT_SQL: dict(_rows(count=2)))
-    assert pilot_ledger.main(["--record", "1", "won"]) == 0 and pilot_ledger.main(["--record", "2", "lost"]) == 0
+    assert pilot_ledger.main(["--record", "1", "won", "--book", "bet365"]) == 0
+    assert pilot_ledger.main(["--record", "2", "lost", "--book", "bet365"]) == 0
     capsys.readouterr()
     items = ledger.reconcile_settlements(store, "postgresql://pilot", NOW)
     outcomes = {bet.bet_id: item.outcome for bet, item in items}
@@ -234,7 +235,7 @@ def test_recording_is_idempotent_locked_and_never_leaves_a_bet_without_its_tip_l
 
 
 # ---------------- closing prices ----------------
-def test_closing_price_prefers_the_tipped_book_then_the_latest_and_gives_a_price_based_value(tmp_path: Path) -> None:
+def test_closing_price_is_the_tipped_books_latest_and_gives_a_price_based_value(tmp_path: Path) -> None:
     store, _ = _record(tmp_path, n=1)
     [bet] = store.open_bets(NOW)
 
@@ -246,6 +247,8 @@ def test_closing_price_prefers_the_tipped_book_then_the_latest_and_gives_a_price
                quote("bet365", 2.4, "2026-10-11T18:56:00+00:00"), quote("bet365", 9.0, "2026-10-11T18:57:00+00:00", player=99)]
     assert pilot_ledger.closing_price(bet, closing) == (2.4, "bet365")  # the tipped book, its latest capture
     assert pilot_ledger.closing_price(bet, [quote("bet365", 2.4, "x", player=99)]) is None
+    # Only the tipped book's close: Betway's has another margin (PRD Gate 3, 2026-10-25).
+    assert pilot_ledger.closing_price(bet, [quote("betway", 2.0, "2026-10-11T18:55:00+00:00")]) is None
     assert pilot_ledger.price_clv(3.0, 2.4) == pytest.approx(0.25)  # took 3.00, the market closed at 2.40
     assert "mean closing-price value +25.0% over 1 paper bet(s)" in pilot_ledger.clv_summary([bet], closing)
     assert pilot_ledger.clv_summary([bet], []) == "no closing price captured yet"
@@ -302,7 +305,7 @@ def _names(tmp_path: Path) -> None:
 def test_capture_writes_the_tipped_selections_closing_prices_once_per_fixture(tmp_path: Path) -> None:
     store, tips_file = _record(tmp_path)
     _names(tmp_path)
-    paths = {"closing_file": tmp_path / "closing.jsonl", "handled_file": tmp_path / "handled.json", "tips_file": tips_file}
+    paths: dict[str, Any] = {"closing_file": tmp_path / "closing.jsonl", "handled_file": tmp_path / "handled.json", "tips_file": tips_file}
     odds = _FakeOdds(_ladder_reply({"Alpha Lima": 2.4, "Bravo Mike": 3.5, "Somebody Else": 1.9}))
     written, notes, available = pilot_closing.capture(NOW, odds, store, tmp_path, **paths)
     assert available and written == 2 and any("closing prices: 2 for 1 fixture(s)" in n for n in notes)
@@ -318,7 +321,7 @@ def test_capture_writes_the_tipped_selections_closing_prices_once_per_fixture(tm
 
 def test_capture_leaves_a_fixture_for_the_next_poll_when_odds_could_not_be_fetched(tmp_path: Path) -> None:
     store, tips_file = _record(tmp_path)
-    paths = {"closing_file": tmp_path / "closing.jsonl", "handled_file": tmp_path / "handled.json", "tips_file": tips_file}
+    paths: dict[str, Any] = {"closing_file": tmp_path / "closing.jsonl", "handled_file": tmp_path / "handled.json", "tips_file": tips_file}
     odds = _FakeOdds([], left=20)  # at the reserve: nothing is fetched
     written, notes, available = pilot_closing.capture(NOW, odds, store, tmp_path, **paths)
     assert (written, available) == (0, False) and "Odds NOT fetched" in notes[0]
@@ -329,6 +332,7 @@ def test_no_request_and_no_client_when_nothing_is_due(tmp_path: Path, monkeypatc
     monkeypatch.setattr(pilot_ledger, "PILOT_BETS_FILE", tmp_path / "none.jsonl")
     monkeypatch.setattr(pilot_ledger, "PILOT_TIPS_FILE", tmp_path / "none_tips.jsonl")
     monkeypatch.setattr(pilot_closing, "HANDLED_FILE", tmp_path / "h.json")
+    monkeypatch.setattr(pilot_closing, "PILOT_SHADOW_FILE", tmp_path / "shadow.jsonl")
     import prop_alpha.ingestion.pipeline as pipeline
 
     monkeypatch.setattr(pipeline, "build_odds_client", lambda env: pytest.fail("no client is built when nothing is due"))
@@ -354,3 +358,21 @@ def test_record_names_the_bookmaker_the_result_was_read_from(tmp_path: Path, mon
     assert (settlement.result, settlement.source) == ("lost", "manual") and "(sportybet)" in settlement.detail
     assert settlement.book == "sportybet"  # stored as a field, so reconcile can tell it from bet365's own result
     assert "(sportybet)" in capsys.readouterr().out
+
+
+def test_a_recorded_result_naming_no_bookmaker_never_reconciles_as_the_tipped_books(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """M2 (audit 2026-10-26): `--record 1 lost` with no --book (e.g. read off a SportyBet ticket) is unverified."""
+    store, _ = _record(tmp_path)
+    monkeypatch.setattr(pilot_ledger, "PILOT_BETS_FILE", store.path)
+    monkeypatch.setattr(pilot_ledger, "PILOT_CLOSING_FILE", tmp_path / "closing.jsonl")
+    monkeypatch.setattr(ledger, "read_settlement_rows", lambda dsn, bets, sql=ledger.SETTLEMENT_SQL: dict(_rows(count=2)))
+    assert pilot_ledger.main(["--record", "1", "won"]) == 0
+    capsys.readouterr()
+    [(_, item)] = [(b, i) for b, i in ledger.reconcile_settlements(store, "postgresql://pilot", NOW) if b.bet_id == 1]
+    assert item.outcome == "unnamed_book_agree"
+    assert pilot_ledger.main(["--reconcile"]) == 0
+    assert "NO BOOK NAMED, AGREES" in capsys.readouterr().out
+    assert pilot_ledger.main(["--list"]) == 0
+    assert "(1 naming no bookmaker: unverified)" in capsys.readouterr().out

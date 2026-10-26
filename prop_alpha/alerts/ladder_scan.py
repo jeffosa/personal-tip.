@@ -63,8 +63,9 @@ from prop_alpha.alerts import pilot_ledger, scan
 from prop_alpha.alerts.fx import BOOK_CURRENCY, SUPPORTED_CURRENCIES, ExchangeRate, bankroll_currency, book_to_bankroll
 from prop_alpha.alerts.fx import identity as fx_identity
 from prop_alpha.alerts.ledger import PlacedBetStore
-from prop_alpha.alerts.market_contract import MODEL_STATISTICS, WITHHELD_NOTE, contract_status, withhold_unverified
+from prop_alpha.alerts.market_contract import MODEL_STATISTICS, WITHHELD_NOTE, contract_status, split_unverified
 from prop_alpha.alerts.predictions import PredictionLog
+from prop_alpha.alerts.shadow_picks import PILOT_SHADOW_FILE, ShadowPickLog
 from prop_alpha.alerts.telegram import (
     PAPER_LABEL,
     AlertContext,
@@ -497,7 +498,7 @@ def run_ladder_scan(
     state_dir: Path = scan.STATE_DIR, currency: str, book_rate: ExchangeRate | None = None,
     predictions: PredictionLog | None = None, paper_bets: PlacedBetStore | None = None,
     tips_file: Path = pilot_ledger.PILOT_TIPS_FILE, manual: Sequence[UpcomingFixture] = (),
-    tip_leagues: Collection[str] | None = None,
+    tip_leagues: Collection[str] | None = None, shadow: ShadowPickLog | None = None,
 ) -> scan.ScanSummary:
     """One scan of the pilot-league matches kicking off in [now, next 4-hour boundary). `store` is the pilot (or mock)
     alert store: exposure is net of its stakes only. A league whose results are missing from the pilot database is
@@ -532,7 +533,7 @@ def run_ladder_scan(
     if manual:
         return _scan_slate(now, list(manual), None, dsn, notifier, store, bankroll, label, max_alerts, summary, tipping,
                            start, end, rate, currency, odds=odds, odds_client=odds_client, books=books, state_dir=state_dir,
-                           predictions=predictions, paper_bets=paper_bets, tips_file=tips_file)
+                           predictions=predictions, paper_bets=paper_bets, tips_file=tips_file, shadow=shadow)
     leagues, absent = pilot_leagues(client)
     if absent:
         summary.odds_notes.append(f"Not in the Sportmonks plan, not scanned: {', '.join(name for name in absent)}")
@@ -543,7 +544,7 @@ def run_ladder_scan(
         return summary
     return _scan_slate(now, listed, finished_listing(client, now, leagues), dsn, notifier, store, bankroll, label, max_alerts,
                        summary, tipping, start, end, rate, currency, odds=odds, odds_client=odds_client, books=books,
-                       state_dir=state_dir, predictions=predictions, paper_bets=paper_bets, tips_file=tips_file)
+                       state_dir=state_dir, predictions=predictions, paper_bets=paper_bets, tips_file=tips_file, shadow=shadow)
 
 
 def _scan_slate(
@@ -551,7 +552,7 @@ def _scan_slate(
     notifier: TelegramNotifier | None, store: SentAlertStore, bankroll: float, label: str, max_alerts: int,
     summary: scan.ScanSummary, tipping: frozenset[str], start: datetime, end: datetime, rate: ExchangeRate, currency: str, *,
     odds: str, odds_client: Any | None, books: Sequence[str], state_dir: Path, predictions: PredictionLog | None,
-    paper_bets: PlacedBetStore | None, tips_file: Path,
+    paper_bets: PlacedBetStore | None, tips_file: Path, shadow: ShadowPickLog | None = None,
 ) -> scan.ScanSummary:
     """run_ladder_scan from the listed fixtures on. `finished` is the Sportmonks listing of recent finished matches for the
     freshness check, or None for fixtures given by hand, which are checked club by club instead (MANUAL_HISTORY_MAX_AGE)."""
@@ -673,7 +674,12 @@ def _scan_slate(
     combined.directives.sort(key=lambda d: (-d.ev_per_unit, d.fixture_id, d.player_id, d.market_type, d.line_value))
     if odds == "oddspapi":
         # No tip, paper or not, on a real price without a verified settlement contract (market_contract, audit 2026-10-25).
-        combined.directives, summary.withheld = withhold_unverified(combined.directives, PILOT_STATISTICS)
+        # With `shadow` the withheld picks are kept, unsent, for their closing-line value (alerts/shadow_picks.py).
+        combined.directives, withheld = split_unverified(combined.directives, PILOT_STATISTICS)
+        summary.withheld = len(withheld)
+        if shadow is not None:
+            shadow.record(withheld, {f.fixture_id: f for f in fixtures},
+                          {p.player_id: p.name for _, inputs in slate for p in inputs.squad}, now, "pilot")
     if notifier is not None:
         fixtures_by_id = {f.fixture_id: f for f in fixtures}
 
@@ -742,6 +748,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             predictions=PredictionLog(PILOT_PREDICTIONS_FILE, data_vendor="sportmonks") if real else None,
             paper_bets=PlacedBetStore(pilot_ledger.PILOT_BETS_FILE) if real and args.send else None,
             manual=manual, tip_leagues=args.tip,
+            shadow=ShadowPickLog(PILOT_SHADOW_FILE) if real and args.send else None,
         )
     finally:
         client.close()

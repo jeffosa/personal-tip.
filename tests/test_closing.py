@@ -92,15 +92,17 @@ def _quote(book: str, over: float | None, under: float | None, at: str) -> dict[
             "under": under, "captured_at": at}
 
 
-def test_closing_line_value_uses_the_devigged_two_way_close_of_the_same_book_first() -> None:
+def test_closing_line_value_uses_only_the_devigged_two_way_close_of_the_same_book() -> None:
     quotes = [_quote("skybet", 1.8, 2.1, "2026-10-10T13:50:00+00:00"),
               _quote("bet365", 2.0, 1.9, "2026-10-10T13:52:00+00:00"),
               _quote("bet365", 1.9, None, "2026-10-10T13:55:00+00:00")]  # one-sided: unusable
     value = ledger.closing_value(_bet(), quotes)
     assert value is not None and value.book == "bet365" and value.closing_price == 2.0
     assert value.clv == pytest.approx(closing_line_value(2.2, 2.0, 1.9))
-    under = ledger.closing_value(_bet(side="under", odds=2.0, book="unknown"), quotes)
-    assert under is not None and under.book == "bet365" and under.clv == pytest.approx(closing_line_value(2.0, 1.9, 2.0))
+    # Another book's close has another margin: a bet whose book has no captured close gets no CLV (PRD Gate 3, 2026-10-25).
+    assert ledger.closing_value(_bet(side="under", odds=2.0, book="unknown"), quotes) is None
+    under = ledger.closing_value(_bet(side="under", odds=2.0, book="SkyBet"), quotes)  # its own, earlier close
+    assert under is not None and under.book == "skybet" and under.clv == pytest.approx(closing_line_value(2.0, 2.1, 1.8))
     assert ledger.closing_value(_bet(), [quotes[2]]) is None
     text = settlement_text(_bet(), Settlement(1, "won", "auto", "auto", KICKOFF), value)
     assert "close 2.00 at bet365, CLV" in text

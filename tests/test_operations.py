@@ -147,8 +147,9 @@ def test_a_daily_backup_that_stops_running_is_flagged_after_26_hours() -> None:
 # Script -> (task_health task key, the failed-step names it can report). 2026-10-05: task_health was built but no
 # script called it, so a failing scheduled step still only wrote "STEP FAILED" into a log nobody reads.
 SCHEDULED_SCRIPTS: dict[str, tuple[str, tuple[str, ...]]] = {
-    "telegram_status.cmd": ("status", ("results", "pilot-results", "fx-refresh", "status-report", "scan-no-odds", "scan",
-                                       "pilot-scan-no-odds", "pilot-scan-stale", "pilot-scan")),
+    "telegram_status.cmd": ("status", ("results", "pilot-results", "lockbox-capture", "fx-refresh", "status-report",
+                                       "scan-no-odds", "scan-stale", "scan", "pilot-scan-no-odds", "pilot-scan-stale",
+                                       "pilot-scan")),
     "ledger_poll.cmd": ("ledger", ("poll", "closing-prices", "lineups", "settle", "pilot-closing", "pilot-settle")),
     "backup.cmd": ("backup", ("backup", "github-push")),
 }
@@ -459,3 +460,11 @@ def test_a_server_without_the_pilot_database_still_backs_up_and_a_bad_pilot_dump
                       pilot_db=backup.PILOT_DB)
     with pytest.raises(ValueError, match="plain database name"):
         backup.database_exists("x'; DROP DATABASE prop_alpha; --", _pilot_runner(True, []))
+
+
+def test_the_backup_covers_the_shadow_picks() -> None:
+    """2026-10-25: the withheld picks kept for their closing-line value are evidence, and their only record."""
+    from prop_alpha.alerts import shadow_picks
+
+    backup = _backup_module()
+    assert {shadow_picks.SHADOW_FILE.name, shadow_picks.PILOT_SHADOW_FILE.name} <= set(backup.STATE_FILES)

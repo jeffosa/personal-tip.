@@ -119,7 +119,7 @@ def test_run_ingests_only_the_missing_fixtures_and_reports_failures(monkeypatch:
     assert "2 not yet stored" not in dry.text() and "(1 refused earlier, not retried)" in dry.text()
 
 
-def test_every_results_run_names_its_refusal_record(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_every_results_run_names_its_refusal_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     """League One/Two reads and writes REFUSED_FILE, the pilot PILOT_REFUSED_FILE; run() has no default, so a caller
     cannot leave the record out again."""
     from prop_alpha.ingestion import pipeline
@@ -142,6 +142,7 @@ def test_every_results_run_names_its_refusal_record(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(pipeline, "build_vendor_client", lambda environ: _Client())
     monkeypatch.setattr(results, "pilot_leagues", lambda client: (PILOT, []))
     monkeypatch.setattr(results, "run", fake_run)
+    monkeypatch.setattr(results, "RESULTS_OK_FILE", tmp_path / "results_last_ok.json")  # never the real state file
     assert results.main([]) == 0 and results.main(["--pilot"]) == 0
     assert seen == [(results.REFUSED_FILE, sportmonks.SCAN_LEAGUES), (results.PILOT_REFUSED_FILE, PILOT)]
     assert results.REFUSED_FILE != results.PILOT_REFUSED_FILE

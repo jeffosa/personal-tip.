@@ -194,15 +194,17 @@ def load_closing(path: Path) -> list[dict[str, Any]]:
 
 
 def closing_price(bet: PlacedBet, closing: Sequence[Mapping[str, Any]]) -> tuple[float, str] | None:
-    """Pure: the closing price of the bet's own selection (same fixture, player, market, line and side), preferring the
-    book it was tipped at, then the latest capture; None when none was captured."""
+    """Pure: the closing price of the bet's own selection (same fixture, player, market, line and side) at the book it was
+    tipped at, from the latest capture; None when that book's price was not captured (another book's close is never
+    used: its margin differs, closing-price review 2026-10-25)."""
     side = "over" if bet.side == "over" else "under"
     candidates = [q for q in closing
                   if (int(q["fixture_id"]), int(q["player_id"]), str(q["market"]), float(q["line"]))
-                  == (bet.fixture_id, bet.player_id, bet.market, bet.line) and q.get(side) is not None]
+                  == (bet.fixture_id, bet.player_id, bet.market, bet.line) and q.get(side) is not None
+                  and str(q["book"]).strip().lower() == bet.book.strip().lower()]
     if not candidates:
         return None
-    best = max(candidates, key=lambda q: (str(q["book"]).lower() == bet.book.lower(), str(q["captured_at"])))
+    best = max(candidates, key=lambda q: str(q["captured_at"]))
     return float(best[side]), str(best["book"])
 
 
@@ -234,11 +236,13 @@ def results_text(settled: Sequence[tuple[PlacedBet, Settlement]], closing: Seque
     by_result = {result: sum(1 for _, s in settled if s.result == result) for result in RESULTS}
     roi = f", return on stake {total / staked:+.1%}" if staked > 0 else ""
     confirmed = [(bet, s) for bet, s in settled if s.source != "auto"]
-    elsewhere = sum(1 for bet, s in confirmed if not same_book(bet.book, s.book))
+    elsewhere = sum(1 for bet, s in confirmed if s.book is not None and not same_book(bet.book, s.book))
+    unnamed = sum(1 for _, s in confirmed if s.book is None)
     return (f"{len(settled)} settled paper bet(s) ({by_result['won']} won, {by_result['lost']} lost, {by_result['void']} void): "
             f"staked {staked:.2f}, paper profit {total:+.2f}{roi}; {len(settled) - len(confirmed)} provisional (automatic, assumed "
             f"market rules), {len(confirmed)} with a bookmaker result you recorded"
-            + (f" ({elsewhere} of them another book's, not the tipped book's)" if elsewhere else "") + "; "
+            + (f" ({elsewhere} of them another book's, not the tipped book's)" if elsewhere else "")
+            + (f" ({unnamed} naming no bookmaker: unverified)" if unnamed else "") + "; "
             f"{clv_summary([bet for bet, _ in settled], closing)}" + _model_scored(settled, reconstructed))
 
 

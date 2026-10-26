@@ -11,7 +11,112 @@ settlements, closing prices) that code cannot produce. They take calendar time a
 
 Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not executed where it will run · **[N]** not built.
 
-## Status on 2026-10-25 (c): contract criteria enforced; still no evidence (read this first)
+## Status on 2026-10-26 (c): operational protections for the lockbox period (read this first)
+
+**Still PAPER ONLY.** Only fail-closed operational and evidence-integrity changes; the pricing digest (`839e97ce...`), the
+lockbox start (2026-10-27 00:00 UTC) and the protocol are unchanged.
+
+| Gap found | Change [T] |
+|---|---|
+| Lockbox outcomes were captured only when someone ran `gate2_prospective.py`, so "72 hours after kickoff" was not enforced and revisions until that run were included | `--capture-only` (captures, never scores) runs as the 4-hourly task's `lockbox-capture` step, after both results jobs; the coverage line counts outcomes due and captured, with a WARNING for each one missing |
+| The League One/Two scan priced and logged lockbox predictions on history of unknown currency (a failed results job, or a data plan no longer covering the leagues) | The results job records its last clean real run (`results_last_ok.json`: time, matches listed). A real-odds scan with fixtures refuses to price or log when that record is missing, older than 9 hours, or listed no match; it says why and exits 4 (`scan-stale`, alerted after two failing runs) |
+| `scripts/make_static_dataset.py` sampled evaluation fixtures from 2026-01-01 with no upper bound and exported every final match's outcomes | It stops before the lockbox start (`lockbox.tuning_cutoff`), and `tests/test_lockbox_isolation.py` fails if any script reads working-database outcomes without a cutoff (a short, reasoned allow-list: the scorer, the retired scorer, Gate 1 counts, contract evidence) |
+| A test of the results job could write the real heartbeat file (it did once during this work: `listed: 0`, removed before any live run read it) | An autouse fixture redirects the heartbeat file in every test |
+
+**Checked and unchanged:**
+- **Prediction log:** written before any alert, once per fixture, digest and kickoff.
+- **Closing capture:** every 10 minutes, 0-15 minutes before kickoff.
+- **`task_health`:** alerts after two failing runs and flags a silent task (5 h status, 40 min poll, 26 h backup).
+- **Tuning and backtests:** `quick_backtest`, `tune_backtest`, `recalibrate` and `tune_fouls` already stop before the start.
+
+**Still needs a live observation [U]:**
+- the first scheduled `lockbox-capture` and `scan-stale` behaviour;
+- the first eligible prediction (from 27 Oct);
+- the first captured outcome (from about 30 Oct);
+- a closing price at a League One/Two bookmaker.
+
+**Not fixable in code:**
+- **Uptime:** the poll ran on 1-38% of each day since 5 Oct, and nothing outside the laptop notices it is off.
+- **Data plan:** the Sportmonks trial ends 2026-11-08.
+
+## Status on 2026-10-26 (b): a result naming no bookmaker is never agreement (audit M2)
+
+**The gap.** `replies.same_book` treated a manual result that named no bookmaker as the bet's own bookmaker's.
+- `result 3 lost`, typed from a SportyBet ticket for a bet365 paper tip, reconciled as **AGREE** at bet365.
+- So did `pilot_ledger --record 3 lost` with no `--book`, and every `settled <id> ...` reply, which could not name a book.
+
+**Now [T]:**
+- **`same_book`** is true only when the result names the bet's bookmaker.
+- **`replies.reconcile`** reports an unnamed result as `unnamed_book_agree` (unverified) or `unnamed_book_discrepancy` (a
+  failure: `--reconcile` exits 1), labelled "NO BOOK NAMED".
+- **Gate 3** (`value_evidence.settlement_integrity`): unnamed agreeing is incomplete, unnamed disagreeing fails.
+- **Excluded from evidence:** the evidence report's outcomes (`book_results`, reason "no bookmaker named"), its CLV sample and
+  `scripts/contract_evidence.py` all leave unnamed results out, for both ledgers.
+- **Naming the book:** `settled <id> won|lost|void <book>` now takes the bookmaker; the reply help text asks for it.
+- **Unchanged:** a result naming the bet's own book (any case) is that book's; one naming another book is `other_book_*`;
+  no settlement rule, price or threshold changed.
+- **Real data:** unchanged. The 5 recorded bookmaker results all name SportyBet, so they stay "another book".
+
+## Status on 2026-10-26: Gate 3 settlement integrity enforced in the evidence report
+
+**Still PAPER ONLY; no gate passed.**
+
+**The gap.** `scripts/value_evidence.py` printed the reconciliation separately, while `evaluation/value_evidence.py` set
+`value_shown` from the sample, the CLV interval and the power check alone. A sample with positive CLV could therefore have
+been reported as value shown with a failed reconciliation. Also, a single market or line could have triggered it, while
+Gate 3 is judged over all paper bets.
+
+**Now [T]:**
+- **Classification** (`value_evidence.settlement_integrity`, PRD Gate 3 criterion 4). Each `replies.reconcile` outcome is
+  classified:
+
+  | Outcome | Counts as |
+  |---|---|
+  | `agree` | reconciled |
+  | `discrepancy`, `other_book_discrepancy`, `unnamed_book_discrepancy`, any manual override (`Reconciliation.overridden`, whatever the outcome) | **failed** |
+  | `unverifiable` (no gradable statistics), `unconfirmed` (automatic result only), `other_book_agree` (only another bookmaker's result), `unnamed_book_agree` (no bookmaker named, added 2026-10-26) | **incomplete** |
+
+  An unclassified outcome raises. Status: "failed" if any bet failed; else "incomplete" if any bet is incomplete or there
+  is no bet; "passed" only when every bet reconciled.
+- **Population.** Every settled paper bet of the Gate 3 population is checked: League One/Two ledger, lockbox match,
+  placed before kickoff. That includes bets left out of the CLV sample (automatic result only, another book's result, a
+  void). Pilot bets are not in it. The report also shows each ledger's integrity over all its settled bets, for
+  information.
+- **CLV result kept distinct.** The tips' statistics are now `clv_criteria_met` (sample, CLV lower bound above 0, power
+  check: statistical only, never a pass on its own). `gate3_result` adds settlement integrity and gives Gate 3 "passed"
+  only when all four criteria hold. It gives "failed" when integrity failed, or on the full sample when the CLV interval
+  lies below 0 (or, with the power met, does not lie above 0); otherwise "incomplete". It is computed over all tips
+  together (`tips["all"]`).
+- **Verdict.** "value shown" now needs a verified contract **and** Gate 3 passed.
+- **Today:** Gate 3 INCOMPLETE. 0 settled League One/Two paper bets; the pilot's 10 are all incomplete (5 another book's
+  result, 5 automatic only).
+
+No model, pricing, lockbox, settlement rule, risk default or PRD threshold changed.
+
+## Status on 2026-10-25 (d): closing-price trail reviewed
+
+**Still PAPER ONLY; no gate passed; real-price tips stay withheld.**
+
+**What the closing-price trail had produced:**
+- League One/Two: one capture, 10 Oct: 20 matches, 0 prices, because no bookmaker quotes those markets.
+- Pilot: never ran in a kickoff window. The 10-minute poll ran on only 1-29% of each day since 5 Oct, not at all on 17, 19,
+  20, 23 and 24 Oct, and all three tipped kickoffs (11 Oct 20:30, 12 Oct 22:30, 13 Oct 00:00 UTC) fell in gaps in the log.
+- The CLV formulas are the PRD's (`closing_line_value`: odds taken x de-vigged close - 1).
+
+| Weak point | Change [T] |
+|---|---|
+| With tips withheld, the pilot capture (tipped selections only) would never run again, and League One/Two picks were not kept | Withheld picks are kept unsent as **shadow picks** (`alerts/shadow_picks.py`); the pilot capture prices them; `scripts/value_evidence.py` reports their same-book closing value (price and de-vigged) with fixture-clustered 90% intervals; reported, never judged, not Gate 3 evidence |
+| CLV fell back to another bookmaker's close | Only the bet's own bookmaker's close is used (`ledger.closing_value`, `pilot_ledger.closing_price`), as the PRD's ledger writer specifies |
+| A match missed while the machine was off left no trace | The 4-hourly status report has a **lockbox coverage** line: matches kicked off, how many had a prediction logged before kickoff (missed ones flagged as WARNING), how many had a closing capture and prices (`lockbox.coverage`) |
+
+**Still open:**
+- **Uptime.** An always-on host is needed: Oracle chosen 2026-10-25, sign-up in progress; `deploy/VPS_SETUP.md` not yet run
+  [U]. Until then, keep the laptop on mains power and awake through matchdays.
+- **One-sided ladders.** The "k+" ladders can be de-vigged only at the 0.5 line, so PRD CLV is available only there; the
+  shadow report shows the price value beside it.
+- **Nothing to capture for League One/Two** until a bookmaker quotes those markets (odds probe, 31 Oct).
+
+## Status on 2026-10-25 (c): contract criteria enforced; still no evidence
 
 **Still PAPER ONLY; no go-live gate passed; real-price tips stay withheld.**
 - Brazil Serie A tips: every pilot tip is a paper bet (`pilot_ledger.record_tips`) and carries the PILOT label. No execution
