@@ -184,7 +184,8 @@ npx --yes pyright@1.1.406
   unverified if it agrees, a failure if it disagrees).
   Betway's own rules document (v42, 10/02/2022) is recorded in `contract_evidence/betway_*.json`. It voids players who do
   not start, while the scans price "void only if he does not play", so Betway tips stay withheld even with full evidence
-  until the maintainer decides how Betway quotes are priced (`MARKET_CONTRACT.md` section 12). Of 10 settled paper tips, 0 have a bet365 result; the 5
+  until the maintainer decides how Betway quotes are priced (`MARKET_CONTRACT.md` section 12). The evidence still needed for
+  every target (bet365, Betway, Betfred), and how to collect it, is in `MARKET_CONTRACT.md` section 13. Of 10 settled paper tips, 0 have a bet365 result; the 5
   SportyBet results are reported as another book's (`pilot_ledger --reconcile`: "OTHER BOOK"), never as agreement.
 - **Model value not shown:** `python scripts/value_evidence.py` (read-only; writes `.prop_alpha_state/analysis/value_evidence_<date>.json`)
   reports settlement agreement, eligible predictions, bookmaker-settled outcomes, closing prices, ROI and CLV. On 2026-10-25: 0 eligible

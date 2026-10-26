@@ -411,3 +411,63 @@ substitute's Betway bet on his count where Betway voids it.
 - It shows Betway's rules differ by operator. For example, a postponed league match stands for 24 hours in this document but is
   void if not played that day in v42. So the operator behind OddsPapi's `betway` must be identified before any Betway
   rule document can count.
+
+## 13. Evidence status per target, and what the maintainer must obtain (2026-10-26)
+
+**Targets:**
+- bet365 and Betway: the bookmakers the scans price (`ladder_scan.DEFAULT_BOOKMAKERS`; `scan.DEFAULT_BOOKMAKERS` adds Sky Bet
+  and William Hill, which have never returned a tackles or fouls market).
+- Betfred: it quoted Championship fouls in the 2026-10-26 probe, but nothing prices it today.
+- League One/Two: no target, since no bookmaker on OddsPapi quotes these markets there (probe, 2026-10-26).
+
+One evidence file per target in `contract_evidence/` (`*_tackles.json`, `*_fouls.json`). Each records the bookmaker-authored
+rules found, the access attempts that failed, what is missing and the same-book examples (none).
+`python scripts/contract_evidence.py --book <book> --market <market>` lists the unmet criteria.
+
+| Target | First-hand rules on file | Same-book examples | Criteria unmet | Blocking |
+|---|---|---|---|---|
+| bet365 tackles | none (help.bet365.com: HTTP 403 to fetch and raw download, refused in the browser pane) | 0 | 13 | rules, examples |
+| bet365 fouls | none (same) | 0 | 10 | rules, examples |
+| Betway tackles | 4 of 5 topics, from Betway Betting Rules v42 (2022), operator and currency unconfirmed | 0 | 9 | whole-line rule, examples; its "players must start" rule is not the void rule priced |
+| Betway fouls | 3 of 5 topics (no player fouls market defined) | 0 | 7 | statistic, whole-line rule, examples |
+| Betfred fouls | none (betfred.com rules page: HTTP 403, bot challenge, not bypassed) | 0 | 10 | rules, examples; not a priced book |
+
+Not used, and why:
+- search-engine summaries of bet365's pages;
+- a 2020 "Betting Rules" PDF on a content CDN that names no operator;
+- Betway's Malawi rules (no tackles or fouls market);
+- SportyBet's results (another book's);
+- every automatic Sportmonks settlement.
+
+**What the maintainer must obtain, per target:**
+
+1. **The rules, first-hand.** In your own browser:
+   - **bet365:** help.bet365.com → Sports Rules → Soccer: the "Settlement" page, "Match/Team/Player Statistics" and the
+     "What is Opta" FAQ.
+   - **Betway:** your own account's site, its football betting rules (the "Player Performance" / propositions section). Say
+     which country's Betway it is, and whether it is the Betway OddsPapi quotes.
+   - **Betfred:** betfred.com/help/bet-rules/football.
+
+   For each, print the page to PDF so the URL and date show, and save it. Each must cover: the statistic and its data
+   provider; extra time; a starter, a substitute and a named player who does not play; an abandoned or postponed match; and a
+   count exactly on a whole line.
+
+   Where a page is silent, ask support in writing (section 5 has the questions) and keep the reply. I then record the wording,
+   URL, date and file hash in the evidence file (source `bookmaker rules document` or `bookmaker support reply`).
+2. **At least 20 results settled by that bookmaker itself, per market.**
+   - A bookmaker settles only bets placed with it, so these come only from bet slips or account history. Whether to place any
+     bet is your decision. Paper tips never produce one, and nothing here asks you to bet.
+   - Record each result naming the bookmaker: `settled <id> won|lost|void <book>`, `result <tip> won|lost|void <book>`, or
+     `pilot_ledger --record <tip> <result> --book <book>`.
+   - The set must include:
+     - for tackles, results where Opta tackles and tackles won fall on different sides of the line, and where challenges lost
+       or interceptions would change the result (each rival count contradicted at least once);
+     - for fouls, a result where fouls drawn would change it;
+     - a player who came on as a substitute;
+     - a named player who did not start or play.
+3. **Then:**
+   - `python scripts/contract_evidence.py --book <book> --market <market> --write` drafts the examples with their stored
+     counts.
+   - Once every criterion in section 10 is met, listing the contract is your decision, in a PR.
+   - A Betway contract that voids non-starters also needs your pricing decision (section 12) before any Betway tip could be
+     sent.
