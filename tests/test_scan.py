@@ -556,7 +556,8 @@ def test_on_time_utc_runs_scan_every_kickoff_exactly_once_across_the_clock_chang
     contract the schedule relies on, over 24-26 Oct (the UK clocks go back on the 25th, which UTC runs do not notice)."""
     start = datetime(2026, 10, 24, 0, tzinfo=timezone.utc)
     runs = [start + timedelta(hours=4 * i) for i in range(18)]  # 00:00, 04:00, ... UTC for three days
-    kickoffs = [start + timedelta(minutes=15 * i) for i in range(4 * 24 * 3)]
+    # From 00:15: a kickoff on the first boundary belongs to the run before the first one listed (scan_window).
+    kickoffs = [start + timedelta(minutes=15 * i) for i in range(1, 4 * 24 * 3)]
     assert set(_covered(runs, kickoffs).values()) == {1}
     # The old schedule (an hour before each boundary) left three hours in four unscanned.
     old = _covered([run - timedelta(hours=1) for run in runs], kickoffs)
@@ -581,9 +582,13 @@ def test_a_kickoff_on_a_boundary_is_scanned_by_the_run_before_when_the_scan_star
 def test_a_late_catch_up_run_covers_the_rest_of_its_window_and_a_missed_run_only_loses_what_already_kicked_off() -> None:
     start = datetime(2026, 10, 17, 8, tzinfo=timezone.utc)
     kickoffs = [start + timedelta(minutes=15 * i) for i in range(4 * 12)]  # 08:00-19:45 UTC
-    late = _covered([start, start + timedelta(hours=5, minutes=44), start + timedelta(hours=8)], kickoffs)  # 12:00 ran at 13:44
-    assert all(n == 1 for k, n in late.items() if not (start + timedelta(hours=4) <= k < start + timedelta(hours=5, minutes=44)))
-    assert all(n == 0 for k, n in late.items() if start + timedelta(hours=4) <= k < start + timedelta(hours=5, minutes=44))
+    runs = [start - timedelta(hours=4), start, start + timedelta(hours=5, minutes=44), start + timedelta(hours=8)]
+    late = _covered(runs, kickoffs)  # the 12:00 run ran at 13:44
+    # Lost: what kicked off between a minute past 12:00 and the late run; the 12:00 kickoff itself was the 08:00 run's.
+    lost = (start + timedelta(hours=4, minutes=1), start + timedelta(hours=5, minutes=44))
+    assert all(n == 1 for k, n in late.items() if not lost[0] <= k < lost[1])
+    assert all(n == 0 for k, n in late.items() if lost[0] <= k < lost[1])
+    assert late[start + timedelta(hours=4)] == 1
     assert max(late.values()) == 1  # windows never overlap, so nothing is scanned twice
     # A retry inside the same window overlaps the first run: the alert store and the prediction log (once per fixture and
     # digest) keep it from alerting or logging a fixture twice.

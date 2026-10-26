@@ -63,7 +63,7 @@ NetworkProfile event logs, `powercfg`, the task definitions):
 - the power plan, a system setting left for the maintainer: on battery it sleeps after 3 minutes with wake timers off;
 - the network and logon dependencies.
 
-**Found while verifying, not fixed:** `slate.scan_window` covers [now, next boundary). A kickoff exactly on a 4-hour boundary (20:00 or 00:00 UTC) falls between two runs and is never scanned. Monday's 20:00 UTC Walsall v Salford got a T-60 team sheet but was not in the 20:00 scan.
+**Found while verifying, then fixed [T]:** `slate.scan_window` covered [now, next boundary). The scan starts after the boundary, so a kickoff exactly on a 4-hour boundary (20:00 or 00:00 UTC) fell between two runs and was never scanned: Walsall v Salford (Mon 26 Oct 20:00 UTC) got a T-60 team sheet but was in no scan. The window now runs to a minute past the next boundary and starts a minute past its own (`BOUNDARY_GRACE`). On-time runs therefore scan every kickoff exactly once, and a boundary kickoff belongs to the run 4 hours before it. The pilot scan (Brazil's 00:00 UTC games) uses the same window. `scan_window` is not frozen pricing code (`FROZEN_DIGEST` unchanged). Not yet seen live: the first boundary kickoff priced by a scheduled scan [U].
 
 ## Status on 2026-10-26 (d): Gate 2 calibration rule amended before the lockbox start
 
