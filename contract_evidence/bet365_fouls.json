@@ -1,0 +1,29 @@
+{
+  "book": "bet365",
+  "market": "fouls",
+  "status": "NOT VERIFIED: no first-hand rule and no same-book settlement",
+  "note": "Only search-engine summaries of help.bet365.com exist here (MARKET_CONTRACT.md section 7): Opta data, a tackle is a ground challenge that takes the ball, a selected player who does not start is void. Summaries do not count.",
+  "access_attempts": [
+    {
+      "date": "2026-10-10",
+      "what": "help.bet365.com rules pages by fetch",
+      "outcome": "HTTP 403"
+    },
+    {
+      "date": "2026-10-25",
+      "what": "help.bet365.com match-statistics and settlement pages (en, en-us, en-gb) by fetch and in the browser pane",
+      "outcome": "HTTP 403; the browser pane refuses the site (safety restriction)"
+    },
+    {
+      "date": "2026-10-26",
+      "what": "raw download of https://help.bet365.com/s/en-gb/sportsrules/soccer/match-statistics",
+      "outcome": "HTTP 403 (bot challenge; not bypassed)"
+    }
+  ],
+  "missing": [
+    "first-hand wording (rules page saved as PDF with URL and date, or a written support reply) on: statistic and data provider, extra time, player participation and void (starter, substitute, named non-player), abandoned or postponed match, whole-line settlement",
+    "at least 20 results settled by this bookmaker, recorded naming the bookmaker, including examples that contradict every rival count, a substitute appearance and a named player who did not start or play"
+  ],
+  "rules": [],
+  "examples": []
+}

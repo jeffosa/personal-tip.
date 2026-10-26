@@ -231,3 +231,20 @@ def test_betways_rules_document_covers_four_topics_and_voids_non_starters() -> N
     assert "players must start" in tackles["rules"][2]["wording"]
     contracts = {("betway", "tackles"): Contract("s.tackles_attempted", starting, "betway_tackles.json")}
     assert not contract_verified("betway", "tackles", NO_APPEARANCE, MODEL_STATISTICS["tackles"], contracts)
+
+
+def test_every_evidence_file_is_well_formed_and_holds_only_first_hand_rules() -> None:
+    """2026-10-26: one evidence file per target bookmaker and market. Each must parse against the contract the model would
+    need (its statistic, no-appearance void rule), and every rule recorded in it must be the bookmaker's own wording: a
+    search summary or another book's page is never put in `rules`."""
+    files = sorted(p for p in EVIDENCE_DIR.glob("*.json") if p.name != "TEMPLATE.json")
+    assert {p.name for p in files} >= {"bet365_tackles.json", "bet365_fouls.json", "betway_tackles.json", "betway_fouls.json",
+                                       "betfred_fouls.json"}
+    for path in files:
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+        book, market = path.stem.split("_", 1)
+        assert (evidence["book"], evidence["market"]) == (book, market), path.name
+        contract = Contract(MODEL_STATISTICS[market], NO_APPEARANCE, path.name)
+        failures = evidence_failures(evidence, book, market, contract)  # raises on malformed evidence
+        assert not any("is not the bookmaker's own wording" in f for f in failures), (path.name, failures)
+        assert failures, f"{path.name} meets every criterion: list the contract in VERIFIED_CONTRACTS deliberately, with review"
