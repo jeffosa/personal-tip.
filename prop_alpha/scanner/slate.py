@@ -37,6 +37,9 @@ from prop_alpha.modeling.league_level import level_ratios, season_of
 from prop_alpha.scanner.market_scanner import LiveOddsQuote, ProjectionKey, price_for_ev, stressed_probabilities
 
 SCAN_INTERVAL: Final[timedelta] = timedelta(hours=4)
+# A scan window runs to this long past the next boundary, and starts this long past its own (scan_window): a kickoff on
+# the boundary belongs to the earlier run, which is the only one that can still price it before kickoff.
+BOUNDARY_GRACE: Final[timedelta] = timedelta(minutes=1)
 # Market -> the Appearance field it counts. Card markets need referee propensities and are not scanned yet.
 SCAN_MARKETS: Final[tuple[str, ...]] = ("tackles", "fouls")
 RECENT_TEAM_MATCHES: Final[int] = 5
@@ -84,8 +87,6 @@ def scan_window(now: datetime) -> tuple[datetime, datetime]:
     _require_utc(now, "now")
     interval_hours = int(SCAN_INTERVAL.total_seconds() // 3600)
     boundary = now.replace(hour=now.hour - now.hour % interval_hours, minute=0, second=0, microsecond=0)
-    if now < boundary + BOUNDARY_GRACE:  # a run in the first minute after a boundary: that minute was the last run's
-        boundary -= timedelta(0) if now >= boundary else SCAN_INTERVAL
     return max(now, boundary + BOUNDARY_GRACE), boundary + SCAN_INTERVAL + BOUNDARY_GRACE
 
 
