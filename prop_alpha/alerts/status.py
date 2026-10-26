@@ -59,6 +59,8 @@ TELEGRAM_UPDATE_RETENTION: Final[timedelta] = timedelta(hours=24)
 # leagues, a 14-day trial). TheStatsAPI's trial ended 2026-10-20. The plan went live on 2026-10-25 and Sportmonks' own
 # reply says "Trialing until 2026-11-08 04:57:14" (UTC). None means no trial end is known (set it to None once paid).
 DATA_VENDOR_NAME: Final[str] = "Sportmonks"
+# The lockbox's captured outcomes (scripts/gate2_prospective.py OUTCOMES_FILE), for the coverage line.
+LOCKBOX_OUTCOMES_NAME: Final[str] = "lockbox_outcomes.jsonl"
 DATA_TRIAL_ENDS: Final[date | None] = date(2026, 11, 8)
 # The status report warns this many days before the trial ends (and every run after).
 TRIAL_WARNING_DAYS: Final[int] = 7
@@ -214,7 +216,7 @@ def read_snapshot(dsn: str) -> DatabaseSnapshot:
                             int(rejects), int(raw), int(incomplete), kickoffs)
 
 
-def coverage_section(snapshot: DatabaseSnapshot, state_dir: Path) -> list[str]:
+def coverage_section(snapshot: DatabaseSnapshot, state_dir: Path, now: datetime | None = None) -> list[str]:
     """The lockbox coverage line (closing-price review, 2026-10-25): of the lockbox matches stored as kicked off, how many
     had a prediction logged before kickoff and a closing-price capture. A match missed while the machine was off leaves no
     other trace."""
@@ -222,10 +224,14 @@ def coverage_section(snapshot: DatabaseSnapshot, state_dir: Path) -> list[str]:
     tried = {int(f) for f in json.loads(tried_file.read_text(encoding="utf-8"))} if tried_file.is_file() else set()
     priced = {int(q["fixture_id"]) for q in load_closing_quotes(state_dir)}
     records = PredictionLog(state_dir / PREDICTIONS_NAME).load()
-    return [lockbox.coverage_line(lockbox.coverage(dict(snapshot.lockbox_kickoffs), records, tried, priced))]
+    outcomes_file = state_dir / LOCKBOX_OUTCOMES_NAME
+    captured = ({int(json.loads(line)["fixture_id"]) for line in outcomes_file.read_text(encoding="utf-8").splitlines()
+                 if line.strip()} if outcomes_file.is_file() else set())
+    return [lockbox.coverage_line(lockbox.coverage(dict(snapshot.lockbox_kickoffs), records, tried, priced,
+                                                   captured=captured, now=now))]
 
 
-def database_section(dsn: str, coverage_state: Path | None = None) -> list[str]:
+def database_section(dsn: str, coverage_state: Path | None = None, now: datetime | None = None) -> list[str]:
     import psycopg2
 
     try:
@@ -245,7 +251,7 @@ def database_section(dsn: str, coverage_state: Path | None = None) -> list[str]:
     if snapshot.rejects_24h:
         lines.append(f"WARNING: {snapshot.rejects_24h} rows rejected in the last 24h (see staging_rejects)")
     if coverage_state is not None:
-        lines += coverage_section(snapshot, coverage_state)
+        lines += coverage_section(snapshot, coverage_state, now if now is not None else datetime.now(timezone.utc))
     return lines
 
 
@@ -369,7 +375,7 @@ def build_report(now: datetime, dsn: str, store: SentAlertStore, bets: PlacedBet
                  poll_state: tuple[Path, AnswerOutbox] | None = None, odds_state: Path | None = None,
                  pilot_state: Path | None = None, coverage_state: Path | None = None) -> str:
     alerts = [alert for alert in store.load() if alert.sent_at > now - REPORT_INTERVAL]
-    return format_report(now, database_section(dsn, coverage_state), len(alerts), store.exposure(now).total,
+    return format_report(now, database_section(dsn, coverage_state, now), len(alerts), store.exposure(now).total,
                          [*(bet_section(bets, now) if bets is not None else ()),
                           *(delivery_section(deliveries, now) if deliveries is not None else ()),
                           *(poll_section(*poll_state, now) if poll_state is not None else ()),

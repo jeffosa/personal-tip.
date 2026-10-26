@@ -92,7 +92,8 @@ def test_a_recorded_bookmaker_result_is_reconciled_against_the_automatic_one(
     monkeypatch.setattr(pilot_ledger, "PILOT_BETS_FILE", store.path)
     monkeypatch.setattr(pilot_ledger, "PILOT_CLOSING_FILE", tmp_path / "closing.jsonl")
     monkeypatch.setattr(ledger, "read_settlement_rows", lambda dsn, bets, sql=ledger.SETTLEMENT_SQL: dict(_rows(count=2)))
-    assert pilot_ledger.main(["--record", "1", "won"]) == 0 and pilot_ledger.main(["--record", "2", "lost"]) == 0
+    assert pilot_ledger.main(["--record", "1", "won", "--book", "bet365"]) == 0
+    assert pilot_ledger.main(["--record", "2", "lost", "--book", "bet365"]) == 0
     capsys.readouterr()
     items = ledger.reconcile_settlements(store, "postgresql://pilot", NOW)
     outcomes = {bet.bet_id: item.outcome for bet, item in items}
@@ -357,3 +358,21 @@ def test_record_names_the_bookmaker_the_result_was_read_from(tmp_path: Path, mon
     assert (settlement.result, settlement.source) == ("lost", "manual") and "(sportybet)" in settlement.detail
     assert settlement.book == "sportybet"  # stored as a field, so reconcile can tell it from bet365's own result
     assert "(sportybet)" in capsys.readouterr().out
+
+
+def test_a_recorded_result_naming_no_bookmaker_never_reconciles_as_the_tipped_books(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """M2 (audit 2026-10-26): `--record 1 lost` with no --book (e.g. read off a SportyBet ticket) is unverified."""
+    store, _ = _record(tmp_path)
+    monkeypatch.setattr(pilot_ledger, "PILOT_BETS_FILE", store.path)
+    monkeypatch.setattr(pilot_ledger, "PILOT_CLOSING_FILE", tmp_path / "closing.jsonl")
+    monkeypatch.setattr(ledger, "read_settlement_rows", lambda dsn, bets, sql=ledger.SETTLEMENT_SQL: dict(_rows(count=2)))
+    assert pilot_ledger.main(["--record", "1", "won"]) == 0
+    capsys.readouterr()
+    [(_, item)] = [(b, i) for b, i in ledger.reconcile_settlements(store, "postgresql://pilot", NOW) if b.bet_id == 1]
+    assert item.outcome == "unnamed_book_agree"
+    assert pilot_ledger.main(["--reconcile"]) == 0
+    assert "NO BOOK NAMED, AGREES" in capsys.readouterr().out
+    assert pilot_ledger.main(["--list"]) == 0
+    assert "(1 naming no bookmaker: unverified)" in capsys.readouterr().out

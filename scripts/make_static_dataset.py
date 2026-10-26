@@ -14,7 +14,10 @@ Writes CSV files plus manifest.json (row counts, sha256, seed, caveats) to the o
         does) and a closing quote (the opening logit plus N(0, 0.1) noise). The closing price carries no information,
         so it exercises closing-line plumbing but says nothing about CLV or edge.
 Model probabilities come from the same walk-forward pricing the backtests use (scripts/recalibrate.predictions: only
-data strictly before kickoff, league level, per-market k, tackles multiplier). The folder is gitignored: the real
+data strictly before kickoff, league level, per-market k, tackles multiplier). Nothing kicking off on or after the lockbox
+start (lockbox.tuning_cutoff) is exported or evaluated (operational audit 2026-10-26): the fixtures and
+player_match_stats tables, the evaluation fixtures and the outcomes all stop before it, so the dataset can never carry a
+lockbox outcome. The folder is gitignored: the real
 files are vendor data and must not be redistributed.
 """
 
@@ -40,12 +43,15 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import quick_backtest as qb  # noqa: E402
 import recalibrate as rc  # noqa: E402
 from prop_alpha.alerts.status import DEFAULT_DSN, DSN_ENV  # noqa: E402
+from prop_alpha.evaluation.lockbox import tuning_cutoff  # noqa: E402
 from prop_alpha.scanner.slate import (  # noqa: E402
     MOCK_BOOK_MARGIN, MOCK_MISPRICING_SD, MOCK_SPORTSBOOK, SCAN_RATE_MULTIPLIER_BY_MARKET,
 )
 
 SEED: Final[int] = 20261005
 EVAL_FROM: Final[datetime] = datetime(2026, 1, 1, tzinfo=timezone.utc)
+# The lockbox start for League One/Two (the working database): no fixture from it on is exported or evaluated.
+LOCKBOX_CUTOFF: Final[datetime] = tuning_cutoff(None) or datetime.max.replace(tzinfo=timezone.utc)
 CLOSING_NOISE_SD: Final[float] = 0.1
 PROBABILITY_RANGE: Final[tuple[float, float]] = (0.05, 0.95)
 TABLES: Final[tuple[tuple[str, str], ...]] = (
@@ -53,9 +59,9 @@ TABLES: Final[tuple[tuple[str, str], ...]] = (
     ("teams", "SELECT * FROM prop_alpha.teams ORDER BY team_id"),
     ("players", "SELECT * FROM prop_alpha.players ORDER BY player_id"),
     ("referees", "SELECT * FROM prop_alpha.referees ORDER BY referee_id"),
-    ("fixtures", "SELECT * FROM prop_alpha.fixtures WHERE status = 'final' ORDER BY fixture_id"),
+    ("fixtures", "SELECT * FROM prop_alpha.fixtures WHERE status = 'final' AND kickoff_at < %(cutoff)s ORDER BY fixture_id"),
     ("player_match_stats", "SELECT s.* FROM prop_alpha.player_match_stats s JOIN prop_alpha.fixtures f USING (fixture_id) "
-                           "WHERE f.status = 'final' ORDER BY s.fixture_id, s.player_id"),
+                           "WHERE f.status = 'final' AND f.kickoff_at < %(cutoff)s ORDER BY s.fixture_id, s.player_id"),
 )
 
 
@@ -76,7 +82,7 @@ def export_tables(out: Path) -> tuple[dict[str, Any], dict[int, str], dict[int, 
     try:
         with conn, conn.cursor() as cur:
             for name, sql in TABLES:
-                cur.execute(sql)
+                cur.execute(sql, {"cutoff": LOCKBOX_CUTOFF})
                 if cur.description is None:
                     raise ValueError(f"{name}: the query returned no result set")
                 header = [d[0] for d in cur.description]
@@ -113,7 +119,7 @@ def main() -> int:
     rows = qb.load_rows()
     by_market = {market: rc.predictions(rows, market) for market in qb.LINES}
     candidates = sorted({p[0].fixture_id for preds in by_market.values() for p in preds
-                         if p[0].kickoff_at >= EVAL_FROM})
+                         if EVAL_FROM <= p[0].kickoff_at < LOCKBOX_CUTOFF})
     if len(candidates) < args.fixtures:
         raise SystemExit(f"only {len(candidates)} evaluation fixtures available, need {args.fixtures}")
     chosen = set(random.Random(SEED).sample(candidates, args.fixtures))
@@ -123,7 +129,7 @@ def main() -> int:
     odds: list[list[Any]] = []
     outcomes: dict[tuple[int, int], list[Any]] = {}
     for market, preds in by_market.items():
-        subset = [p for p in preds if p[0].fixture_id in chosen and p[0].kickoff_at >= EVAL_FROM]
+        subset = [p for p in preds if p[0].fixture_id in chosen and EVAL_FROM <= p[0].kickoff_at < LOCKBOX_CUTOFF]
         multiplier = SCAN_RATE_MULTIPLIER_BY_MARKET.get(market, 1.0)
         for line in qb.LINES[market]:
             probabilities = rc.over_probabilities(subset, line, multiplier)

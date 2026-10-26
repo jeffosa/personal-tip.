@@ -23,6 +23,7 @@ from prop_alpha.alerts.replies import (
     reconcile,
     reconciliation_summary,
     reconciliation_text,
+    same_book,
 )
 
 NOW = datetime(2026, 10, 12, 9, tzinfo=timezone.utc)
@@ -35,8 +36,9 @@ def _bet(bet_id: int = 1, side: str = "over", line: float = 1.5, market: str = "
                      min_odds=1.9, match="Walsall v Port Vale", player="A (Walsall)", placed_at=NOW - timedelta(days=2))
 
 
-def _manual(bet_id: int, result: str) -> Settlement:
-    return Settlement(bet_id, result, "manual", "reported", NOW, update_id=900 + bet_id)
+def _manual(bet_id: int, result: str, book: str | None = "skybet") -> Settlement:
+    """A bookmaker result read off the tipped book (skybet) unless another, or no, bookmaker is named."""
+    return Settlement(bet_id, result, "manual", "reported", NOW, update_id=900 + bet_id, book=book)
 
 
 def _auto(bet_id: int, result: str) -> Settlement:
@@ -160,15 +162,14 @@ def test_another_books_result_is_compared_but_never_counted_as_agreement_with_th
     assert agreeing.outcome == "other_book_agree" and "sportybet's result, not skybet's" in agreeing.detail
     disagreeing = reconcile(bet, replace(sportybet, result="lost"), ("final", 90, 2, 0), None, NOW)
     assert disagreeing.outcome == "other_book_discrepancy"
-    # The tipped book's own result, named in any case, or no book named (a settled reply), is the tipped book's.
+    # The tipped book's own result, named in any case, is the tipped book's.
     assert reconcile(bet, replace(sportybet, book="SkyBet"), ("final", 90, 2, 0), None, NOW).outcome == "agree"
-    assert reconcile(bet, replace(sportybet, book=None), ("final", 90, 2, 0), None, NOW).outcome == "agree"
     summary = reconciliation_summary([agreeing, disagreeing])
     assert "0 result(s) from the tipped book: 0 agree" in summary and "2 result(s) from another book (1 agree, 1 DISAGREE" in summary
     assert summary.endswith("PRD Gate 3 needs every bet to reconcile.") and "FAIL" in summary
     assert "nothing verified yet at the tipped book" in reconciliation_summary([agreeing])
     assert "OTHER BOOK, DISAGREES" in reconciliation_text(bet, disagreeing)
-    assert set(RECONCILE_FAILURES) == {"discrepancy", "other_book_discrepancy"}
+    assert set(RECONCILE_FAILURES) == {"discrepancy", "other_book_discrepancy", "unnamed_book_discrepancy"}
 
 
 def test_a_settlement_names_its_bookmaker_only_when_manual_and_trimmed() -> None:
@@ -194,3 +195,37 @@ def test_older_records_name_their_bookmaker_in_the_detail(tmp_path: Path) -> Non
     store.record_settlement(Settlement(2, "won", "manual", "bookmaker result (bet365) recorded by hand", NOW,
                                        update_id=0, book="bet365"))
     assert {bet.bet_id: settlement.book for bet, settlement in store.settled_bets()} == {1: "sportybet", 2: "bet365"}
+
+
+# ---------------- a result naming no bookmaker (M2, audit 2026-10-26) ----------------
+def test_a_result_naming_no_bookmaker_is_never_agreement_with_the_tipped_book() -> None:
+    """Until 2026-10-26 a manual result with no bookmaker was taken to be the tipped book's, so a SportyBet ticket typed as
+    `result 3 lost` reconciled as AGREE at bet365. It is now unverified (agreeing) or a failure (disagreeing)."""
+    bet = _bet()  # tipped at skybet
+    named_same = reconcile(bet, _manual(1, "won", "SkyBet"), ("final", 90, 2, 0), None, NOW)
+    named_other = reconcile(bet, _manual(1, "won", "sportybet"), ("final", 90, 2, 0), None, NOW)
+    unnamed = reconcile(bet, _manual(1, "won", None), ("final", 90, 2, 0), None, NOW)  # this case used to be "agree"
+    unnamed_wrong = reconcile(bet, _manual(1, "lost", None), ("final", 90, 2, 0), None, NOW)
+    assert (named_same.outcome, named_other.outcome) == ("agree", "other_book_agree")
+    assert unnamed.outcome == "unnamed_book_agree" and "no bookmaker named on this result" in unnamed.detail
+    assert unnamed_wrong.outcome == "unnamed_book_discrepancy" and "unnamed_book_discrepancy" in RECONCILE_FAILURES
+    assert "NO BOOK NAMED, AGREES" in reconciliation_text(bet, unnamed)
+    summary = reconciliation_summary([unnamed, unnamed_wrong])
+    assert "0 result(s) from the tipped book: 0 agree" in summary and "2 result(s) naming no bookmaker (1 agree, 1 DISAGREE" in summary
+    assert "FAIL" in summary and "nothing verified yet at the tipped book" in reconciliation_summary([unnamed])
+    # Without a gradable statistic it stays unverifiable, named or not.
+    assert reconcile(bet, _manual(1, "won", None), None, None, NOW).outcome == "unverifiable"
+    assert not same_book("skybet", None) and same_book("skybet", " SKYBET ") and not same_book("skybet", "bet365")
+
+
+def test_a_settled_reply_can_name_its_bookmaker_and_one_that_does_not_stays_unverified(tmp_path: Path) -> None:
+    from prop_alpha.alerts.replies import SettleCommand, parse_reply
+
+    assert parse_reply("settled 12 lost") == SettleCommand(12, "lost", None)
+    assert parse_reply("settled #12 won Bet365") == SettleCommand(12, "won", "Bet365")
+    store = PlacedBetStore(tmp_path / "bets.jsonl")
+    store.record_bet(_bet(1))
+    store.record_settlement(Settlement(1, "won", "manual", "settled by hand (no bookmaker named)", NOW, update_id=5))
+    [(_, settlement)] = store.settled_bets()
+    assert settlement.book is None  # an older or unnamed record is not read as the bet's book
+    assert reconcile(_bet(1), settlement, ("final", 90, 2, 0), None, NOW).outcome == "unnamed_book_agree"

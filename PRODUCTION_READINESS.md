@@ -11,7 +11,53 @@ settlements, closing prices) that code cannot produce. They take calendar time a
 
 Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not executed where it will run · **[N]** not built.
 
-## Status on 2026-10-26: Gate 3 settlement integrity enforced in the evidence report (read this first)
+## Status on 2026-10-26 (c): operational protections for the lockbox period (read this first)
+
+**Still PAPER ONLY.** Only fail-closed operational and evidence-integrity changes; the pricing digest (`839e97ce...`), the
+lockbox start (2026-10-27 00:00 UTC) and the protocol are unchanged.
+
+| Gap found | Change [T] |
+|---|---|
+| Lockbox outcomes were captured only when someone ran `gate2_prospective.py`, so "72 hours after kickoff" was not enforced and revisions until that run were included | `--capture-only` (captures, never scores) runs as the 4-hourly task's `lockbox-capture` step, after both results jobs; the coverage line counts outcomes due and captured, with a WARNING for each one missing |
+| The League One/Two scan priced and logged lockbox predictions on history of unknown currency (a failed results job, or a data plan no longer covering the leagues) | The results job records its last clean real run (`results_last_ok.json`: time, matches listed). A real-odds scan with fixtures refuses to price or log when that record is missing, older than 9 hours, or listed no match; it says why and exits 4 (`scan-stale`, alerted after two failing runs) |
+| `scripts/make_static_dataset.py` sampled evaluation fixtures from 2026-01-01 with no upper bound and exported every final match's outcomes | It stops before the lockbox start (`lockbox.tuning_cutoff`), and `tests/test_lockbox_isolation.py` fails if any script reads working-database outcomes without a cutoff (a short, reasoned allow-list: the scorer, the retired scorer, Gate 1 counts, contract evidence) |
+| A test of the results job could write the real heartbeat file (it did once during this work: `listed: 0`, removed before any live run read it) | An autouse fixture redirects the heartbeat file in every test |
+
+**Checked and unchanged:**
+- **Prediction log:** written before any alert, once per fixture, digest and kickoff.
+- **Closing capture:** every 10 minutes, 0-15 minutes before kickoff.
+- **`task_health`:** alerts after two failing runs and flags a silent task (5 h status, 40 min poll, 26 h backup).
+- **Tuning and backtests:** `quick_backtest`, `tune_backtest`, `recalibrate` and `tune_fouls` already stop before the start.
+
+**Still needs a live observation [U]:**
+- the first scheduled `lockbox-capture` and `scan-stale` behaviour;
+- the first eligible prediction (from 27 Oct);
+- the first captured outcome (from about 30 Oct);
+- a closing price at a League One/Two bookmaker.
+
+**Not fixable in code:**
+- **Uptime:** the poll ran on 1-38% of each day since 5 Oct, and nothing outside the laptop notices it is off.
+- **Data plan:** the Sportmonks trial ends 2026-11-08.
+
+## Status on 2026-10-26 (b): a result naming no bookmaker is never agreement (audit M2)
+
+**The gap.** `replies.same_book` treated a manual result that named no bookmaker as the bet's own bookmaker's.
+- `result 3 lost`, typed from a SportyBet ticket for a bet365 paper tip, reconciled as **AGREE** at bet365.
+- So did `pilot_ledger --record 3 lost` with no `--book`, and every `settled <id> ...` reply, which could not name a book.
+
+**Now [T]:**
+- **`same_book`** is true only when the result names the bet's bookmaker.
+- **`replies.reconcile`** reports an unnamed result as `unnamed_book_agree` (unverified) or `unnamed_book_discrepancy` (a
+  failure: `--reconcile` exits 1), labelled "NO BOOK NAMED".
+- **Gate 3** (`value_evidence.settlement_integrity`): unnamed agreeing is incomplete, unnamed disagreeing fails.
+- **Excluded from evidence:** the evidence report's outcomes (`book_results`, reason "no bookmaker named"), its CLV sample and
+  `scripts/contract_evidence.py` all leave unnamed results out, for both ledgers.
+- **Naming the book:** `settled <id> won|lost|void <book>` now takes the bookmaker; the reply help text asks for it.
+- **Unchanged:** a result naming the bet's own book (any case) is that book's; one naming another book is `other_book_*`;
+  no settlement rule, price or threshold changed.
+- **Real data:** unchanged. The 5 recorded bookmaker results all name SportyBet, so they stay "another book".
+
+## Status on 2026-10-26: Gate 3 settlement integrity enforced in the evidence report
 
 **Still PAPER ONLY; no gate passed.**
 
@@ -27,8 +73,8 @@ Gate 3 is judged over all paper bets.
   | Outcome | Counts as |
   |---|---|
   | `agree` | reconciled |
-  | `discrepancy`, `other_book_discrepancy`, any manual override (`Reconciliation.overridden`, whatever the outcome) | **failed** |
-  | `unverifiable` (no gradable statistics), `unconfirmed` (automatic result only), `other_book_agree` (only another bookmaker's result) | **incomplete** |
+  | `discrepancy`, `other_book_discrepancy`, `unnamed_book_discrepancy`, any manual override (`Reconciliation.overridden`, whatever the outcome) | **failed** |
+  | `unverifiable` (no gradable statistics), `unconfirmed` (automatic result only), `other_book_agree` (only another bookmaker's result), `unnamed_book_agree` (no bookmaker named, added 2026-10-26) | **incomplete** |
 
   An unclassified outcome raises. Status: "failed" if any bet failed; else "incomplete" if any bet is incomplete or there
   is no bet; "passed" only when every bet reconciled.

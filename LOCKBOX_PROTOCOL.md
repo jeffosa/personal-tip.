@@ -73,7 +73,7 @@ Findings:
 - **Duplicates:** for each (match, player, market, line) only the earliest logged line counts; later ones are reported as duplicates.
 - **Postponed or rescheduled match:** its earlier prediction is ineligible (kickoff moved). The log now writes a new prediction when the same match is scanned with a new kickoff, and that one is eligible.
 - **Missing outcomes:** a match not final in the database, or inside the revision grace, is pending. A match still not final 14 days after kickoff is reported as missing. Neither is scored.
-- **Revised vendor data:** each player's outcome is captured once, 72 hours after kickoff (the revision grace), into the append-only `.prop_alpha_state/lockbox_outcomes.jsonl`. Later database revisions are reported, never applied.
+- **Revised vendor data:** each player's outcome is captured once, 72 hours after kickoff (the revision grace), into the append-only `.prop_alpha_state/lockbox_outcomes.jsonl`. Later database revisions are reported, never applied. (Operations, 2026-10-26, not a protocol change: the 4-hourly task captures with `gate2_prospective.py --capture-only`, so a capture happens within about 4 hours of the grace while the machine is on; it never scores.)
 - **Model or data changes:** a different pricing digest or data vendor makes a prediction ineligible. Any pricing change, or a change of data source, ends this lockbox and needs a new protocol with a later start. `tests/test_lockbox.py` fails while `PROTOCOL` and `model_freeze` disagree, and the scorer refuses to run on unfrozen code.
 
 **Keeping the lockbox away from tuning:**

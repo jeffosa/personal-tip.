@@ -61,6 +61,7 @@ from prop_alpha.alerts.telegram import (
 from prop_alpha.config import DEFAULT_DSN, DEFAULT_ENV_FILE, DSN_ENV
 from prop_alpha.ingestion import oddspapi, sportmonks
 from prop_alpha.ingestion.pipeline import QuotaExhaustedError, VendorError
+from prop_alpha.ingestion.results import load_results_heartbeat, results_staleness
 from prop_alpha.modeling.engine import FactorProjection, ProjectionError, QuantEngine
 from prop_alpha.modeling.league_level import SEASON_START_MONTH, SeasonTotals, season_of, season_rates
 from prop_alpha.scanner.market_scanner import (
@@ -111,6 +112,10 @@ ODDS_CACHE_DIR: Final[str] = "oddspapi"
 CATALOGUE_FILE: Final[str] = "line_markets.json"
 # Exit code of a real-odds run that had no usable bookmaker prices (the summary and boards were still sent).
 ODDS_UNAVAILABLE_EXIT: Final[int] = 3
+# A real-odds run refused because the League One/Two history is not known to be current (results.results_staleness): the
+# scheduled task reports it as `scan-stale`. The same code as the pilot scan's ladder_scan.STALE_EXIT.
+STALE_EXIT: Final[int] = 4
+STALE_LEAGUE_LABEL: Final[str] = "League One/Two"
 BOOKMAKERS_ENV: Final[str] = "ODDS_BOOKMAKERS"
 DEFAULT_BOOKMAKERS: Final[tuple[str, ...]] = ("bet365", "skybet", "williamhill")
 ODDS_QUOTA_RESERVE: Final[int] = 20
@@ -588,7 +593,7 @@ def run_scan(
     odds: str = "mock", odds_client: Any | None = None, books: Sequence[str] = DEFAULT_BOOKMAKERS,
     state_dir: Path = STATE_DIR, bets: PlacedBetStore | None = None, currency: str,
     book_rate: ExchangeRate | None = None, predictions: PredictionLog | None = None,
-    shadow: ShadowPickLog | None = None,
+    shadow: ShadowPickLog | None = None, results_heartbeat: Mapping[str, Any] | None | bool = False,
 ) -> ScanSummary:
     """With `bets`, exposure per market is the larger of the stakes alerted and the stakes recorded as placed.
     `currency` (fx.bankroll_currency()) is the bankroll's; when it is not BOOK_CURRENCY, `book_rate`
@@ -612,6 +617,16 @@ def run_scan(
     summary.fixtures = [f"{f.name} {f.kickoff_at:%H:%M}" for f in fixtures]
     if not fixtures:
         return summary
+    # results_heartbeat False: not checked (tests, mock runs); otherwise the last clean results run's record, or None.
+    if results_heartbeat is not False:
+        stale = results_staleness(None if results_heartbeat is True else results_heartbeat or None, now)
+        if stale is not None:
+            # Fail closed (operational audit 2026-10-26): no price and no lockbox prediction on history that may be out of
+            # date; the run says why and exits STALE_EXIT, and the status report's coverage line counts the matches missed.
+            summary.failures.append(f"{STALE_LEAGUE_LABEL}: not priced and no prediction logged, because {stale}; "
+                                    "run `python -m prop_alpha.ingestion.results` and check its output")
+            summary.stale_leagues.append(STALE_LEAGUE_LABEL)
+            return summary
     conn = psycopg2.connect(dsn, options="-c statement_timeout=30000 -c default_transaction_read_only=on",
                             connect_timeout=10)
     try:
@@ -734,7 +749,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                            bets=PlacedBetStore() if real else None, currency=currency, book_rate=book_rate,
                            predictions=PredictionLog(data_vendor=environ.get("DATA_VENDOR", "sportmonks"))
                            if real and args.send else None,
-                           shadow=ShadowPickLog() if real and args.send else None)
+                           shadow=ShadowPickLog() if real and args.send else None,
+                           results_heartbeat=load_results_heartbeat() if real else False)
     finally:
         client.close()
         if odds_client is not None:
@@ -743,6 +759,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(text)
     if notifier is not None:
         print(f"summary sent (message_id {notifier.send_message(text)})")
+    if summary.stale_leagues:
+        logger.error("scan refused: League One/Two history not known to be current; exiting %d", STALE_EXIT)
+        return STALE_EXIT
     if real and summary.odds_unavailable:
         logger.error("scan finished without real odds; exiting %d", ODDS_UNAVAILABLE_EXIT)
         return ODDS_UNAVAILABLE_EXIT

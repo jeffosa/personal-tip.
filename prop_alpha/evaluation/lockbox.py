@@ -251,17 +251,24 @@ class Coverage:
     predicted: int
     closing_tried: int
     closing_priced: int
+    outcomes_due: int = 0
+    outcomes_captured: int = 0
 
 
 def coverage(kicked_off: Mapping[int, datetime], records: Sequence[Mapping[str, Any]], closing_tried: Collection[int],
-             closing_priced: Collection[int], protocol: LockboxProtocol = PROTOCOL) -> Coverage:
+             closing_priced: Collection[int], protocol: LockboxProtocol = PROTOCOL, *,
+             captured: Collection[int] = (), now: datetime | None = None) -> Coverage:
     """Pure: `kicked_off` is each protocol-league match that has kicked off, as stored (vendor id -> UTC kickoff); `records`
     the prediction log; `closing_tried` the matches the closing capture ran for, `closing_priced` those it found prices for.
-    Matches before the start or examined before the restart are not lockbox matches and are left out."""
+    Matches before the start or examined before the restart are not lockbox matches and are left out. With `now`, the
+    predicted matches whose kickoff is at least the revision grace before it are due an outcome capture, and `captured`
+    (the matches with a captured outcome) says how many have one."""
     matches = {fixture_id for fixture_id, kickoff in kicked_off.items()
                if kickoff >= protocol.start and fixture_id not in protocol.examined_fixtures}
     predicted = {int(r["fixture_id"]) for r in eligible(records, kicked_off, protocol).eligible} & matches
-    return Coverage(len(matches), len(predicted), len(matches & set(closing_tried)), len(matches & set(closing_priced)))
+    due = set() if now is None else {f for f in predicted if kicked_off[f] + protocol.revision_grace <= now}
+    return Coverage(len(matches), len(predicted), len(matches & set(closing_tried)), len(matches & set(closing_priced)),
+                    len(due), len(due & set(captured)))
 
 
 def coverage_line(result: Coverage, protocol: LockboxProtocol = PROTOCOL) -> str:
@@ -272,4 +279,8 @@ def coverage_line(result: Coverage, protocol: LockboxProtocol = PROTOCOL) -> str
     missed = result.matches - result.predicted
     return (head + f"{result.matches} matches kicked off; {result.predicted} with a prediction logged before kickoff"
             + (f" (WARNING: {missed} missed: machine off, or the scan failed)" if missed else "")
-            + f"; closing capture ran for {result.closing_tried}, prices for {result.closing_priced}")
+            + f"; closing capture ran for {result.closing_tried}, prices for {result.closing_priced}"
+            + (f"; outcomes captured for {result.outcomes_captured} of {result.outcomes_due} due"
+               + (f" (WARNING: {result.outcomes_due - result.outcomes_captured} not captured: run "
+                  "scripts/gate2_prospective.py --capture-only)" if result.outcomes_captured < result.outcomes_due else "")
+               if result.outcomes_due else ""))

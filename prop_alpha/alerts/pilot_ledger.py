@@ -236,11 +236,13 @@ def results_text(settled: Sequence[tuple[PlacedBet, Settlement]], closing: Seque
     by_result = {result: sum(1 for _, s in settled if s.result == result) for result in RESULTS}
     roi = f", return on stake {total / staked:+.1%}" if staked > 0 else ""
     confirmed = [(bet, s) for bet, s in settled if s.source != "auto"]
-    elsewhere = sum(1 for bet, s in confirmed if not same_book(bet.book, s.book))
+    elsewhere = sum(1 for bet, s in confirmed if s.book is not None and not same_book(bet.book, s.book))
+    unnamed = sum(1 for _, s in confirmed if s.book is None)
     return (f"{len(settled)} settled paper bet(s) ({by_result['won']} won, {by_result['lost']} lost, {by_result['void']} void): "
             f"staked {staked:.2f}, paper profit {total:+.2f}{roi}; {len(settled) - len(confirmed)} provisional (automatic, assumed "
             f"market rules), {len(confirmed)} with a bookmaker result you recorded"
-            + (f" ({elsewhere} of them another book's, not the tipped book's)" if elsewhere else "") + "; "
+            + (f" ({elsewhere} of them another book's, not the tipped book's)" if elsewhere else "")
+            + (f" ({unnamed} naming no bookmaker: unverified)" if unnamed else "") + "; "
             f"{clv_summary([bet for bet, _ in settled], closing)}" + _model_scored(settled, reconstructed))
 
 

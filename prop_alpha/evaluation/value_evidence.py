@@ -85,13 +85,15 @@ class Tip:
 
 def book_results(settled: Sequence[tuple[Any, Any]]) -> tuple[dict[SelectionKey, int], dict[str, int]]:
     """Pure: the Over outcome per selection from (PlacedBet, Settlement) pairs, and how many pairs were left out and why.
-    Only a manual settlement from the bet's own book counts (replies.same_book); conflicting results for one selection
-    leave it out."""
+    Only a manual settlement naming the bet's own book counts (replies.same_book); one naming no bookmaker or another
+    one is left out, and conflicting results for one selection leave it out."""
     outcomes: dict[SelectionKey, set[int]] = defaultdict(set)
     left_out: dict[str, int] = defaultdict(int)
     for bet, settlement in settled:
         if settlement.source != "manual":
             left_out["automatic result (assumed rules, provisional)"] += 1
+        elif settlement.book is None:
+            left_out["no bookmaker named"] += 1
         elif not same_book(bet.book, settlement.book):
             left_out["another bookmaker's result"] += 1
         elif settlement.result == "void":
@@ -203,17 +205,17 @@ def tip_evidence(tips: Sequence[Tip], rng: np.random.Generator) -> dict[str, Any
 # overrides. Each replies.reconcile outcome is one of these; a manual override (Reconciliation.overridden) fails a bet
 # whatever its outcome. Nothing unchecked, unresolved or settled by another bookmaker counts as reconciled.
 INTEGRITY_RECONCILED: Final[tuple[str, ...]] = ("agree",)
-INTEGRITY_FAILED: Final[tuple[str, ...]] = ("discrepancy", "other_book_discrepancy")
-INTEGRITY_INCOMPLETE: Final[tuple[str, ...]] = ("unverifiable", "unconfirmed", "other_book_agree")
+INTEGRITY_FAILED: Final[tuple[str, ...]] = ("discrepancy", "other_book_discrepancy", "unnamed_book_discrepancy")
+INTEGRITY_INCOMPLETE: Final[tuple[str, ...]] = ("unverifiable", "unconfirmed", "other_book_agree", "unnamed_book_agree")
 INTEGRITY_STATUSES: Final[tuple[str, ...]] = ("passed", "failed", "incomplete")
 
 
 @dataclass(frozen=True)
 class SettlementIntegrity:
     """Gate 3 criterion 4 over a set of settled paper bets. "passed": at least one bet and every one reconciled with no
-    override; "failed": any discrepancy (at the tipped book or another) or any manual override; "incomplete": no failure,
-    but a bet not reconciled (no stored statistics, automatic result only, or only another bookmaker's result), or no bet
-    at all. `failed` and `incomplete` give one reason per bet."""
+    override; "failed": any discrepancy (at the tipped book, another, or one not named) or any manual override;
+    "incomplete": no failure, but a bet not reconciled (no stored statistics, automatic result only, or a result from another
+    or an unnamed bookmaker), or no bet at all. `failed` and `incomplete` give one reason per bet."""
 
     status: str
     bets: int

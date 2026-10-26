@@ -30,17 +30,19 @@ def _manual(bet_id: int, result: str, book: str | None = None) -> Settlement:
 
 def test_only_the_tipped_books_own_won_or_lost_result_is_an_outcome() -> None:
     settled = [
-        (_bet(1), _manual(1, "won")),                                         # own book (no book named): Over won
+        (_bet(1), _manual(1, "won", "Bet365")),                               # own book named: Over won
         (_bet(2, side="under", player_id=8), _manual(2, "won", "bet365")),     # own book named; Under won = Over lost
         (_bet(3, player_id=9), _manual(3, "lost", "sportybet")),              # another book's result
         (_bet(4, player_id=10), Settlement(4, "won", "auto", "auto", NOW, 2, 90)),  # provisional automatic result
-        (_bet(5, player_id=11), _manual(5, "void")),                          # a void is not an outcome
-        (_bet(6, player_id=12), _manual(6, "won")), (_bet(7, side="under", player_id=12), _manual(7, "won")),  # conflict
+        (_bet(5, player_id=11), _manual(5, "void", "bet365")),                # a void is not an outcome
+        (_bet(6, player_id=12), _manual(6, "won", "bet365")),
+        (_bet(7, side="under", player_id=12), _manual(7, "won", "bet365")),  # conflict
+        (_bet(8, player_id=13), _manual(8, "won")),                           # no bookmaker named (M2): never an outcome
     ]
     outcomes, left_out = value_evidence.book_results(settled)
     assert outcomes == {(50, 7, "tackles", 1.5): 1, (50, 8, "tackles", 1.5): 0}
     assert left_out == {"another bookmaker's result": 1, "automatic result (assumed rules, provisional)": 1,
-                        "void (not an outcome)": 1, "conflicting results for one selection": 1}
+                        "void (not an outcome)": 1, "conflicting results for one selection": 1, "no bookmaker named": 1}
     with pytest.raises(ValueError):
         BookResult(1, 2, "tackles", 1.5, "bet365", 2)
 
@@ -231,3 +233,14 @@ def test_a_refuted_clv_fails_gate3_and_a_short_sample_leaves_it_incomplete() -> 
     assert refuted["clv_high"] < 0.0 and value_evidence.gate3_result(refuted, passed)["status"] == "failed"
     short = value_evidence.tip_evidence(_good_tips()[:40], rng)
     assert value_evidence.gate3_result(short, passed)["status"] == "incomplete"
+
+
+
+def test_a_result_naming_no_bookmaker_never_passes_settlement_integrity() -> None:
+    """M2 (2026-10-26): unnamed agreeing is incomplete; unnamed disagreeing fails."""
+    agreeing = Reconciliation(2, "unnamed_book_agree", "won", "won", "no bookmaker named")
+    disagreeing = Reconciliation(3, "unnamed_book_discrepancy", "lost", "won", "no bookmaker named")
+    incomplete = value_evidence.settlement_integrity([_agree(1), agreeing])
+    assert incomplete.status == "incomplete" and incomplete.incomplete == ("bet 2: unnamed_book_agree",)
+    failed = value_evidence.settlement_integrity([_agree(1), disagreeing])
+    assert failed.status == "failed" and failed.failed == ("bet 3: unnamed_book_discrepancy (bookmaker lost, automatic won)",)

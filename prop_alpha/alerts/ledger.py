@@ -467,8 +467,9 @@ def process_updates(
             if command.bet_id not in bets or command.bet_id in cancelled:
                 replies.append((own_id, f"No recorded bet #{command.bet_id} to settle."))
             else:
-                settlement = Settlement(command.bet_id, command.result, "manual", "settled by hand",
-                                        _message_time(message, now), update_id=update_id)
+                settlement = Settlement(command.bet_id, command.result, "manual",
+                                        f"settled by hand ({command.book or 'no bookmaker named'})",
+                                        _message_time(message, now), update_id=update_id, book=command.book)
                 store.record_settlement(settlement)
                 replies.append((own_id, "Recorded " + settlement_text(bets[command.bet_id], settlement)))
         else:

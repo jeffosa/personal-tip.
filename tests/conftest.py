@@ -101,3 +101,13 @@ def _no_real_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "read_env_file", read_env_file)
     for name in CREDENTIAL_VARIABLES:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_results_heartbeat(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The League One/Two scan trusts `.prop_alpha_state/results_last_ok.json` (ingestion/results.py): no test may write
+    or read the real one (2026-10-26: a stubbed results run in a test wrote `listed: 0` there, which would have made the
+    next live scan refuse)."""
+    from prop_alpha.ingestion import results
+
+    monkeypatch.setattr(results, "RESULTS_OK_FILE", tmp_path / "results_last_ok.json")

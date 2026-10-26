@@ -49,6 +49,12 @@ PILOT_REFUSED_FILE: Final[Path] = DEFAULT_ENV_FILE.parent / ".prop_alpha_state" 
 # never load (e.g. the backfill's ambiguous League Two matches, where both starting XIs list 10) stayed missing, was
 # re-requested on every run and failed the job until the listing window moved past it.
 REFUSED_FILE: Final[Path] = DEFAULT_ENV_FILE.parent / ".prop_alpha_state" / "refused.json"
+# The last clean League One/Two run (operational audit, 2026-10-26): written only when a real run finished with no failure
+# and no reject, with how many finished matches it listed. The League One/Two scan reads it (results_staleness) and prices
+# nothing, logging no lockbox prediction, when the history behind its prices is not known to be current.
+RESULTS_OK_FILE: Final[Path] = DEFAULT_ENV_FILE.parent / ".prop_alpha_state" / "results_last_ok.json"
+# One failed 4-hourly run is tolerated (4 h + 4 h + slack); two in a row are not.
+RESULTS_MAX_AGE: Final[timedelta] = timedelta(hours=9)
 
 # TheStatsAPI's answer for a match it holds no player statistics for (HTTP 404): a permanent gap, recorded as refused.
 STATS_NOT_AVAILABLE: Final[str] = "STATS_NOT_AVAILABLE_AT_SOURCE"
@@ -258,6 +264,36 @@ def run(
     return report
 
 
+def results_staleness(record: Mapping[str, Any] | None, now: datetime) -> str | None:
+    """Pure: why the League One/Two history cannot be taken as current (no clean results run on record, the last one older
+    than RESULTS_MAX_AGE, or one that listed no finished match at all, as when the data plan stops covering the leagues),
+    or None when it can."""
+    if now.tzinfo is None or now.utcoffset() != timedelta(0):
+        raise ValueError("now must be a timezone-aware UTC datetime")
+    if record is None:
+        return "no clean League One/Two results run on record"
+    at = datetime.fromisoformat(str(record["at"]))
+    if at.tzinfo is None:
+        raise ValueError("the results heartbeat has no timezone")
+    if now - at > RESULTS_MAX_AGE:
+        return f"the last clean League One/Two results run was {at:%a %d %b %H:%M} UTC, over {RESULTS_MAX_AGE} ago"
+    if int(record["listed"]) <= 0:
+        return "the last results run listed no finished League One/Two match (is the data plan still covering them?)"
+    return None
+
+
+def load_results_heartbeat(path: Path | None = None) -> dict[str, Any] | None:
+    """The last clean League One/Two run's record (RESULTS_OK_FILE unless `path`), or None when there is none; a damaged
+    file raises."""
+    path = RESULTS_OK_FILE if path is None else path
+    if not path.is_file():
+        return None
+    record: Any = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(record, dict) or "at" not in record or "listed" not in record:
+        raise ValueError(f"{path.name} is not a results heartbeat")
+    return record
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Ingest League One/Two results not yet in the database.")
@@ -280,8 +316,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             report = run(datetime.now(timezone.utc), client, os.environ.get(PILOT_DSN_ENV, DEFAULT_PILOT_DSN),
                          dry_run=args.dry_run, workers=args.workers, leagues=leagues, refused_path=PILOT_REFUSED_FILE)
         else:
-            report = run(datetime.now(timezone.utc), client, os.environ.get(DSN_ENV, DEFAULT_DSN), dry_run=args.dry_run,
+            started = datetime.now(timezone.utc)
+            report = run(started, client, os.environ.get(DSN_ENV, DEFAULT_DSN), dry_run=args.dry_run,
                          workers=args.workers, refused_path=REFUSED_FILE)
+            if report.ok and not args.dry_run:
+                RESULTS_OK_FILE.parent.mkdir(parents=True, exist_ok=True)
+                RESULTS_OK_FILE.write_text(json.dumps({"at": started.isoformat(), "listed": report.listed,
+                                                       "missing": len(report.missing), "ingested": report.ingested}),
+                                           encoding="utf-8")
     finally:
         client.close()
     print(report.text())

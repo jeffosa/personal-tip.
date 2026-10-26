@@ -292,7 +292,27 @@ def test_the_report_counts_lockbox_matches_missed_by_the_prediction_log(tmp_path
         "player_id": 7, "market": "tackles", "line": 1.5, "p_win": 0.4, "p_lose": 0.5, "p_void": 0.1,
         "digest": PROTOCOL.pricing_digest, "data_vendor": "sportmonks"}) + "\n", encoding="utf-8")
     (tmp_path / "closing_captured.json").write_text("[5001]", encoding="utf-8")
-    lines = status.database_section("postgresql://unused", tmp_path)
+    lines = status.database_section("postgresql://unused", tmp_path, kickoff + timedelta(hours=1))
     assert lines[-1] == ("Lockbox coverage (kickoff from 27 Oct): 2 matches kicked off; 1 with a prediction logged before "
                          "kickoff (WARNING: 1 missed: machine off, or the scan failed); closing capture ran for 1, prices for 0")
     assert not any(line.startswith("Lockbox coverage") for line in status.database_section("postgresql://unused"))
+
+
+def test_the_coverage_line_warns_of_lockbox_outcomes_not_captured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Operational audit 2026-10-26: past the 72-hour grace, a predicted lockbox match without a captured outcome is flagged."""
+    from dataclasses import replace
+
+    from prop_alpha.evaluation.lockbox import PROTOCOL
+
+    kickoff = PROTOCOL.start + timedelta(days=1, hours=19)
+    monkeypatch.setattr(status, "read_snapshot", lambda dsn: replace(SNAPSHOT, lockbox_kickoffs=((5001, kickoff),)))
+    (tmp_path / "predictions.jsonl").write_text(json.dumps({
+        "logged_at": (kickoff - timedelta(hours=2)).isoformat(), "window_start": (kickoff - timedelta(hours=3)).isoformat(),
+        "kickoff_at": kickoff.isoformat(), "fixture_id": 5001, "lineup_basis": "estimated",
+        "player_id": 7, "market": "tackles", "line": 1.5, "p_win": 0.4, "p_lose": 0.5, "p_void": 0.1,
+        "digest": PROTOCOL.pricing_digest, "data_vendor": "sportmonks"}) + "\n", encoding="utf-8")
+    later = kickoff + timedelta(hours=80)
+    assert "outcomes captured for 0 of 1 due (WARNING: 1 not captured" in status.database_section("x", tmp_path, later)[-1]
+    (tmp_path / status.LOCKBOX_OUTCOMES_NAME).write_text(json.dumps({"fixture_id": 5001, "player_id": 7, "minutes": 90})
+                                                         + "\n", encoding="utf-8")
+    assert status.database_section("x", tmp_path, later)[-1].endswith("outcomes captured for 1 of 1 due")

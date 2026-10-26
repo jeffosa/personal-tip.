@@ -1,7 +1,7 @@
 """Run one scheduled task on any operating system (maintainer decision 4, 2026-10-11: move the tasks to an always-on
 Ubuntu host, after making the Windows-only scheduling portable).
 
-    python scripts/run_task.py status     # every 4 hours: results, pilot results, exchange rate, status report, both scans
+    python scripts/run_task.py status     # every 4 hours: results, pilot results, lockbox capture, exchange rate, status report, both scans
     python scripts/run_task.py ledger     # every 10 minutes: reply poll, closing prices, team sheets, settlement, pilot
     python scripts/run_task.py backup     # daily: verified backup, then the push to the private GitHub repository
 
@@ -55,10 +55,11 @@ TASKS: Final[Mapping[str, tuple[Step, ...]]] = {
     "status": (
         Step(("-m", "prop_alpha.ingestion.results"), "results"),
         Step(("-m", "prop_alpha.ingestion.results", "--pilot"), "pilot-results"),
+        Step(("scripts/gate2_prospective.py", "--capture-only"), "lockbox-capture"),
         Step(("-m", "prop_alpha.alerts.fx", "--refresh"), "fx-refresh"),
         Step(("-m", "prop_alpha.alerts.status", "--send"), "status-report"),
         Step(("-m", "prop_alpha.alerts.scan", "--odds", "oddspapi", "--send"), "scan",
-             ((ODDS_UNAVAILABLE_EXIT, "scan-no-odds"),)),
+             ((ODDS_UNAVAILABLE_EXIT, "scan-no-odds"), (STALE_EXIT, "scan-stale"))),
         Step(("-m", "prop_alpha.alerts.ladder_scan", "--odds", "oddspapi", "--send"), "pilot-scan",
              ((ODDS_UNAVAILABLE_EXIT, "pilot-scan-no-odds"), (STALE_EXIT, "pilot-scan-stale"))),
     ),

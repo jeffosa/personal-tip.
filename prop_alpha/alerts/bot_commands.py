@@ -26,7 +26,7 @@ HELP_TEXT: Final[str] = "\n".join([
     "/bets - your recorded bets: open ones and settled results",
     "/pilot - the pilot's paper tips: open ones and settled results",
     "/help - this list",
-    "To record a bet, reply to the alert itself: placed 3 @1.95 5 (also undo 12, settled 12 won|lost|void).",
+    "To record a bet, reply to the alert itself: placed 3 @1.95 5 (also undo 12, settled 12 won|lost|void <book>).",
     "To record the bookmaker's result for a pilot paper tip: result 3 won [book] (tip numbers: /pilot).",
 ])
 # The newest settled bets listed one by one; older ones are only in the totals.
