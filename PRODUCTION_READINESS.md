@@ -11,7 +11,43 @@ settlements, closing prices) that code cannot produce. They take calendar time a
 
 Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not executed where it will run · **[N]** not built.
 
-## Status on 2026-10-25 (d): closing-price trail reviewed (read this first)
+## Status on 2026-10-26: Gate 3 settlement integrity enforced in the evidence report (read this first)
+
+**Still PAPER ONLY; no gate passed.**
+
+**The gap.** `scripts/value_evidence.py` printed the reconciliation separately, while `evaluation/value_evidence.py` set
+`value_shown` from the sample, the CLV interval and the power check alone. A sample with positive CLV could therefore have
+been reported as value shown with a failed reconciliation. Also, a single market or line could have triggered it, while
+Gate 3 is judged over all paper bets.
+
+**Now [T]:**
+- **Classification** (`value_evidence.settlement_integrity`, PRD Gate 3 criterion 4). Each `replies.reconcile` outcome is
+  classified:
+
+  | Outcome | Counts as |
+  |---|---|
+  | `agree` | reconciled |
+  | `discrepancy`, `other_book_discrepancy`, any manual override (`Reconciliation.overridden`, whatever the outcome) | **failed** |
+  | `unverifiable` (no gradable statistics), `unconfirmed` (automatic result only), `other_book_agree` (only another bookmaker's result) | **incomplete** |
+
+  An unclassified outcome raises. Status: "failed" if any bet failed; else "incomplete" if any bet is incomplete or there
+  is no bet; "passed" only when every bet reconciled.
+- **Population.** Every settled paper bet of the Gate 3 population is checked: League One/Two ledger, lockbox match,
+  placed before kickoff. That includes bets left out of the CLV sample (automatic result only, another book's result, a
+  void). Pilot bets are not in it. The report also shows each ledger's integrity over all its settled bets, for
+  information.
+- **CLV result kept distinct.** The tips' statistics are now `clv_criteria_met` (sample, CLV lower bound above 0, power
+  check: statistical only, never a pass on its own). `gate3_result` adds settlement integrity and gives Gate 3 "passed"
+  only when all four criteria hold. It gives "failed" when integrity failed, or on the full sample when the CLV interval
+  lies below 0 (or, with the power met, does not lie above 0); otherwise "incomplete". It is computed over all tips
+  together (`tips["all"]`).
+- **Verdict.** "value shown" now needs a verified contract **and** Gate 3 passed.
+- **Today:** Gate 3 INCOMPLETE. 0 settled League One/Two paper bets; the pilot's 10 are all incomplete (5 another book's
+  result, 5 automatic only).
+
+No model, pricing, lockbox, settlement rule, risk default or PRD threshold changed.
+
+## Status on 2026-10-25 (d): closing-price trail reviewed
 
 **Still PAPER ONLY; no gate passed; real-price tips stay withheld.**
 

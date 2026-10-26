@@ -27,7 +27,7 @@ from typing import Any, Final, Mapping, Sequence
 
 import numpy as np
 
-from prop_alpha.alerts.replies import same_book
+from prop_alpha.alerts.replies import Reconciliation, same_book
 from prop_alpha.evaluation.backtest import brier_score
 from prop_alpha.evaluation.gate2 import (
     BOOTSTRAP_RESAMPLES,
@@ -188,12 +188,89 @@ def tip_evidence(tips: Sequence[Tip], rng: np.random.Generator) -> dict[str, Any
             fixtures, values, [1.0] * len(values), rng)
         entry["clv_required_fixtures"] = required_clusters(fixtures, values)
     entry["gate3_sample"] = enough
-    entry["value_shown"] = bool(enough and priced and entry["clv_low"] > 0.0
-                                and entry["clv_required_fixtures"] <= len({t.fixture_id for t in priced}))
-    entry["note"] = ("CLV lower bound above 0 on the Gate 3 sample" if entry["value_shown"] else
-                     f"no value claim: {entry['n']} settled tips in {entry['n_fixtures']} fixtures (Gate 3 needs "
+    entry["power_met"] = bool(priced and entry["clv_required_fixtures"] <= len({t.fixture_id for t in priced}))
+    # The statistical CLV result only (Gate 3 criteria 1-3). It is never "value shown" or a passed Gate 3 on its own:
+    # gate3_result adds settlement integrity (criterion 4), which can fail while this is met.
+    entry["clv_criteria_met"] = bool(enough and priced and entry["clv_low"] > 0.0 and entry["power_met"])
+    entry["note"] = ("CLV criteria met on the Gate 3 sample (statistical result only; Gate 3 also needs settlement integrity)"
+                     if entry["clv_criteria_met"] else
+                     f"CLV criteria not met: {entry['n']} settled tips in {entry['n_fixtures']} fixtures (Gate 3 needs "
                      f"{MIN_SETTLED_BETS} in {MIN_BET_FIXTURES}), {entry['n_clv']} with a two-way closing price")
     return entry
+
+
+# PRD Gate 3 criterion 4: 100% of paper bets reconcile to the realised outcome and the book's void rule, with no manual
+# overrides. Each replies.reconcile outcome is one of these; a manual override (Reconciliation.overridden) fails a bet
+# whatever its outcome. Nothing unchecked, unresolved or settled by another bookmaker counts as reconciled.
+INTEGRITY_RECONCILED: Final[tuple[str, ...]] = ("agree",)
+INTEGRITY_FAILED: Final[tuple[str, ...]] = ("discrepancy", "other_book_discrepancy")
+INTEGRITY_INCOMPLETE: Final[tuple[str, ...]] = ("unverifiable", "unconfirmed", "other_book_agree")
+INTEGRITY_STATUSES: Final[tuple[str, ...]] = ("passed", "failed", "incomplete")
+
+
+@dataclass(frozen=True)
+class SettlementIntegrity:
+    """Gate 3 criterion 4 over a set of settled paper bets. "passed": at least one bet and every one reconciled with no
+    override; "failed": any discrepancy (at the tipped book or another) or any manual override; "incomplete": no failure,
+    but a bet not reconciled (no stored statistics, automatic result only, or only another bookmaker's result), or no bet
+    at all. `failed` and `incomplete` give one reason per bet."""
+
+    status: str
+    bets: int
+    reconciled: int
+    failed: tuple[str, ...]
+    incomplete: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.status not in INTEGRITY_STATUSES:
+            raise ValueError(f"unknown settlement-integrity status {self.status!r}")
+        if self.reconciled + len(self.failed) + len(self.incomplete) != self.bets:
+            raise ValueError("every bet is reconciled, failed or incomplete, exactly once")
+        expected = "failed" if self.failed else "incomplete" if self.incomplete or not self.bets else "passed"
+        if self.status != expected:
+            raise ValueError(f"status {self.status!r} does not fit the counts (expected {expected!r})")
+
+
+def settlement_integrity(items: Sequence[Reconciliation]) -> SettlementIntegrity:
+    """Pure: Gate 3 criterion 4 over `items` (replies.reconcile results, one per settled paper bet); fails closed."""
+    failed: list[str] = []
+    incomplete: list[str] = []
+    reconciled = 0
+    for item in items:
+        if item.overridden:
+            failed.append(f"bet {item.bet_id}: manual override of a recorded automatic result ({item.outcome})")
+        elif item.outcome in INTEGRITY_FAILED:
+            failed.append(f"bet {item.bet_id}: {item.outcome} (bookmaker {item.bookmaker_result}, automatic "
+                          f"{item.automatic_result})")
+        elif item.outcome in INTEGRITY_INCOMPLETE:
+            incomplete.append(f"bet {item.bet_id}: {item.outcome}")
+        elif item.outcome in INTEGRITY_RECONCILED:
+            reconciled += 1
+        else:
+            raise ValueError(f"bet {item.bet_id}: reconciliation outcome {item.outcome!r} is not classified")
+    status = "failed" if failed else "incomplete" if incomplete or not items else "passed"
+    return SettlementIntegrity(status, len(items), reconciled, tuple(failed), tuple(incomplete))
+
+
+def gate3_result(sample: Mapping[str, Any], integrity: SettlementIntegrity) -> dict[str, Any]:
+    """Pure: PRD Gate 3 over every settled paper bet (`sample`: tip_evidence of all of them) and their settlement
+    integrity. "passed" needs every criterion; "failed" when integrity failed, or on the full sample when the CLV interval
+    lies below 0 (or, with the power met, does not lie above 0); otherwise "incomplete". A met CLV criterion never passes the gate alone."""
+    criteria = {
+        f"sample ({MIN_SETTLED_BETS}+ settled bets in {MIN_BET_FIXTURES}+ fixtures)": bool(sample["gate3_sample"]),
+        "CLV 90% lower bound above 0": bool("clv_low" in sample and sample["clv_low"] > 0.0),
+        "power check": bool(sample.get("power_met", False)),
+        "settlement integrity (100% reconciled, no manual override)": integrity.status == "passed",
+    }
+    # PRD: an interval that excludes zero from below is a failure; with the power met, a lower bound at or below 0 is too.
+    clv_refuted = bool(sample["gate3_sample"] and "clv_low" in sample
+                       and (sample["clv_high"] < 0.0 or (sample.get("power_met") and sample["clv_low"] <= 0.0)))
+    status = ("failed" if integrity.status == "failed" or clv_refuted
+              else "passed" if all(criteria.values()) else "incomplete")
+    return {"status": status, "criteria": criteria, "blockers": [name for name, ok in criteria.items() if not ok],
+            "clv_criteria_met": bool(sample["clv_criteria_met"]),
+            "settlement_integrity": {"status": integrity.status, "bets": integrity.bets, "reconciled": integrity.reconciled,
+                                     "failed": list(integrity.failed), "incomplete": list(integrity.incomplete)}}
 
 
 def closing_over(quotes: Sequence[Mapping[str, Any]]) -> dict[SelectionKey, float]:
@@ -216,9 +293,11 @@ def over_probability(record: Mapping[str, Any]) -> float:
 
 def evidence(predictions: Sequence[Mapping[str, Any]], outcomes: Mapping[SelectionKey, int],
              closing: Mapping[SelectionKey, float], tips: Sequence[Tip], lines: Mapping[str, Sequence[float]],
-             rng: np.random.Generator) -> dict[str, Any]:
-    """Pure: per market and line, the predictions' metrics against bookmaker-settled outcomes and closing prices, and per
-    market the tips' ROI and CLV. `predictions` must already be the eligible ones (lockbox.eligible)."""
+             rng: np.random.Generator, *, integrity: SettlementIntegrity) -> dict[str, Any]:
+    """Pure: per market and line, the predictions' metrics against bookmaker-settled outcomes and closing prices; per
+    market, line and overall ("all") the tips' ROI and CLV; and the Gate 3 result over all tips and `integrity`, the
+    settlement integrity of every settled paper bet in the Gate 3 population. `predictions` must already be the eligible
+    ones (lockbox.eligible)."""
     report: dict[str, Any] = {"lines": {}, "tips": {}}
     for market, market_lines in lines.items():
         for line in market_lines:
@@ -231,6 +310,8 @@ def evidence(predictions: Sequence[Mapping[str, Any]], outcomes: Mapping[Selecti
             report["tips"][f"{market} over {line:g}"] = tip_evidence(
                 [t for t in tips if t.market == market and t.line == float(line)], rng)
         report["tips"][market] = tip_evidence([t for t in tips if t.market == market], rng)
+    report["tips"]["all"] = tip_evidence(tips, rng)
+    report["gate3"] = gate3_result(report["tips"]["all"], integrity)
     return report
 
 

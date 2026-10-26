@@ -313,7 +313,9 @@ For one bookmaker and one market:
    10), at least 1 substitute appearance and at least 1 player who did not start; recorded with `result <tip> won|lost|void
    <book>` or `pilot_ledger --record --book`.
 3. **Reconciliation:** `pilot_ledger --reconcile` / `ledger --reconcile` report every one of them AGREE at that book, with no
-   DISCREPANCY and no override; any discrepancy is investigated and resolved here before the count restarts.
+   DISCREPANCY and no override; any discrepancy is investigated and resolved here before the count restarts. (Gate 3's own
+   settlement-integrity check, `value_evidence.settlement_integrity`, applies the same classification to every settled
+   paper bet of the Gate 3 population.)
 4. **Then** the maintainer adds `(book, market): Contract(statistic, void rule, evidence file)` to `market_contract.VERIFIED_CONTRACTS` in a PR, and `tests/test_market_contract.py` checks the evidence (section 11). If the
    verified statistic or void rule differs from what the model prices, the pricing change needs a new freeze and a later lockbox
    start first (`LOCKBOX_PROTOCOL.md`).

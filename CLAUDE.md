@@ -55,6 +55,15 @@ Full rules for any code change: **AGENT.md**. Requirements and go-live gates: `p
       logged before kickoff and a closing capture (`lockbox.coverage`, `status.coverage_section`).
   - Still open: the machine must be on at kickoff (an always-on host), and the "k+" ladders are one-sided (only the
     0.5 line can be de-vigged).
+  **Gate 3 settlement integrity (2026-10-26):** `scripts/value_evidence.py` no longer reports value from CLV alone.
+  - `value_evidence.settlement_integrity` classifies each reconciliation: `agree` reconciled; `discrepancy`,
+    `other_book_discrepancy` or any manual override failed; `unverifiable`, `unconfirmed` or `other_book_agree`
+    incomplete; no bet at all is incomplete.
+  - It covers every settled paper bet of the Gate 3 population: lockbox League One/Two match, placed before kickoff.
+  - `gate3_result` passes only with the sample, the CLV lower bound, the power check and integrity all met;
+    `clv_criteria_met` is the statistical result alone.
+  - "value shown" needs Gate 3 passed and a verified contract. Today Gate 3 is INCOMPLETE (0 settled League One/Two
+    paper bets).
 - **SQL has run on PostgreSQL 18.6 only.** In CI's database stage, `schema.sql` installs cleanly, migrations 003 → 004 → 005 → 006 → 007 → 008 → 009 upgrade cleanly and `tests/test_merge_postgres.sql` passes. On the working `prop_alpha` database, the merge has run on real Sportmonks data (backfill, Gate 1 below), and migrations 006 and 007 were applied on 2026-10-04 (backups in `.prop_alpha_state/backups/`; 007 backfilled `match_position` on all 46,653 rows, 6,148 of which differ from the player's current position, and a second run updated 0); migration 009 was applied on 2026-10-05 (backup `prop_alpha_before_009_20261005T094128Z.dump`): a player listed without a Sportmonks `position_id` had been stored as the position 'PNone', a pricing bucket of its own; 009 stores NULL instead (the adapter now sends NULL for a missing id and refuses an unknown one), set the 14 'PNone' match rows (all in fixture 1146) to NULL and restored the 3 affected players' `primary_position` from their latest known match (ATT, DEF, GK); a second run changed nothing. This is an input-data repair: the pricing code and its frozen digest are unchanged, and it was applied before the first lockbox kickoff (2026-10-06). The Gate 1 soak ran on a throwaway copy. The PRD minimum is 15+, so 18 qualifies; 15–17 are untested. **Not run:** migration 002 on a real v2 database (none exists). Tag claims beyond this **[U]**.
 - **Odds collector: built for OddsPapi player tackles and fouls O/U in League One and Two, verified live on 2026-10-03** (bet365 answered; Sky Bet and William Hill had no fixtures; bet365 listed only goalscorer props a week out, so no tackles/fouls price has been seen yet; fixture matching 12/12 on bet365's real fixtures; player-name matching is unit-tested only). Odds are archived as files, not written to `odds_lines`. Since 2026-10-06 the status report counts the distinct tackles/fouls prices in every archived reply (`status.quote_section`, audit F-02); on that day: "F-02 open: no tackles/fouls price in 1 archived OddsPapi reply".
 - **Not built:** projection refresh into `model_projections`, the database bet ledger (`bets` table) and execution components (never to be built: betting is manual). **Built 2026-10-05:** closing-price capture (`alerts/closing.py`, run every 10 minutes by the ledger task: each bookmaker's prices 0-15 minutes before kickoff, appended to `.prop_alpha_state/closing_quotes.jsonl`); no closing price has been captured yet [U]. **Built:** a file-based manual ledger (`alerts/ledger.py`, `.prop_alpha_state/placed_bets.jsonl`) that records bets the maintainer reports by Telegram reply, and settles them (2026-10-04) from the stored Sportmonks counts under the **assumed** market contract (tackles = `tackles_attempted`, fouls = `fouls_committed`, void if the player does not play, a whole-line count is a push); a `settled <id> won|lost|void` reply overrides it. Settlement has run on no real bet yet [U]. A results job (`ingestion/results.py`) keeps the database current.
@@ -115,7 +124,7 @@ python3 -m venv .venv
 Tests:
 
 ```bash
-# Whole suite (947 tests). This is the command that counts.
+# Whole suite (953 tests). This is the command that counts.
 python -m pytest tests -q -p no:cacheprovider
 
 # Individual suites
@@ -224,7 +233,7 @@ On a machine without a native install, Docker works too (untested here): `docker
 
 ## Before you say a change is done
 
-1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (947). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
+1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (953). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
 2. `bash ci/bootstrap.sh --preflight` passes, and `python -m mypy` and `npx --yes pyright@1.1.406` report no errors.
 3. If you touched SQL: the full pipeline with `PROP_ALPHA_CI_DATABASE_URL` set ends with `schema smoke test passed`, and any new merge behaviour has a check in `tests/test_merge_postgres.sql`.
 4. New behaviour has tests that failed before the change.

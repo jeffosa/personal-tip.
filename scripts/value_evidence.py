@@ -43,7 +43,14 @@ from prop_alpha.alerts.pilot_ledger import (  # noqa: E402
 )
 from prop_alpha.alerts.shadow_picks import PILOT_SHADOW_FILE, SHADOW_FILE, ShadowPickLog  # noqa: E402
 from prop_alpha.alerts.predictions import PredictionLog  # noqa: E402
-from prop_alpha.alerts.replies import profit, reconciliation_summary, reconciliation_text, same_book  # noqa: E402
+from prop_alpha.alerts.replies import (  # noqa: E402
+    PlacedBet,
+    Reconciliation,
+    profit,
+    reconciliation_summary,
+    reconciliation_text,
+    same_book,
+)
 from prop_alpha.config import DEFAULT_DSN, DEFAULT_PILOT_DSN, DSN_ENV  # noqa: E402
 from prop_alpha.evaluation import lockbox, value_evidence  # noqa: E402
 
@@ -72,12 +79,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     report: dict[str, Any] = {"run_at": now.isoformat(), "contract": contract_status(), "settlement": {}}
 
     print("1. Settlement agreement (bookmaker result v automatic settlement on stored Sportmonks counts)")
+    reconciled: dict[str, list[tuple[PlacedBet, Reconciliation]]] = {}
     for name, store, db, sql in (("League One/Two ledger", PlacedBetStore(), dsn, ledger.SETTLEMENT_SQL),
                                  ("pilot paper tips", PlacedBetStore(PILOT_BETS_FILE), DEFAULT_PILOT_DSN, PILOT_SETTLEMENT_SQL)):
         items = ledger.reconcile_settlements(store, db, now, sql)
+        reconciled[name] = items
         counts = Counter(item.outcome for _, item in items)
-        report["settlement"][name] = dict(counts)
-        print(f"  {name}: {len(items)} settled bet(s)")
+        whole = value_evidence.settlement_integrity([item for _, item in items])
+        report["settlement"][name] = {"outcomes": dict(counts), "integrity": whole.status}
+        print(f"  {name}: {len(items)} settled bet(s); settlement integrity over all of them: {whole.status.upper()} "
+              f"({whole.reconciled} reconciled, {len(whole.failed)} failed, {len(whole.incomplete)} incomplete)")
         for bet, item in items:
             if item.outcome != "unconfirmed":
                 print("    " + reconciliation_text(bet, item))
@@ -115,8 +126,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                                            None if value is None else value.clv))
     if pilot_settled:
         not_tips["pilot paper tip (pilot matches are not evidence)"] += len(pilot_settled)
+    # Gate 3 criterion 4 covers every settled paper bet of the Gate 3 population (a lockbox match, placed before kickoff),
+    # including those left out of the CLV sample (automatic result only, another book's result, a void): each must
+    # reconcile, with no manual override (value_evidence.settlement_integrity). Pilot bets are not in the population.
+    population = [item for bet, item in reconciled["League One/Two ledger"]
+                  if bet.fixture_id in kickoff and bet.placed_at < kickoff[bet.fixture_id]]
+    integrity = value_evidence.settlement_integrity(population)
     result = value_evidence.evidence(selection.eligible, outcomes, closing, tips, lockbox.PROTOCOL.lines,
-                                     np.random.default_rng(lockbox.PROTOCOL.seed))
+                                     np.random.default_rng(lockbox.PROTOCOL.seed), integrity=integrity)
     report.update(result, outcomes_left_out=left_out, tips_left_out=dict(not_tips), closing_quotes=len(quotes),
                   two_way_closing=len(closing))
     print(f"  bookmaker-settled outcomes: {len(outcomes)}; left out: "
@@ -141,10 +158,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                if "clv" in entry else "")
         print(f"  {name}: {entry['picks']} shadow picks, {entry['with_close']} with a same-book closing price "
               f"({entry['with_two_way_close']} two-way) in {entry['fixtures']} matches{price_text}{clv}; reported, not judged")
-    shown = bool(VERIFIED_CONTRACTS) and any(entry["value_shown"] for entry in result["tips"].values())
+    gate3 = result["gate3"]
+    print(f"5. Gate 3 (all settled paper bets): {gate3['status'].upper()}")
+    print(f"  CLV criteria (statistical result only, never a passed gate on its own): "
+          f"{'met' if gate3['clv_criteria_met'] else 'not met'}")
+    print(f"  settlement integrity (100% reconciled, no manual override): {integrity.status.upper()} over "
+          f"{integrity.bets} bet(s): {integrity.reconciled} reconciled, {len(integrity.failed)} failed, "
+          f"{len(integrity.incomplete)} incomplete")
+    for reason in [*integrity.failed, *integrity.incomplete]:
+        print(f"    {reason}")
+    for blocker in gate3["blockers"]:
+        print(f"  not met: {blocker}")
+    # Value is claimed only when Gate 3 passed (CLV and settlement integrity together) under a verified contract.
+    shown = bool(VERIFIED_CONTRACTS) and gate3["status"] == "passed"
     report["value_shown"] = shown
-    print(f"Verdict: value {'shown on the Gate 3 sample' if shown else 'NOT shown'}; {contract_status()}. No value "
-          "claim is made without a verified contract and the Gate 3 sample.")
+    print(f"Verdict: value {'shown: Gate 3 passed' if shown else 'NOT shown'}; Gate 3 {gate3['status']}; "
+          f"{contract_status()}. No value claim is made without a verified contract and a passed Gate 3.")
     out = STATE / "analysis" / f"value_evidence_{now:%Y-%m-%d}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=1, default=str), encoding="utf-8")

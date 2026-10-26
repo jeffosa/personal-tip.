@@ -154,6 +154,11 @@ npx --yes pyright@1.1.406
   the lockbox matches that kicked off without a logged prediction (WARNING) and those with a closing capture. Withheld
   real-price picks are kept as shadow picks (`shadow_picks.jsonl`, `pilot_shadow_picks.jsonl`); `scripts/value_evidence.py`
   reports their same-book closing value.
+- **Gate 3 in the evidence report** (2026-10-26): `scripts/value_evidence.py` prints Gate 3 as PASSED, FAILED or
+  INCOMPLETE, with each unmet criterion. Settlement integrity covers every settled paper bet of the Gate 3 population:
+  any discrepancy or manual override fails it; an unchecked, automatic-only or other-book result leaves it incomplete.
+  The CLV line is a statistical result only and never a passed gate on its own; "value shown" needs Gate 3 passed
+  and a verified contract.
 - **Vendor and leagues:** current scheduled paths use Sportmonks with `prop_alpha` (League One/Two) and `prop_alpha_pilot` (Brazil Serie A, Scottish Premiership, English Championship). The Starter trial is recorded through 2026-11-08; confirm paid coverage and cost before relying on ingestion after it.
 - **Pilot leagues are unvalidated:** Brazil Serie A is in `TIP_LEAGUES`, but its tips are withheld by the contract gate (above); the settlement definition and model-vs-market evidence remain unresolved. Scottish leagues are priced but never tipped. Do not treat any pilot result as validated betting performance.
 - **Never run:** migration 002 on a real v2 database; the live T-60 line-up path; the 14-branch pruning of the backup repository.
