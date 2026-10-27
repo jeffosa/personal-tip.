@@ -1,0 +1,2 @@
+{"delivery_id": 1, "event": "pending", "at": "2026-10-10T11:00:00+00:00", "kind": "digest", "text": "PAPER ONLY\nHIGH-VALUE BETS 1-1 of 1\n\n1. Walsall v Port Vale", "items": [{"number": 1, "kind": "alert", "fixture_id": 9001, "player_id": 7, "market": "tackles", "line": 1.5, "min_odds": [["over", 1.97]], "match": "Walsall v Port Vale", "player": "A (Walsall)", "book": "skybet", "label": ""}], "valid_until": "2026-10-10T14:00:00+00:00"}
+{"delivery_id": 1, "event": "confirmed_by_reply", "at": "2026-10-10T12:00:00+00:00", "message_id": 777}

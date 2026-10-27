@@ -1,0 +1,1 @@
+{"fixture_id": 9001, "league": "League Two", "kickoff_at": "2026-10-10T15:00:00+00:00", "captured_at": "2026-10-10T14:20:00+00:00", "minutes_to_kickoff": 40.0, "status": "incomplete", "home_team_uid": "76", "away_team_uid": "348", "starters": {"76": [], "348": ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10"]}, "bench": {"76": ["hb1"], "348": ["ab1"]}}

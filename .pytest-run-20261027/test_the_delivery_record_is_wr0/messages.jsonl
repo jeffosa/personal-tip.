@@ -1,0 +1,1 @@
+{"message_id": 70, "sent_at": "2026-10-27T10:33:29.876595+00:00", "items": [{"number": 1, "kind": "alert", "fixture_id": 1001, "player_id": 100, "market": "tackles", "line": 4.5, "min_odds": [["under", 1.156]], "match": "Fixture 1001", "player": "player 100", "book": "SyntheticBookC", "label": "1a"}]}

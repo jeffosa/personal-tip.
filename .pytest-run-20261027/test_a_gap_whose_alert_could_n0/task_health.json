@@ -1,0 +1,13 @@
+{
+ "ledger": {
+  "last_run_at": "2026-10-22T20:11:00+00:00",
+  "consecutive_failures": 0,
+  "failed_steps": [],
+  "failing_since": null,
+  "alerted_at": null,
+  "overdue_alerted_at": null
+ },
+ "machine": {
+  "battery_alerted_at": null
+ }
+}

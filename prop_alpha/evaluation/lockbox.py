@@ -34,6 +34,7 @@ DUPLICATE: Final[str] = "duplicate (a later log of the same prediction)"
 PENDING: Final[str] = "outcome pending (not final, or inside the revision grace)"
 MISSING: Final[str] = "outcome missing (not final 14 days after kickoff)"
 VOID: Final[str] = "void (the player did not play)"
+EXCLUDED_LATE: Final[str] = "excluded (captured late with no data fetched before the grace)"
 
 
 @dataclass(frozen=True)
@@ -58,9 +59,15 @@ class LockboxProtocol:
     end: datetime
     min_scored_fixtures_per_line: int
     amended_on: date
+    # Capture amendment of 2026-10-27 (maintainer: option D of LOCKBOX_PROTOCOL.md section 5), decided after the start
+    # but before any capture could be due (start + revision_grace) and before any outcome existed. A match's outcome is
+    # captured from data re-fetched at its first capture run within `refetch_window` after the grace; a later capture is
+    # rebuilt from the last payload fetched at or before the grace, and excluded when there is none.
+    refetch_window: timedelta
+    capture_policy_decided_at: datetime
 
     def __post_init__(self) -> None:
-        for name in ("start", "last_examined_kickoff", "end"):
+        for name in ("start", "last_examined_kickoff", "end", "capture_policy_decided_at"):
             value = getattr(self, name)
             if value.tzinfo is None or value.utcoffset() != timedelta(0):
                 raise ValueError(f"{name} must be a UTC datetime")
@@ -78,6 +85,10 @@ class LockboxProtocol:
             raise ValueError("the lockbox must end after it starts and need at least one match per line")
         if self.amended_on >= self.start.date():
             raise ValueError("an amendment to the scoring rules must be decided before the lockbox starts")
+        if not timedelta(0) < self.refetch_window < self.missing_after - self.revision_grace:
+            raise ValueError("the re-fetch window must be positive and end before outcomes count as missing")
+        if self.capture_policy_decided_at >= self.start + self.revision_grace:
+            raise ValueError("the capture policy must be decided before any capture can be due")
 
 
 PROTOCOL: Final[LockboxProtocol] = LockboxProtocol(
@@ -98,6 +109,8 @@ PROTOCOL: Final[LockboxProtocol] = LockboxProtocol(
     end=datetime(2027, 6, 1, tzinfo=timezone.utc),
     min_scored_fixtures_per_line=320,
     amended_on=date(2026, 10, 26),
+    refetch_window=timedelta(hours=4),
+    capture_policy_decided_at=datetime(2026, 10, 27, 10, 38, tzinfo=timezone.utc),
 )
 
 PredictionKey = tuple[int, int, str, float]
@@ -173,14 +186,65 @@ class StoredMatch:
     kickoff_at: datetime
     final: bool
     players: Mapping[int, tuple[int, Mapping[str, int]]]
+    # When the vendor data stored for the match was first and last fetched (raw_payloads.fetched_at: a revised payload is
+    # a new row): recorded on each capture so a late one shows whether it holds data fetched after the intended capture time.
+    first_fetched_at: datetime | None = None
+    last_fetched_at: datetime | None = None
+
+
+# How a captured outcome was obtained (capture amendment of 2026-10-27). REFETCHED: from data re-fetched at the match's
+# first capture run within PROTOCOL.refetch_window of the grace. REBUILT: a later capture, rebuilt from the last stored
+# payload fetched at or before the grace. NO_EARLY_DATA: a later capture with no such payload: excluded, never scored.
+# STORED: the stored statistics as they are (only before the amendment, and in tests of the record itself).
+REFETCHED: Final[str] = "refetched at the grace"
+REBUILT: Final[str] = "rebuilt from the last payload fetched before the grace"
+NO_EARLY_DATA: Final[str] = "excluded: captured late, no data fetched before the grace"
+STORED: Final[str] = "stored statistics"
+REFETCH: Final[str] = "refetch"
+REBUILD: Final[str] = "rebuild"
+
+
+def capture_plan(predictions: Sequence[Mapping[str, Any]], captured: Mapping[tuple[int, int], Mapping[str, Any]],
+                 matches: Mapping[int, StoredMatch], now: datetime,
+                 protocol: LockboxProtocol = PROTOCOL) -> dict[int, str]:
+    """Pure: for each match with an eligible prediction still to capture that is final in `matches` and past its grace,
+    REFETCH (now within `refetch_window` of the grace: re-fetch it, then capture from the fresh data) or REBUILD (later:
+    capture from the last payload fetched at or before the grace, or exclude it when there is none)."""
+    plan: dict[int, str] = {}
+    for record in predictions:
+        fixture_id = int(record["fixture_id"])
+        match = matches.get(fixture_id)
+        if (fixture_id, int(record["player_id"])) in captured or match is None or not match.final:
+            continue
+        due = match.kickoff_at + protocol.revision_grace
+        if now >= due:
+            plan[fixture_id] = REFETCH if now <= due + protocol.refetch_window else REBUILD
+    return plan
+
+
+def exclusion_records(predictions: Sequence[Mapping[str, Any]], captured: Mapping[tuple[int, int], Mapping[str, Any]],
+                      matches: Mapping[int, StoredMatch], fixture_ids: Collection[int], now: datetime,
+                      protocol: LockboxProtocol = PROTOCOL) -> list[dict[str, Any]]:
+    """Pure: an exclusion record, once per (match, player) of an eligible prediction, for late captures of `fixture_ids`
+    with no payload fetched at or before the grace: recorded so it is never attempted again, never scored."""
+    new: dict[tuple[int, int], dict[str, Any]] = {}
+    for record in predictions:
+        key = (int(record["fixture_id"]), int(record["player_id"]))
+        if key[0] not in fixture_ids or key in captured or key in new or key[0] not in matches:
+            continue
+        new[key] = {"fixture_id": key[0], "player_id": key[1], "minutes": None, "excluded": True,
+                    "capture_basis": NO_EARLY_DATA, "captured_at": now.isoformat(),
+                    "due_at": (matches[key[0]].kickoff_at + protocol.revision_grace).isoformat()}
+    return list(new.values())
 
 
 def outcomes_to_capture(predictions: Sequence[Mapping[str, Any]], captured: Mapping[tuple[int, int], Mapping[str, Any]],
                         matches: Mapping[int, StoredMatch], now: datetime,
-                        protocol: LockboxProtocol = PROTOCOL) -> list[dict[str, Any]]:
+                        protocol: LockboxProtocol = PROTOCOL, basis: str = STORED) -> list[dict[str, Any]]:
     """Pure: the outcome records to append, once per (match, player) of an eligible prediction: only for a final match
     whose kickoff is at least the revision grace before `now`, and never again once captured (a later vendor revision
-    is reported by `revised`, never applied). A player with no stored row did not play."""
+    is reported by `revised`, never applied). A player with no stored row did not play. `basis` says how `matches` was
+    obtained (REFETCHED or REBUILT; capture_plan chooses)."""
     new: dict[tuple[int, int], dict[str, Any]] = {}
     for record in predictions:
         key = (int(record["fixture_id"]), int(record["player_id"]))
@@ -190,8 +254,74 @@ def outcomes_to_capture(predictions: Sequence[Mapping[str, Any]], captured: Mapp
         minutes, counts = match.players.get(key[1], (0, {}))
         new[key] = {"fixture_id": key[0], "player_id": key[1], "minutes": int(minutes),
                     **{market: (None if counts.get(market) is None else int(counts[market])) for market in protocol.lines},
-                    "captured_at": now.isoformat(), "source": f"{protocol.data_vendor}:player_match_stats"}
+                    "captured_at": now.isoformat(), "source": f"{protocol.data_vendor}:player_match_stats",
+                    "capture_basis": basis,
+                    # Evidence only (2026-10-27): when the capture was due and when the data it holds was fetched.
+                    "due_at": (match.kickoff_at + protocol.revision_grace).isoformat(),
+                    "data_first_fetched_at": None if match.first_fetched_at is None else match.first_fetched_at.isoformat(),
+                    "data_last_fetched_at": None if match.last_fetched_at is None else match.last_fetched_at.isoformat()}
     return list(new.values())
+
+
+# A capture later than this after the grace is late: it missed the re-fetch window of the capture amendment
+# (PROTOCOL.refetch_window, one 4-hourly capture run). Data fetched after the grace plus this window was fetched after the
+# intended capture time. Reporting only: no captured outcome is changed, dropped or re-captured.
+CAPTURE_RUN_INTERVAL: Final[timedelta] = PROTOCOL.refetch_window
+
+
+@dataclass(frozen=True)
+class CaptureTiming:
+    """How the captured matches were captured (LOCKBOX_PROTOCOL.md sections 5 and 6). `late`: captured more than
+    CAPTURE_RUN_INTERVAL after the grace. `first_fetched_after_due` / `revised_after_due`: the data a capture holds was all
+    fetched, or partly re-fetched, after the grace plus CAPTURE_RUN_INTERVAL (after the intended capture time).
+    `unknown`: captured without timing records. `refetched`, `rebuilt`, `excluded`: matches by capture basis (REFETCHED,
+    REBUILT, NO_EARLY_DATA). Counts are of matches."""
+
+    matches: int
+    late: int
+    latest_hours: float
+    first_fetched_after_due: int
+    revised_after_due: int
+    unknown: int
+    refetched: int = 0
+    rebuilt: int = 0
+    excluded: int = 0
+
+
+def capture_timing(captured: Mapping[tuple[int, int], Mapping[str, Any]]) -> CaptureTiming:
+    """Pure: the timing of the captured outcomes, one entry per match (its earliest capture), from the records alone."""
+    by_match: dict[int, Mapping[str, Any]] = {}
+    for (fixture_id, _), record in sorted(captured.items(), key=lambda item: (item[0], str(item[1]["captured_at"]))):
+        by_match.setdefault(fixture_id, record)
+    late = first_after = revised_after = unknown = 0
+    latest = 0.0
+    for record in by_match.values():
+        if record.get("due_at") is None:
+            unknown += 1
+            continue
+        due = _time(record["due_at"])
+        cutoff = due + CAPTURE_RUN_INTERVAL
+        lateness = _time(record["captured_at"]) - due
+        latest = max(latest, lateness.total_seconds() / 3600.0)
+        late += lateness > CAPTURE_RUN_INTERVAL
+        first, last = record.get("data_first_fetched_at"), record.get("data_last_fetched_at")
+        if first is not None and _time(first) > cutoff:
+            first_after += 1
+        elif last is not None and _time(last) > cutoff:
+            revised_after += 1
+    bases = [record.get("capture_basis") for record in by_match.values()]
+    return CaptureTiming(len(by_match), late, latest, first_after, revised_after, unknown,
+                         bases.count(REFETCHED), bases.count(REBUILT), bases.count(NO_EARLY_DATA))
+
+
+def capture_timing_line(timing: CaptureTiming) -> str:
+    """Pure: the scorer's line about capture timing (reported, never applied)."""
+    return (f"capture timing: {timing.matches} match(es) captured ({timing.refetched} re-fetched at the grace, "
+            f"{timing.rebuilt} rebuilt from data before it, {timing.excluded} excluded: no data before it); {timing.late} "
+            f"more than {int(CAPTURE_RUN_INTERVAL.total_seconds() // 3600)} h after the 72 h grace (latest "
+            f"{timing.latest_hours:.1f} h after it); data fetched after the intended capture time: "
+            f"{timing.first_fetched_after_due} first fetched then, {timing.revised_after_due} revised then"
+            + (f"; {timing.unknown} captured without timing records" if timing.unknown else ""))
 
 
 def revised(captured: Mapping[tuple[int, int], Mapping[str, Any]], matches: Mapping[int, StoredMatch],
@@ -200,7 +330,7 @@ def revised(captured: Mapping[tuple[int, int], Mapping[str, Any]], matches: Mapp
     changed = []
     for (fixture_id, player_id), outcome in sorted(captured.items()):
         match = matches.get(fixture_id)
-        if match is None:
+        if match is None or outcome.get("excluded"):
             continue
         minutes, counts = match.players.get(player_id, (0, {}))
         if int(minutes) != int(outcome["minutes"]) or any(
@@ -227,6 +357,9 @@ def scoring_rows(predictions: Sequence[Mapping[str, Any]], captured: Mapping[tup
     for record in predictions:
         fixture_id, market, line = int(record["fixture_id"]), str(record["market"]), float(record["line"])
         outcome = captured.get((fixture_id, int(record["player_id"])))
+        if outcome is not None and outcome.get("excluded"):
+            states[EXCLUDED_LATE] += 1
+            continue
         if outcome is None:
             late = now >= _time(record["kickoff_at"]) + protocol.missing_after
             states[MISSING if late else PENDING] += 1

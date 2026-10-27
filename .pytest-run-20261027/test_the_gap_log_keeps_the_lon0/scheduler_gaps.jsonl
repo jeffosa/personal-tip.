@@ -1,0 +1,4 @@
+{"start": "2026-10-22T18:01:00+00:00", "end": "2026-10-22T20:01:00+00:00", "hours": 2.0, "missed_status_runs": 0, "missed_polls": 11, "missed_backups": 0, "noticed_by": "ledger", "power": null}
+{"start": "2026-10-22T18:01:00+00:00", "end": "2026-10-22T21:01:00+00:00", "hours": 3.0, "missed_status_runs": 1, "missed_polls": 17, "missed_backups": 0, "noticed_by": "status", "power": "battery (29%)"}
+{"start": "2026-10-23T18:01:00+00:00", "end": "2026-10-23T19:01:00+00:00", "hours": 1.0, "missed_status_runs": 0, "missed_polls": 5, "missed_backups": 0, "noticed_by": "ledger", "power": null}
+["not", "a", "gap"]

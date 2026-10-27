@@ -64,6 +64,16 @@ Full rules for any code change: **AGENT.md**. Requirements and go-live gates: `p
     `clv_criteria_met` is the statistical result alone.
   - "value shown" needs Gate 3 passed and a verified contract. Today Gate 3 is INCOMPLETE (0 settled League One/Two
     paper bets).
+  **Late lockbox captures (2026-10-27, `LOCKBOX_PROTOCOL.md` section 5):**
+  - A capture copies whatever `player_match_stats` holds when the 4-hourly capture runs. So a late capture can include
+    data fetched after kickoff + 72 h, and the results job never re-fetches a stored final, so even an on-time capture
+    holds the vendor's first-ingestion data, not its 72 h state.
+  - Each capture now records `due_at` and the match's raw-payload fetch times, and the scorer reports late captures and
+    post-grace data (`lockbox.capture_timing`). Reported only: no outcome, eligibility or scoring rule changed.
+  - **Option D in force** (maintainer, 2026-10-27 10:38 UTC, before any capture could be due; `LOCKBOX_PROTOCOL.md`
+    section 6). At its first capture run within 4 h after the grace a match is re-fetched through the ingestion engine
+    and captured from the fresh data. Later it is rebuilt from the last raw payload fetched at or before the grace,
+    and excluded (never scored) when there is none. Tests: `tests/test_lockbox_capture_policy.py`.
   **Gate 3 trace (2026-10-26, `GATE3_DECISION_MEMO.md`):**
   - PRD criterion 4 reconciles a paper bet to the stored outcome and the book's void rule; it asks for no bookmaker's
     settlement. So an automatic result under the bet's book's verified contract (`market_contract.automatic_settlement_verified`)
@@ -101,6 +111,16 @@ Full rules for any code change: **AGENT.md**. Requirements and go-live gates: `p
   - Same-book settled examples: 0 for every target.
   - `tests/test_market_contract.py` requires every file to parse and to hold only first-hand rules.
   - What the maintainer must obtain: `MARKET_CONTRACT.md` section 13.
+  **Contract-evidence checks hardened (audit 2026-10-27; `VERIFIED_CONTRACTS` still empty, every real-price tip withheld):**
+  - `market_contract.evidence_failures` reports a CONFLICT, and counts nothing for that selection, when it is recorded twice
+    with different facts. Before, the first record was kept silently, so a contradicting same-book settlement could hide
+    behind it.
+  - It does not count an example without `source` (how the bookmaker's result was read) or `settled_on`; an invalid date
+    raises.
+  - It refuses malformed fields (`_checked_example`) instead of reading them loosely: `bool("false")` is true, so a
+    substitute typed that way was read as a starter.
+  - `TEMPLATE.json` lists all three first-hand sources.
+  - Tests: `tests/test_market_contract.py`.
   **Gate 2 calibration amendment (maintainer, 2026-10-26 20:44 UTC, before the lockbox start; `GATE2_CALIBRATION_DECISION_MEMO.md` Option 3):**
   - **Why:** "every bin of 50+ within 0.03" almost never passes a perfectly calibrated model at the lockbox's sample sizes
     (0 of 1,000 and 0 of 2,000 simulations at the old trigger of about 21 matches), and the slope rule cannot pass a good
@@ -175,7 +195,7 @@ python3 -m venv .venv
 Tests:
 
 ```bash
-# Whole suite (1000 tests). This is the command that counts.
+# Whole suite (1028 tests). This is the command that counts.
 python -m pytest tests -q -p no:cacheprovider
 
 # Individual suites
@@ -284,7 +304,7 @@ On a machine without a native install, Docker works too (untested here): `docker
 
 ## Before you say a change is done
 
-1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (1000). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
+1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (1028). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
 2. `bash ci/bootstrap.sh --preflight` passes, and `python -m mypy` and `npx --yes pyright@1.1.406` report no errors.
 3. If you touched SQL: the full pipeline with `PROP_ALPHA_CI_DATABASE_URL` set ends with `schema smoke test passed`, and any new merge behaviour has a check in `tests/test_merge_postgres.sql`.
 4. New behaviour has tests that failed before the change.

@@ -11,7 +11,46 @@ settlements, closing prices) that code cannot produce. They take calendar time a
 
 Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not executed where it will run · **[N]** not built.
 
-## Status on 2026-10-26 (f): Gate 3 traced against the PRD (read this first)
+## Status on 2026-10-27: late lockbox captures (read this first)
+
+**Finding:** the protocol captures each outcome "once, 72 hours after kickoff". The code copies the stored counts whenever
+the 4-hourly capture runs.
+- **A late capture** (laptop off at the 72 h mark, a failed results job, a re-ingestion) can hold data fetched after the
+  intended time, and nothing recorded it.
+- **Even an on-time capture** holds the vendor's data from first ingestion: stored finals are never re-fetched, so the
+  grace takes in no vendor correction.
+
+**Change [T]:** each capture records when it was due and when its data was fetched, and the scorer reports late captures
+and post-grace data. Reported only, as the protocol authorises; no outcome, eligibility or scoring rule changed. Tests:
+`tests/test_lockbox_capture_timing.py` (on-time, late, first ingested late, repeated runs).
+
+**Decided 2026-10-27: option D** (`LOCKBOX_PROTOCOL.md` section 6, in force before any capture could be due).
+- On time (the first capture run within 4 h after the grace): re-fetch the match, then capture from the fresh data.
+- Late: rebuild from the last raw payload fetched at or before the grace; excluded and reported when there is none.
+
+[T] `tests/test_lockbox_capture_policy.py`. Not seen live yet: the first capture falls due about 30 Oct [U].
+
+## Status on 2026-10-27 (g): contract registry and evidence checks audited
+
+**Still PAPER ONLY; every real-price tip withheld.** `VERIFIED_CONTRACTS` is empty, and every evidence file fails `evidence_failures`. Criteria unmet: bet365 tackles 13, bet365 fouls 10, Betway tackles 9, Betway fouls 7, Betfred fouls 10.
+
+| Defect (could admit an unverified contract, or misstate evidence) | Fix [T] |
+|---|---|
+| A selection recorded twice kept its first record silently, so a contradicting same-book settlement could hide behind an agreeing one | A CONFLICT failure, and the selection is not counted |
+| Examples without `source` or `settled_on` were counted, though the template requires both | Reported and not counted; an invalid date raises |
+| Fields were read loosely (`bool("false")` is true, so a typed-as-string substitute was misreported as missing) | Malformed fields raise (`_checked_example`) |
+| `TEMPLATE.json` omitted `bookmaker rules document` as a first-hand source | Listed |
+
+**Tip paths audited:**
+- **League One/Two scan:** bet365, skybet and williamhill; tackles only; gated by `split_unverified` on `MODEL_STATISTICS`.
+- **Pilot scan:** bet365 and betway; tackles only; Brazil Serie A only; gated on `PILOT_STATISTICS` (`s.tackles_attempted`).
+- **Mock runs:** not gated, but labelled MOCK and kept in separate stores.
+- **Other senders:** `delivery --resend` refuses expired deliveries. `telegram --demo` is synthetic. Status, task_health, odds_probe and matchday_report (task deleted) send no tips.
+- **Betway:** would stay withheld even with evidence, because its rules void non-starters, which is not the void rule priced.
+
+**Still needed:** the maintainer checklist in `MARKET_CONTRACT.md` section 13, and decision D2 in `GATE3_DECISION_MEMO.md` (same-book settlements need real money; PRD §1.2).
+
+## Status on 2026-10-26 (f): Gate 3 traced against the PRD
 
 **Still PAPER ONLY; Gate 3 INCOMPLETE.** The full trace and the open decisions are in `GATE3_DECISION_MEMO.md`.
 

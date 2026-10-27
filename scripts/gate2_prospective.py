@@ -14,8 +14,10 @@ writes `.prop_alpha_state/gate2_prospective_result.json`; a later run prints tha
 missing benchmark or sample is a fail, never a pass. A lockbox that closes (PROTOCOL.end plus PROTOCOL.missing_after)
 short of the threshold gets a one-time NOT PASSED result in the same file, with no metric computed: it is never scored.
 
-Refuses to run on pricing code other than the protocol's. Read-only on the database; writes only the outcome ledger
-(not with --dry-run) and the one result file.
+Refuses to run on pricing code other than the protocol's. Writes only the outcome ledger (not with --dry-run) and the one
+result file. Since the capture amendment of 2026-10-27 (LOCKBOX_PROTOCOL.md section 6) a capture within the re-fetch window
+after a match's grace first re-fetches it from the vendor through the ingestion engine (the results job's own write path);
+a later capture is rebuilt, read-only, from the last stored payload fetched at or before the grace.
 
     .venv\\Scripts\\python.exe scripts\\gate2_prospective.py [--dry-run | --capture-only]
 
@@ -48,6 +50,7 @@ from prop_alpha.evaluation.backtest import calibration_table  # noqa: E402
 from prop_alpha.evaluation.gate2 import MIN_BENCHMARK_PREDICTIONS, market_benchmark, score_line  # noqa: E402
 from prop_alpha.modeling.model_freeze import FROZEN_DIGEST, LOCKBOX_START, pricing_digest  # noqa: E402
 from prop_alpha.evaluation.value_evidence import closing_over  # noqa: E402
+from prop_alpha.ingestion.transform import parse_fixture_payload  # noqa: E402
 
 STATE: Final[Path] = ROOT / ".prop_alpha_state"
 OUTCOMES_FILE: Final[Path] = STATE / "lockbox_outcomes.jsonl"
@@ -55,8 +58,12 @@ RESULT_FILE: Final[Path] = STATE / "gate2_prospective_result.json"
 RESULT_LOCK_FILE: Final[Path] = STATE / "gate2_prospective_result.lock"
 # PRD target markets the frozen model does not price: Gate 2 cannot pass while one is missing.
 UNPRICED_TARGET_MARKETS: Final[tuple[str, ...]] = ("yellow_card",)
+# With when the match's stored vendor data was first and last fetched (each distinct payload is a raw_payloads row), so a
+# capture records whether it holds data fetched after the intended capture time (lockbox.capture_timing).
 MATCHES_SQL: Final[str] = """
-    SELECT f.vendor_fixture_uid, f.kickoff_at, f.status = 'final'
+    SELECT f.vendor_fixture_uid, f.kickoff_at, f.status = 'final',
+           (SELECT min(r.fetched_at) FROM prop_alpha.raw_payloads r WHERE r.vendor_fixture_uid = f.vendor_fixture_uid),
+           (SELECT max(r.fetched_at) FROM prop_alpha.raw_payloads r WHERE r.vendor_fixture_uid = f.vendor_fixture_uid)
     FROM prop_alpha.fixtures f WHERE f.vendor_fixture_uid = ANY(%s)
 """
 PLAYERS_SQL: Final[str] = """
@@ -64,6 +71,95 @@ PLAYERS_SQL: Final[str] = """
     FROM prop_alpha.player_match_stats s JOIN prop_alpha.fixtures f USING (fixture_id)
     WHERE f.vendor_fixture_uid = ANY(%s) AND f.status = 'final'
 """
+
+
+# A capture rebuilt after the re-fetch window uses the last payload stored for the match at or before its grace (each
+# distinct payload is a raw_payloads row; the payload is the vendor adapter's output, which parse_fixture_payload reads).
+REBUILD_PAYLOAD_SQL: Final[str] = """
+    SELECT payload, fetched_at FROM prop_alpha.raw_payloads
+    WHERE vendor_fixture_uid = %s AND fetched_at <= %s ORDER BY fetched_at DESC, payload_id DESC LIMIT 1
+"""
+PLAYER_IDS_SQL: Final[str] = "SELECT vendor_player_uid, player_id FROM prop_alpha.players WHERE vendor_player_uid = ANY(%s)"
+# Workers for the re-fetch at the grace: a handful of matches per capture run.
+REFETCH_WORKERS: Final[int] = 2
+
+
+def read_matches(dsn: str, fixture_ids: Sequence[int]) -> dict[int, lockbox.StoredMatch]:
+    """Read-only: each match as stored now (kickoff, final or not, the protocol counts per player) with when its vendor
+    data was first and last fetched."""
+    import psycopg2
+
+    conn = psycopg2.connect(dsn, options="-c statement_timeout=60000 -c default_transaction_read_only=on")
+    try:
+        with conn, conn.cursor() as cur:
+            uids = [str(u) for u in fixture_ids]
+            cur.execute(MATCHES_SQL, (uids,))
+            found = {int(uid): (kickoff.astimezone(timezone.utc), bool(final), first, last)
+                     for uid, kickoff, final, first, last in cur.fetchall()}
+            cur.execute(PLAYERS_SQL, (uids,))
+            players: dict[int, dict[int, tuple[int, Mapping[str, int]]]] = {}
+            for uid, player_id, minutes, tackles, fouls in cur.fetchall():
+                players.setdefault(int(uid), {})[int(player_id)] = (int(minutes or 0), {"tackles": tackles, "fouls": fouls})
+    finally:
+        conn.close()
+    return {uid: lockbox.StoredMatch(kickoff, final, players.get(uid, {}),
+                                     None if first is None else first.astimezone(timezone.utc),
+                                     None if last is None else last.astimezone(timezone.utc))
+            for uid, (kickoff, final, first, last) in found.items()}
+
+
+def refetch(dsn: str, fixture_ids: Sequence[int]) -> set[int]:
+    """The re-fetch at the grace: the matches fetched again from the vendor and merged through the ingestion engine
+    (results.ingest, the results job's own path); returns those re-fetched and merged. One vendor request per match."""
+    from prop_alpha.ingestion import results
+    from prop_alpha.ingestion.pipeline import build_vendor_client
+
+    environ = {**os.environ,
+               "DATA_VENDOR_MAX_REQUESTS": os.environ.get("DATA_VENDOR_MAX_REQUESTS", str(2 * len(fixture_ids) + 2)),
+               "DATA_VENDOR_QUOTA_RESERVE": os.environ.get("DATA_VENDOR_QUOTA_RESERVE", "100")}
+    client = build_vendor_client(environ)
+    try:
+        slate = results.ingest(client, dsn, [str(u) for u in fixture_ids], REFETCH_WORKERS)
+    finally:
+        client.close()
+    if slate.merge_error is not None:
+        return set()
+    failed = {str(uid) for uid in slate.failed} | {str(uid) for uid in slate.timed_out}
+    return {uid for uid in fixture_ids if str(uid) not in failed}
+
+
+def match_from_payload(payload: Mapping[str, Any], fetched_at: datetime, kickoff_at: datetime,
+                       player_ids: Mapping[str, int]) -> lockbox.StoredMatch | None:
+    """Pure: the match as the stored payload had it (protocol counts per player id), or None when that payload was not of a
+    final match. A player the players table does not know is left out (no lockbox prediction can be for him)."""
+    parsed = parse_fixture_payload(payload)
+    if parsed.fixture.status != "final":
+        return None
+    players = {player_ids[p.player_uid]: (p.minutes_played, {"tackles": p.tackles_attempted, "fouls": p.fouls_committed})
+               for p in parsed.players if p.player_uid in player_ids}
+    fetched = fetched_at.astimezone(timezone.utc)
+    return lockbox.StoredMatch(kickoff_at, True, players, fetched, fetched)
+
+
+def rebuild(dsn: str, fixture_id: int, kickoff_at: datetime, due: datetime) -> lockbox.StoredMatch | None:
+    """Read-only: the match rebuilt from its last payload fetched at or before `due` (the end of its grace); None when
+    there is none, or it was not of a final match (the outcome is then excluded, never scored)."""
+    import psycopg2
+
+    conn = psycopg2.connect(dsn, options="-c statement_timeout=60000 -c default_transaction_read_only=on")
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(REBUILD_PAYLOAD_SQL, (str(fixture_id), due))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            payload, fetched_at = row
+            uids = [str(player["uid"]) for player in payload.get("players", [])]
+            cur.execute(PLAYER_IDS_SQL, (uids,))
+            player_ids = {str(uid): int(player_id) for uid, player_id in cur.fetchall()}
+    finally:
+        conn.close()
+    return match_from_payload(payload, fetched_at, kickoff_at, player_ids)
 
 
 def load_outcomes(path: Path) -> dict[tuple[int, int], dict[str, Any]]:
@@ -147,8 +243,6 @@ def write_result_once(result: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    import psycopg2
-
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="capture no outcome; report only")
@@ -163,27 +257,32 @@ def main(argv: Sequence[str] | None = None) -> int:
               "change needs a new protocol with a later start (LOCKBOX_PROTOCOL.md).")
         return 2
     now = datetime.now(timezone.utc)
+    dsn = os.environ.get(DSN_ENV, DEFAULT_DSN)
     records = PredictionLog(STATE / "predictions.jsonl").load()
     candidates = sorted({int(r["fixture_id"]) for r in records if lockbox.record_reason(r) is None})
-    matches: dict[int, lockbox.StoredMatch] = {}
-    conn = psycopg2.connect(os.environ.get(DSN_ENV, DEFAULT_DSN),
-                            options="-c statement_timeout=60000 -c default_transaction_read_only=on")
-    try:
-        with conn, conn.cursor() as cur:
-            uids = [str(u) for u in candidates]
-            cur.execute(MATCHES_SQL, (uids,))
-            found = {int(uid): (kickoff.astimezone(timezone.utc), bool(final)) for uid, kickoff, final in cur.fetchall()}
-            cur.execute(PLAYERS_SQL, (uids,))
-            players: dict[int, dict[int, tuple[int, Mapping[str, int]]]] = {}
-            for uid, player_id, minutes, tackles, fouls in cur.fetchall():
-                players.setdefault(int(uid), {})[int(player_id)] = (int(minutes or 0), {"tackles": tackles, "fouls": fouls})
-    finally:
-        conn.close()
-    matches = {uid: lockbox.StoredMatch(kickoff, final, players.get(uid, {})) for uid, (kickoff, final) in found.items()}
+    matches = read_matches(dsn, candidates)
     selection = lockbox.eligible(records, {uid: m.kickoff_at for uid, m in matches.items()})
     captured = load_outcomes(OUTCOMES_FILE)
-    new = lockbox.outcomes_to_capture(selection.eligible, captured, matches, now)
-    if new and not args.dry_run:
+    # The capture amendment of 2026-10-27 (LOCKBOX_PROTOCOL.md section 6): within the re-fetch window after the grace a
+    # match is re-fetched and captured from the fresh data; later it is rebuilt from the last payload fetched at or before
+    # the grace, or excluded when there is none. A dry run fetches and writes nothing.
+    plan = lockbox.capture_plan(selection.eligible, captured, matches, now)
+    to_refetch = sorted(uid for uid, action in plan.items() if action == lockbox.REFETCH)
+    to_rebuild = sorted(uid for uid, action in plan.items() if action == lockbox.REBUILD)
+    new: list[dict[str, Any]] = []
+    refetched: set[int] = set()
+    if not args.dry_run:
+        refetched = refetch(dsn, to_refetch) if to_refetch else set()
+        fresh = read_matches(dsn, sorted(refetched)) if refetched else {}
+        new += lockbox.outcomes_to_capture(selection.eligible, captured, fresh, now, basis=lockbox.REFETCHED)
+        rebuilt = {uid: rebuild(dsn, uid, matches[uid].kickoff_at, matches[uid].kickoff_at + protocol.revision_grace)
+                   for uid in to_rebuild}
+        new += lockbox.outcomes_to_capture(selection.eligible, captured,
+                                           {uid: m for uid, m in rebuilt.items() if m is not None}, now,
+                                           basis=lockbox.REBUILT)
+        new += lockbox.exclusion_records(selection.eligible, captured, matches,
+                                         {uid for uid, m in rebuilt.items() if m is None}, now)
+    if new:
         OUTCOMES_FILE.parent.mkdir(parents=True, exist_ok=True)
         with OUTCOMES_FILE.open("a", encoding="utf-8") as handle:
             for outcome in new:
@@ -191,8 +290,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             handle.flush()
             os.fsync(handle.fileno())
         captured = load_outcomes(OUTCOMES_FILE)
-    elif new:
-        captured = {**captured, **{(int(o["fixture_id"]), int(o["player_id"])): o for o in new}}
     scoring = lockbox.scoring_rows(selection.eligible, captured, now)
     changed = lockbox.revised(captured, matches)
     print(f"Gate 2 prospective lockbox: kickoff from {protocol.start:%Y-%m-%d %H:%M} UTC, digest {protocol.pricing_digest[:12]}, "
@@ -202,8 +299,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"  not eligible: {count} - {reason}")
     for state, count in sorted(scoring.states.items()):
         print(f"  eligible, {state}: {count}")
+    print(f"  capture plan this run: {len(to_refetch)} match(es) to re-fetch at the grace ({len(refetched)} re-fetched), "
+          f"{len(to_rebuild)} to rebuild from data before the grace"
+          + (" - dry run: nothing fetched or written" if args.dry_run else ""))
     print(f"  outcomes captured: {len(captured)} ({len(new)} new{' - dry run, not written' if args.dry_run else ''}); "
           f"revised at the source since capture (not applied): {len(changed)}")
+    timing = lockbox.capture_timing(captured)
+    print("  " + lockbox.capture_timing_line(timing))
     for (market, line), rows in sorted(scoring.rows.items()):
         print(f"  {market} over {line}: {len(rows)} scored of {protocol.min_scored_per_line} needed, "
               f"{len({r[0] for r in rows})} matches of {protocol.min_scored_fixtures_per_line} needed")
@@ -236,7 +338,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     result.update({"scored_at": now.isoformat(), "protocol_start": protocol.start.isoformat(),
                    "pricing_digest": protocol.pricing_digest, "data_vendor": protocol.data_vendor, "seed": protocol.seed,
                    "eligible": len(selection.eligible), "excluded": selection.excluded, "states": scoring.states,
-                   "revised_since_capture": len(changed)})
+                   "revised_since_capture": len(changed), "capture_timing": asdict(timing)})
     stored = write_result_once(result)
     if stored is not None:
         print("\n".join(stored_summary(stored)))

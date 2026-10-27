@@ -1,0 +1,35 @@
+{
+ "created_at": "2026-10-06T08:00:00+00:00",
+ "database": "prop_alpha",
+ "dump": {
+  "bytes": 15,
+  "sha256": "51ba3f07128fe59a00524ba28d235151d75cfec17541c2a111b6d443e02f4279",
+  "counts": {
+   "fixtures": 3,
+   "player_match_stats": 70,
+   "players": 40,
+   "teams": 6,
+   "leagues": 2,
+   "raw_payloads": 3,
+   "incomplete_team_matches": 0
+  }
+ },
+ "state": {
+  "placed_bets.jsonl": {
+   "bytes": 34,
+   "sha256": "3466c1bff37746417232c7ec99c4a44f0710ea5086e326b6093664ab05899382"
+  },
+  "sent_alerts.jsonl": {
+   "bytes": 4,
+   "sha256": "e3566b3a06430868d71e9287dfd6c6c520a3da027aabea01951d407ee131dc2f"
+  },
+  "odds_archive/20261010T120000Z_bet365.json.gz": {
+   "bytes": 6,
+   "sha256": "4ed05a65340ef7684d5c0158d4629059f2cb3ec62f17e195ed1cd17bf6d49aab"
+  },
+  "analysis/league_one_two_2026-10-17.csv": {
+   "bytes": 17,
+   "sha256": "68a679b69baf9dd75d8e7feddd86dbaab0f0ecbc8762d10d26afb548289cd596"
+  }
+ }
+}

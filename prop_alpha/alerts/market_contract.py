@@ -21,6 +21,7 @@ Pure: no I/O, no clock, no randomness (the caller reads the evidence files).
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from datetime import date
@@ -145,6 +146,38 @@ def expected_result(statistic: str, void_rule: str, line: float, side: str, star
     return "won" if (count > line) == (side == "over") else "lost"
 
 
+_EXAMPLE_FACTS: Final[tuple[str, ...]] = ("book_result", "started", "minutes", "counts")
+
+
+def _checked_example(example: Mapping[str, Any]) -> tuple[str, str, float, str]:
+    """Pure: the example's selection key, after checking its types; a malformed example raises ValueError rather than
+    being read loosely (bool("false") is True: a substitute typed that way would have been read as a starter)."""
+    player = example.get("player")
+    if example.get("book_result") not in ("won", "lost", "void"):
+        raise ValueError(f"example {player!r} has no bookmaker result")
+    if not str(example.get("fixture", "")).strip() or not str(player or "").strip():
+        raise ValueError(f"example {player!r} needs its fixture and player")
+    line, side, started, minutes = example.get("line"), example.get("side"), example.get("started"), example.get("minutes")
+    if isinstance(line, bool) or not isinstance(line, (int, float)) or not math.isfinite(line) or line < 0 \
+            or (2 * line) % 1 != 0:
+        raise ValueError(f"example {player!r}: line {line!r} is not a whole or half line")
+    if side not in ("over", "under"):
+        raise ValueError(f"example {player!r}: side {side!r} is not over or under")
+    if not isinstance(started, bool):
+        raise ValueError(f"example {player!r}: started must be true or false, got {started!r}")
+    if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes < 0:
+        raise ValueError(f"example {player!r}: minutes must be a whole number of at least 0, got {minutes!r}")
+    counts = example.get("counts")
+    if not isinstance(counts, Mapping) or any(isinstance(v, bool) or not isinstance(v, int) or v < 0
+                                              for v in counts.values()):
+        raise ValueError(f"example {player!r}: counts must be whole numbers of at least 0")
+    return str(example["fixture"]), str(player), float(line), str(side)
+
+
+def _same_facts(first: Mapping[str, Any], second: Mapping[str, Any]) -> bool:
+    return all(first.get(name) == second.get(name) for name in _EXAMPLE_FACTS)
+
+
 def evidence_failures(evidence: Mapping[str, Any], book: str, market: str, contract: Contract) -> list[str]:
     """Pure: every reason `evidence` (a parsed contract_evidence/ file) does not verify `contract` for `book`'s `market`; an
     empty list means it does. Malformed evidence raises ValueError."""
@@ -161,14 +194,26 @@ def evidence_failures(evidence: Mapping[str, Any], book: str, market: str, contr
         covered.add(str(rule.get("topic")))
     failures += [f"no first-hand rule on {topic}" for topic in RULE_TOPICS if topic not in covered]
     examples: dict[tuple[str, str, float, str], Mapping[str, Any]] = {}
+    conflicting: set[tuple[str, str, float, str]] = set()
     for example in evidence.get("examples", []):
         if str(example.get("book", "")).lower() != book.lower() or example.get("market") != market:
             failures.append(f"example {example.get('player')!r} is another book's or market's settlement")
             continue
-        if example.get("book_result") not in ("won", "lost", "void"):
-            raise ValueError(f"example {example.get('player')!r} has no bookmaker result")
-        examples.setdefault((str(example["fixture"]), str(example["player"]), float(example["line"]), str(example["side"])),
-                            example)
+        key = _checked_example(example)
+        # Contract audit 2026-10-26: an example with no record of where and when the bookmaker's result was read
+        # (TEMPLATE.json, README) is not counted; one selection recorded twice with different facts is a conflict, never a
+        # silent pick of the first (a contradicting settlement could have hidden behind it).
+        if not str(example.get("source", "")).strip() or example.get("settled_on") in (None, ""):
+            failures.append(f"example {example.get('player')!r} does not say where and when the bookmaker's result was read")
+            continue
+        date.fromisoformat(str(example["settled_on"]))
+        if key in examples and not _same_facts(examples[key], example):
+            conflicting.add(key)
+        examples.setdefault(key, example)
+    for key in sorted(conflicting):
+        failures.append(f"CONFLICT: {key[1]} ({key[0]}) {key[3]} {key[2]:g} is recorded more than once with different "
+                        "results or counts")
+        del examples[key]
     if len(examples) < MIN_EXAMPLES:
         failures.append(f"{len(examples)} same-book settled examples, {MIN_EXAMPLES} needed")
     rivals = [s for s in RIVAL_STATISTICS.get(market, ()) if s != contract.statistic]
@@ -176,7 +221,7 @@ def evidence_failures(evidence: Mapping[str, Any], book: str, market: str, contr
     discriminating = substitutes = absent = 0
     needed = {column for statistic in (contract.statistic, *rivals) for column in statistic_columns(statistic)}
     for (fixture, player, line, side), example in examples.items():
-        started, minutes, counts = bool(example["started"]), int(example["minutes"]), example["counts"]
+        started, minutes, counts = example["started"], example["minutes"], example["counts"]
         if not needed <= set(counts):
             raise ValueError(f"example {player!r} lacks the stored counts {sorted(needed - set(counts))}")
         expected = expected_result(contract.statistic, contract.void_rule, line, side, started, minutes, counts)

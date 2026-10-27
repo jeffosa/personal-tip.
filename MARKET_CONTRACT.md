@@ -471,3 +471,22 @@ Not used, and why:
    - Once every criterion in section 10 is met, listing the contract is your decision, in a PR.
    - A Betway contract that voids non-starters also needs your pricing decision (section 12) before any Betway tip could be
      sent.
+
+**Checks hardened (audit 2026-10-27; nothing became verified, `VERIFIED_CONTRACTS` is still empty):**
+- **Conflicts.** `evidence_failures` reports a CONFLICT when one selection (fixture, player, line, side) is recorded twice with different results or counts, and counts neither record. Before, it kept the first silently, so a contradicting same-book settlement could hide behind an agreeing one.
+- **Provenance.** An example without `source` (how the bookmaker's result was read, and by whom) or `settled_on` is reported and not counted; an invalid `settled_on` date raises. Both were in `TEMPLATE.json`, but neither was checked.
+- **Types.** Malformed fields raise instead of being read loosely (`started` must be true or false: `bool("false")` is true, so a substitute typed that way was read as a starter; `minutes` and the counts whole numbers of at least 0; `side` over or under; a whole or half `line`).
+- **Template.** `TEMPLATE.json` now lists all three first-hand sources, `bookmaker rules document` included.
+
+The criteria unmet, re-run 2026-10-27, are unchanged: bet365 tackles 13, bet365 fouls 10, Betway tackles 9, Betway fouls 7, Betfred fouls 10.
+
+**Maintainer checklist, per bookmaker and market:**
+1. **Rules, first-hand.** Save each rules page as a PDF with its URL and date, or keep a written support reply. It must cover all 5 topics: the statistic and data provider, extra time, participation and void (a starter, a substitute, a named non-player), abandoned or postponed matches, and whole-line settlement.
+2. **Settlements.** At least 20 results settled by that bookmaker on that market.
+   - Record each one naming the book: `settled <id> <result> <book>`, `result <tip> <result> <book>` or `pilot_ledger --record ... --book <book>`.
+   - Each needs its `source` and `settled_on`.
+   - They must include at least 3 that tell the rival counts apart, with every rival contradicted at least once, a substitute appearance and a named player who did not start or play.
+   - No selection may be recorded twice with different facts.
+3. **Counts.** Draft them with `python scripts/contract_evidence.py --book <book> --market <market> --write`. Never type them by hand.
+4. **Listing.** Only when `evidence_failures` returns nothing: list `(book, market): Contract(...)` in `VERIFIED_CONTRACTS` in a PR. `tests/test_market_contract.py` re-checks the file and requires a lower-case key and an evidence file named `<book>_<market>.json`.
+5. **Capital.** Step 2 needs bets actually settled by the bookmaker, i.e. capital at risk, which PRD §1.2 forbids before every gate has passed. That is the maintainer's decision D2 in `GATE3_DECISION_MEMO.md`.

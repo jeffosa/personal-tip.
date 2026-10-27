@@ -1,0 +1,7 @@
+{"answer_id": 1, "event": "pending", "reply_to": null, "text": "BETS SETTLED (reply settled <bet id> won|lost|void to correct one)\n#1 WON (provisional) +5.25: A Player", "at": "2026-10-10T12:00:00+00:00"}
+{"answer_id": 1, "event": "attempt", "at": "2026-10-10T12:00:00+00:00"}
+{"answer_id": 1, "event": "attempt", "at": "2026-10-10T12:00:00+00:00"}
+{"answer_id": 1, "event": "sent", "message_id": 1001, "at": "2026-10-10T12:00:00+00:00"}
+{"answer_id": 2, "event": "pending", "reply_to": null, "text": "BETS SETTLED (reply settled <bet id> won|lost|void to correct one)\n#1 WON (provisional) +5.25: A Player", "at": "2026-10-10T12:00:00+00:00"}
+{"answer_id": 2, "event": "attempt", "at": "2026-10-10T12:00:00+00:00"}
+{"answer_id": 2, "event": "sent", "message_id": 1002, "at": "2026-10-10T12:00:00+00:00"}
