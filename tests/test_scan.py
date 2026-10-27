@@ -66,9 +66,14 @@ def _inputs() -> tuple[list[SquadPlayer], dict[int, list[Appearance]], dict[str,
     return squad, history, recent
 
 
-def test_scan_window_ends_at_the_next_four_hour_boundary() -> None:
-    assert scan_window(datetime(2026, 10, 10, 12, 0, 30, tzinfo=timezone.utc))[1] == datetime(2026, 10, 10, 16, tzinfo=timezone.utc)
-    assert scan_window(datetime(2026, 10, 10, 23, 59, tzinfo=timezone.utc))[1] == datetime(2026, 10, 11, 0, tzinfo=timezone.utc)
+def test_scan_window_runs_to_a_minute_past_the_next_four_hour_boundary() -> None:
+    def at(day: int, hour: int, minute: int = 0, second: int = 0) -> datetime:
+        return datetime(2026, 10, day, hour, minute, second, tzinfo=timezone.utc)
+
+    assert scan_window(at(10, 12, 0, 30)) == (at(10, 12, 1), at(10, 16, 1))  # the boundary minute was the last run's
+    assert scan_window(at(10, 12)) == (at(10, 12, 1), at(10, 16, 1))
+    assert scan_window(at(10, 13, 30)) == (at(10, 13, 30), at(10, 16, 1))  # a late catch-up run starts now
+    assert scan_window(at(10, 23, 59)) == (at(10, 23, 59), at(11, 0, 1))  # includes a 00:00 kickoff
     with pytest.raises(ValueError):
         scan_window(datetime(2026, 10, 10, 12))
 
@@ -551,19 +556,39 @@ def test_on_time_utc_runs_scan_every_kickoff_exactly_once_across_the_clock_chang
     contract the schedule relies on, over 24-26 Oct (the UK clocks go back on the 25th, which UTC runs do not notice)."""
     start = datetime(2026, 10, 24, 0, tzinfo=timezone.utc)
     runs = [start + timedelta(hours=4 * i) for i in range(18)]  # 00:00, 04:00, ... UTC for three days
-    kickoffs = [start + timedelta(minutes=15 * i) for i in range(4 * 24 * 3)]
+    # From 00:15: a kickoff on the first boundary belongs to the run before the first one listed (scan_window).
+    kickoffs = [start + timedelta(minutes=15 * i) for i in range(1, 4 * 24 * 3)]
     assert set(_covered(runs, kickoffs).values()) == {1}
     # The old schedule (an hour before each boundary) left three hours in four unscanned.
     old = _covered([run - timedelta(hours=1) for run in runs], kickoffs)
     assert sum(1 for n in old.values() if n == 0) > len(kickoffs) / 2
 
 
+@pytest.mark.parametrize("delay", [timedelta(seconds=20), timedelta(minutes=4), timedelta(seconds=59)])
+def test_a_kickoff_on_a_boundary_is_scanned_by_the_run_before_when_the_scan_starts_after_the_boundary(
+        delay: timedelta) -> None:
+    """2026-10-26: the scan starts after the task's earlier steps, seconds or minutes past the boundary, so a window that
+    started at `now` and ended at the boundary skipped every kickoff on a boundary (Walsall v Salford, Mon 26 Oct 20:00
+    UTC: a T-60 team sheet was captured, but neither the 16:00 nor the 20:00 scan listed it)."""
+    start = datetime(2026, 10, 26, 0, tzinfo=timezone.utc)
+    runs = [start + timedelta(hours=4 * i) + delay for i in range(12)]
+    kickoffs = [start + timedelta(hours=4, minutes=15 * i) for i in range(4 * 24)]  # 04:00 on 26 Oct to 03:45 on 27 Oct
+    covered = _covered(runs, kickoffs)
+    assert set(covered.values()) == {1}
+    assert covered[datetime(2026, 10, 26, 20, tzinfo=timezone.utc)] == 1
+    assert covered[datetime(2026, 10, 27, 0, tzinfo=timezone.utc)] == 1  # Brazil's 00:00 UTC kickoffs too
+
+
 def test_a_late_catch_up_run_covers_the_rest_of_its_window_and_a_missed_run_only_loses_what_already_kicked_off() -> None:
     start = datetime(2026, 10, 17, 8, tzinfo=timezone.utc)
     kickoffs = [start + timedelta(minutes=15 * i) for i in range(4 * 12)]  # 08:00-19:45 UTC
-    late = _covered([start, start + timedelta(hours=5, minutes=44), start + timedelta(hours=8)], kickoffs)  # 12:00 ran at 13:44
-    assert all(n == 1 for k, n in late.items() if not (start + timedelta(hours=4) <= k < start + timedelta(hours=5, minutes=44)))
-    assert all(n == 0 for k, n in late.items() if start + timedelta(hours=4) <= k < start + timedelta(hours=5, minutes=44))
+    runs = [start - timedelta(hours=4), start, start + timedelta(hours=5, minutes=44), start + timedelta(hours=8)]
+    late = _covered(runs, kickoffs)  # the 12:00 run ran at 13:44
+    # Lost: what kicked off between a minute past 12:00 and the late run; the 12:00 kickoff itself was the 08:00 run's.
+    lost = (start + timedelta(hours=4, minutes=1), start + timedelta(hours=5, minutes=44))
+    assert all(n == 1 for k, n in late.items() if not lost[0] <= k < lost[1])
+    assert all(n == 0 for k, n in late.items() if lost[0] <= k < lost[1])
+    assert late[start + timedelta(hours=4)] == 1
     assert max(late.values()) == 1  # windows never overlap, so nothing is scanned twice
     # A retry inside the same window overlaps the first run: the alert store and the prediction log (once per fixture and
     # digest) keep it from alerting or logging a fixture twice.

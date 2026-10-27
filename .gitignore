@@ -12,6 +12,8 @@ htmlcov/
 .prop_alpha_state/
 # Generated audit output (pyright, bandit, pytest); kept out of the repository.
 project_audit_report.md
+# Temporary pytest folders from ad hoc runs (--basetemp): 645 were committed by mistake in 2a5f40c.
+.pytest-*/
 
 # Generated static test dataset (real rows are vendor data; not for redistribution).
 static_data/

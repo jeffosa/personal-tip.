@@ -690,14 +690,20 @@ def settle(store: PlacedBetStore, dsn: str, now: datetime,
 
 
 def reconcile_settlements(store: PlacedBetStore, dsn: str, now: datetime,
-                          settlement_sql: str = SETTLEMENT_SQL) -> list[tuple[PlacedBet, Reconciliation]]:
+                          settlement_sql: str = SETTLEMENT_SQL,
+                          rules_verified: Callable[[PlacedBet], bool] | None = None,
+                          ) -> list[tuple[PlacedBet, Reconciliation]]:
     """Every settled bet compared with automatic settlement on the statistics stored now (replies.reconcile), from one
-    read-only transaction. Bets settled only automatically need no query."""
+    read-only transaction. `rules_verified` says which bets' books have a verified contract on the rules automatic
+    settlement uses (market_contract.automatic_settlement_verified); their automatic results are re-graded too. Other bets
+    settled only automatically need no query."""
     settled = store.settled_bets()
-    confirmed = [bet for bet, settlement in settled if settlement.source == "manual"]
-    rows = read_settlement_rows(dsn, confirmed, settlement_sql)
+    verified = {bet.bet_id for bet, _ in settled if rules_verified is not None and rules_verified(bet)}
+    checked = [bet for bet, settlement in settled if settlement.source == "manual" or bet.bet_id in verified]
+    rows = read_settlement_rows(dsn, checked, settlement_sql)
     automatic = store.automatic_settlements()
-    return [(bet, reconcile(bet, settlement, rows.get((bet.fixture_id, bet.player_id)), automatic.get(bet.bet_id), now))
+    return [(bet, reconcile(bet, settlement, rows.get((bet.fixture_id, bet.player_id)), automatic.get(bet.bet_id), now,
+                            bet.bet_id in verified))
             for bet, settlement in settled]
 
 
@@ -746,12 +752,14 @@ def results_summary(settled: Sequence[tuple[PlacedBet, Settlement]],
 
 
 @contextmanager
-def ledger_lock(path: Path = DEFAULT_LOCK_FILE) -> Iterator[None]:
+def ledger_lock(path: Path = DEFAULT_LOCK_FILE, *, wait: bool = False) -> Iterator[None]:
     """Hold an exclusive OS lock for a run that writes the ledger (--poll, --settle). Delivery audit 2026-10-05: the
     scheduled task runs one instance at a time, but a manual --poll during it could read the same Telegram update in
     both runs before either recorded it, recording one bet twice. The lock is released by the OS if the process dies,
     so a crash never leaves it stuck. A second writer fails at once (OSError from the lock call), recorded by the
-    scheduled script as a failed step, rather than waiting or writing."""
+    scheduled script as a failed step, rather than waiting or writing. With `wait` (task_health, 2026-10-26: two tasks
+    catching up after the laptop wakes report at the same moment) the second one waits instead: on Windows the OS retries
+    for about 10 seconds before raising OSError; elsewhere it blocks until the lock is free (the unit's timeout bounds it)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+b")
     try:
@@ -759,11 +767,11 @@ def ledger_lock(path: Path = DEFAULT_LOCK_FILE) -> Iterator[None]:
             import msvcrt
 
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK, 1)
         else:
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
         logger.info("ledger lock taken (%s)", path.name)
         yield
         if sys.platform == "win32":

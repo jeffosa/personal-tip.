@@ -5,7 +5,7 @@
   "examples": [],
   "_rule_shape": {
     "topic": "one of: statistic and data provider | extra time | player participation and void | abandoned or postponed match | whole-line settlement",
-    "source": "bookmaker rules page | bookmaker support reply",
+    "source": "bookmaker rules page | bookmaker rules document | bookmaker support reply",
     "url_or_document": "the page URL, or the support ticket reference and where the reply is kept",
     "checked_on": "YYYY-MM-DD",
     "wording": "the bookmaker's exact sentence(s), pasted"
@@ -20,8 +20,13 @@
     "book_result": "won | lost | void, as the bookmaker settled it",
     "started": true,
     "minutes": 90,
-    "counts": {"tackles_attempted": 2, "tackles_won": 1, "dribbled_past": 0, "interceptions": 1},
-    "settled_on": "YYYY-MM-DD",
-    "source": "how the bookmaker's result was read (bet slip, account history), and by whom"
+    "counts": {
+      "tackles_attempted": 2,
+      "tackles_won": 1,
+      "dribbled_past": 0,
+      "interceptions": 1
+    },
+    "settled_on": "required: YYYY-MM-DD",
+    "source": "required: how the bookmaker's result was read (bet slip, account history), and by whom"
   }
 }

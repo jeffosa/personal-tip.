@@ -11,7 +11,131 @@ settlements, closing prices) that code cannot produce. They take calendar time a
 
 Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not executed where it will run · **[N]** not built.
 
-## Status on 2026-10-26 (c): operational protections for the lockbox period (read this first)
+## Status on 2026-10-27: late lockbox captures (read this first)
+
+**Finding:** the protocol captures each outcome "once, 72 hours after kickoff". The code copies the stored counts whenever
+the 4-hourly capture runs.
+- **A late capture** (laptop off at the 72 h mark, a failed results job, a re-ingestion) can hold data fetched after the
+  intended time, and nothing recorded it.
+- **Even an on-time capture** holds the vendor's data from first ingestion: stored finals are never re-fetched, so the
+  grace takes in no vendor correction.
+
+**Change [T]:** each capture records when it was due and when its data was fetched, and the scorer reports late captures
+and post-grace data. Reported only, as the protocol authorises; no outcome, eligibility or scoring rule changed. Tests:
+`tests/test_lockbox_capture_timing.py` (on-time, late, first ingested late, repeated runs).
+
+**Decided 2026-10-27: option D** (`LOCKBOX_PROTOCOL.md` section 6, in force before any capture could be due).
+- On time (the first capture run within 4 h after the grace): re-fetch the match, then capture from the fresh data.
+- Late: rebuild from the last raw payload fetched at or before the grace; excluded and reported when there is none.
+
+[T] `tests/test_lockbox_capture_policy.py`. Not seen live yet: the first capture falls due about 30 Oct [U].
+
+## Status on 2026-10-27 (g): contract registry and evidence checks audited
+
+**Still PAPER ONLY; every real-price tip withheld.** `VERIFIED_CONTRACTS` is empty, and every evidence file fails `evidence_failures`. Criteria unmet: bet365 tackles 13, bet365 fouls 10, Betway tackles 9, Betway fouls 7, Betfred fouls 10.
+
+| Defect (could admit an unverified contract, or misstate evidence) | Fix [T] |
+|---|---|
+| A selection recorded twice kept its first record silently, so a contradicting same-book settlement could hide behind an agreeing one | A CONFLICT failure, and the selection is not counted |
+| Examples without `source` or `settled_on` were counted, though the template requires both | Reported and not counted; an invalid date raises |
+| Fields were read loosely (`bool("false")` is true, so a typed-as-string substitute was misreported as missing) | Malformed fields raise (`_checked_example`) |
+| `TEMPLATE.json` omitted `bookmaker rules document` as a first-hand source | Listed |
+
+**Tip paths audited:**
+- **League One/Two scan:** bet365, skybet and williamhill; tackles only; gated by `split_unverified` on `MODEL_STATISTICS`.
+- **Pilot scan:** bet365 and betway; tackles only; Brazil Serie A only; gated on `PILOT_STATISTICS` (`s.tackles_attempted`).
+- **Mock runs:** not gated, but labelled MOCK and kept in separate stores.
+- **Other senders:** `delivery --resend` refuses expired deliveries. `telegram --demo` is synthetic. Status, task_health, odds_probe and matchday_report (task deleted) send no tips.
+- **Betway:** would stay withheld even with evidence, because its rules void non-starters, which is not the void rule priced.
+
+**Still needed:** the maintainer checklist in `MARKET_CONTRACT.md` section 13, and decision D2 in `GATE3_DECISION_MEMO.md` (same-book settlements need real money; PRD §1.2).
+
+## Status on 2026-10-26 (f): Gate 3 traced against the PRD
+
+**Still PAPER ONLY; Gate 3 INCOMPLETE.** The full trace and the open decisions are in `GATE3_DECISION_MEMO.md`.
+
+| Defect (unambiguous against the PRD) | Fix [T] |
+|---|---|
+| Settlement integrity reconciled a bet only through the tipped book's own manual result. PRD criterion 4 reconciles to the stored outcome and the book's void rule, and a paper bet has no bookmaker's settlement. | An automatic result under the bet's book's verified contract is re-graded: it reconciles, or fails when the stored statistics changed under it. Without a verified contract nothing changes. |
+| The CLV/ROI sample admitted only manual own-book results, and "value shown" checked only that some contract existed | It takes every reconciled, won or lost bet with no override at a book and market with a verified contract; "value shown" needs that for every bet in the sample |
+| Gate 3 could pass with the PRD's prerequisites unbuilt (projection refresh, paper-bet ledger writer, per-player bench probability before Gate 3 results are accepted) | Each is a Gate 3 criterion (`GATE3_PREREQUISITES`); all are unbuilt, so Gate 3 cannot pass |
+
+- **Effect today:** none (`VERIFIED_CONTRACTS` empty; 0 settled League One/Two bets).
+- **Not changed:** the population is the bets you reported placing (real money), standing in for the PRD's paper-bet ledger. And verifying a contract needs 20+ same-book (real-money) settlements. Both conflict with PRD §1.2 and are maintainer decisions D1 and D2.
+- **Never counted:** shadow picks.
+
+## Status on 2026-10-26 (e): scheduler reliability: missed runs verified, silence and battery now detected
+
+**Uptime is NOT fixed.** These changes make silence visible; only an always-on, plugged-in, online and logged-in machine
+prevents it.
+
+**Missed runs, verified from local evidence** (`status.log`, `ledger.log`, `backup.log`, the Windows System and
+NetworkProfile event logs, `powercfg`, the task definitions):
+
+| Day (UTC) | 4-hourly status reports completed (of 6) |
+|---|---|
+| 16 Oct | 2 |
+| 17 Oct | 0 |
+| 18 Oct | 1 |
+| 19, 20 Oct | 0 |
+| 21 Oct | 3 |
+| 22 Oct | 1 |
+| 23, 24 Oct | 0 |
+| 25 Oct | 5 |
+| 26 Oct | 3 (the 20:00 run's report failed: Telegram connect timeout) |
+
+- **Ledger poll:** active in 2–54 of 144 ten-minute slots on the days it ran, and none on 17, 19, 20, 23 and 24 Oct.
+- **Backups:** written on 16, 18, 21, 22, 25 and 26 Oct.
+
+**Causes found in the event logs** (local time UTC+1):
+- **Battery.** The laptop was on battery for long spells, for example 21 Oct 19:16 to 24 Oct 12:42. The power plan sleeps on battery after 180 seconds idle (DC STANDBYIDLE 0xb4), with wake timers off (DC RTCWAKE 0). CLAUDE.md had said 180 minutes, which was wrong.
+- **Sleep.** Spells of up to 17 hours, e.g. 22 Oct 00:03 to 16:51.
+- **No network.** No connection from 22 Oct 19:21 to 25 Oct 04:18; every task requires one.
+- **Logged off.** From 22 Oct 21:10 to 23 Oct 15:19; the tasks need a logged-on user.
+- **Unclean shutdowns** (Kernel-Power 41), probably a flat battery: off from 19 Oct 07:23 to 21 Oct 09:00.
+
+**The task definitions are unchanged.** Every 4 hours from 12:00 UTC, every 10 minutes, and daily at 02:30 UTC; all wake the machine, catch up and require a network and a logged-on user.
+
+| Change [T] | What it gives |
+|---|---|
+| `task_health`: on the first report after no task ran for over 40 minutes, SCHEDULER WAS SILENT (start, end, hours, the 4-hourly runs, polls and backups inside it), appended to `scheduler_gaps.jsonl` (in the backup). The per-task "not running" flags it explains are not sent separately | A silent spell is always reported once the laptop is back, with what it cost |
+| `task_health`: every run reads the power source (Windows `GetSystemPowerStatus`) and sends ON BATTERY once per battery spell (again after 6 hours) | A warning before the laptop sleeps, not after |
+| `task_health` takes an OS lock while it reports (`ledger_lock(..., wait=True)`: the OS's own bounded wait, no new exception handler) | Two tasks catching up at the same moment do not both alert one gap |
+| Status report: silent periods of the last 7 days (WARNING when the latest ended within 24 hours), the power source (WARNING on battery), and "Next status report due by HH:MM UTC" | While the laptop is silent nothing on it can alert; a missing report by that time is the signal |
+| A gap record cut short by a power loss is dropped before the next write, and ignored when read | The status report cannot be broken by a half-written gap record |
+
+**Seen live:** at 21:02 UTC on 26 Oct, the scheduled poll ran the new code from this working tree. It read "battery (26%)", sent the ON BATTERY alert and saved its state under the new lock.
+
+**Still needs live verification [U]:**
+- a SCHEDULER WAS SILENT alert after a real sleep or shutdown;
+- the new status-report lines in a sent report;
+- two tasks reporting at the same moment after a wake.
+
+**Not addressed** (needs a decision or another machine):
+- paging while the laptop is silent (an outside monitor);
+- the power plan, a system setting left for the maintainer: on battery it sleeps after 3 minutes with wake timers off;
+- the network and logon dependencies.
+
+**Found while verifying, then fixed [T]:** `slate.scan_window` covered [now, next boundary). The scan starts after the boundary, so a kickoff exactly on a 4-hour boundary (20:00 or 00:00 UTC) fell between two runs and was never scanned: Walsall v Salford (Mon 26 Oct 20:00 UTC) got a T-60 team sheet but was in no scan. The window now runs to a minute past the next boundary and starts a minute past its own (`BOUNDARY_GRACE`). On-time runs therefore scan every kickoff exactly once, and a boundary kickoff belongs to the run 4 hours before it. The pilot scan (Brazil's 00:00 UTC games) uses the same window. `scan_window` is not frozen pricing code (`FROZEN_DIGEST` unchanged). Not yet seen live: the first boundary kickoff priced by a scheduled scan [U].
+
+## Status on 2026-10-26 (d): Gate 2 calibration rule amended before the lockbox start
+
+**Still PAPER ONLY; no gate passed.** The maintainer decided at 20:44 UTC on 2026-10-26, before the lockbox started and
+before any lockbox prediction or outcome existed. The decision was Option 3 of `GATE2_CALIBRATION_DECISION_MEMO.md`, with
+320 matches and a stop date of 31 May 2027.
+
+| Change [T] | Why |
+|---|---|
+| PRD Gate 2 criterion 3: the bin rule is the count-weighted mean gap of bins of 50+, at most 0.03 (`gate2.mean_bin_gap`); the worst bin is still reported | "Every bin of 50+ within 0.03" almost never passes a perfectly calibrated model: 0 of 1,000 and 0 of 2,000 simulations at the old trigger; 0.1–1.6% at 320 matches |
+| The single look waits for 500 scored predictions from 320 matches on every line (`PROTOCOL.min_scored_fixtures_per_line`) | At about 21 matches (the old trigger), the slope rule alone passes a perfect model 2.5% of the time |
+| Only kickoffs before 2027-06-01 count (`PROTOCOL.end`). A lockbox still short of the threshold when it closes (2027-06-15) is recorded NOT PASSED once and never scored (`lockbox.expired`) | A pre-registered stop: no open-ended wait, and no second look |
+
+- **Unchanged:** the frozen model, `FROZEN_DIGEST`, the lockbox start, the eligibility rules, the bins, the 0.03 tolerance, and the slope and skill rules.
+- **Expected performance at 320 matches** (memo, section 5): a perfect model passes 0.71–0.90 of the time, depending on dependence within matches. Errors above the tolerance pass at most 0.11, and clearly wrong slopes never.
+- **What still blocks Gate 2:** the market benchmark (no League One/Two closing prices), `yellow_card`, and team-sheet line-ups.
+- **Time to collect:** 320 matches take about 11–13 weeks with every match captured, and longer at October's uptime.
+
+## Status on 2026-10-26 (c): operational protections for the lockbox period
 
 **Still PAPER ONLY.** Only fail-closed operational and evidence-integrity changes; the pricing digest (`839e97ce...`), the
 lockbox start (2026-10-27 00:00 UTC) and the protocol are unchanged.

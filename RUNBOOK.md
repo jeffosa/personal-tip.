@@ -100,7 +100,14 @@ a step of `Telegram status`, after `python -m prop_alpha.ingestion.results --pil
   and results (the 8 reconstructed 2026-10-11 tips are listed apart from the model-scored total) and closing prices captured.
 - `alerts/task_health.py`: each scheduled script reports its failed steps; two failing runs in a row raise a Telegram alert (at most every 6
   hours), recovery sends one message, and a task that has not run for 5 hours (status), 40 minutes (poll) or 26 hours (backup) is flagged.
-  It cannot see a machine that is off, asleep or logged out. State: `.prop_alpha_state/task_health.json`.
+  It cannot alert while the machine is off, asleep, offline or logged out. Since 2026-10-26:
+  - the first report after such a gap (no task for over 40 minutes) sends SCHEDULER WAS SILENT with the runs it swallowed,
+    appended to `.prop_alpha_state/scheduler_gaps.jsonl`;
+  - every run reads the power source and sends ON BATTERY once per battery spell (again after 6 hours): on battery the laptop
+    sleeps after 3 minutes idle with wake timers off;
+  - the status report shows the silent periods of the last 7 days, the power source and "Next status report due by HH:MM UTC".
+    **If that time passes with no report, the laptop or its tasks are down: check it is on mains, awake, online and logged in.**
+  State: `.prop_alpha_state/task_health.json` (with a `machine` entry for the battery alert).
 - Delivery review: `python -m prop_alpha.alerts.delivery` lists messages whose delivery outcome is unknown; nothing is re-sent automatically.
 - Settlement check: `python -m prop_alpha.alerts.ledger --reconcile`; prediction log: `python -m prop_alpha.alerts.predictions`.
 - Pilot paper bets (never real bets): `python -m prop_alpha.alerts.pilot_ledger --list`; settle with `--settle [--send]`; after you read a bookmaker's result off the site,
@@ -142,7 +149,7 @@ closing-price capture 0-15 minutes before it, and an outcome captured 72 hours a
 **Never, during the lockbox:**
 - Run a backtest, tuning or calibration script expecting lockbox matches. Each one stops before 2026-10-27, and
   `tests/test_lockbox_isolation.py` fails if a script reads working-database outcomes without that cutoff.
-- Run `scripts/gate2_prospective.py` without a flag: that scores, once, when every line has 500 scored predictions.
+- Run `scripts/gate2_prospective.py` without a flag: that scores once, when every line has 500 scored predictions from 320 matches. After the lockbox closes (2027-06-15), the same run records NOT PASSED if that threshold was not met.
 - Change pricing code or `model_freeze`: a new digest ends this lockbox.
 
 **Decisions with a date:** the Sportmonks Starter trial ends 2026-11-08. Without a paid plan, results stop loading, the scan

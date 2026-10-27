@@ -37,6 +37,9 @@ from prop_alpha.modeling.league_level import level_ratios, season_of
 from prop_alpha.scanner.market_scanner import LiveOddsQuote, ProjectionKey, price_for_ev, stressed_probabilities
 
 SCAN_INTERVAL: Final[timedelta] = timedelta(hours=4)
+# A scan window runs to this long past the next boundary, and starts this long past its own (scan_window): a kickoff on
+# the boundary belongs to the earlier run, which is the only one that can still price it before kickoff.
+BOUNDARY_GRACE: Final[timedelta] = timedelta(minutes=1)
 # Market -> the Appearance field it counts. Card markets need referee propensities and are not scanned yet.
 SCAN_MARKETS: Final[tuple[str, ...]] = ("tackles", "fouls")
 RECENT_TEAM_MATCHES: Final[int] = 5
@@ -76,11 +79,15 @@ def _require_utc(value: datetime, name: str) -> None:
 
 
 def scan_window(now: datetime) -> tuple[datetime, datetime]:
-    """[now, next 4-hour boundary): fixtures kicking off before the next scheduled run."""
+    """[max(now, boundary + BOUNDARY_GRACE), next 4-hour boundary + BOUNDARY_GRACE): fixtures kicking off before the next
+    scheduled run. A run fires at a boundary but its scan starts seconds or minutes later, so until 2026-10-26 a kickoff
+    exactly on a boundary (20:00 or 00:00 UTC) was after one window and before the next: never scanned (Walsall v Salford,
+    Mon 26 Oct 20:00). Each window now runs to a minute past the next boundary and starts a minute past its own, so every
+    kickoff falls in exactly one window when the runs are on time, and a late catch-up run starts at `now`."""
     _require_utc(now, "now")
     interval_hours = int(SCAN_INTERVAL.total_seconds() // 3600)
     boundary = now.replace(hour=now.hour - now.hour % interval_hours, minute=0, second=0, microsecond=0)
-    return now, boundary + SCAN_INTERVAL
+    return max(now, boundary + BOUNDARY_GRACE), boundary + SCAN_INTERVAL + BOUNDARY_GRACE
 
 
 @dataclass(frozen=True)

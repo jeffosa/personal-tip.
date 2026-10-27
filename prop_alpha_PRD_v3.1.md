@@ -521,7 +521,8 @@ The gates are sequential. A gate is passed only when every criterion is met and 
 \text{BSS} = 1 - \frac{\text{BS}_{\text{model}}}{\text{BS}_{\text{clim}}}
 \]
 The fixture-clustered bootstrap 90% interval of BSS MUST have a **lower bound > 0**; a positive point estimate is not sufficient.
-3. **Calibration.** Fit a logistic calibration regression \(\text{logit}\,P(y = 1) = a + b\,\text{logit}\,\hat p\). The slope \(b\) must lie in [0.9, 1.1]. Every calibration bin with ≥ 50 predictions must satisfy \(\lvert\bar{\hat p} - \bar y\rvert \le 0.03\).
+3. **Calibration.** Fit a logistic calibration regression \(\text{logit}\,P(y = 1) = a + b\,\text{logit}\,\hat p\). The slope \(b\) must lie in [0.9, 1.1]. Over the calibration bins (10 equal-width bins on [0, 1]) with ≥ 50 predictions, the mean of \(\lvert\bar{\hat p} - \bar y\rvert\) weighted by each bin's count must be ≤ 0.03.
+   *Amended 2026-10-26 by the maintainer, before the prospective lockbox started (Option 3 of `GATE2_CALIBRATION_DECISION_MEMO.md`). The rule was "every calibration bin with ≥ 50 predictions must satisfy \(\lvert\bar{\hat p} - \bar y\rvert \le 0.03\)": a perfectly calibrated model almost never passes that rule at the lockbox's sample sizes. The lockbox is scored once, at a pre-registered 500 predictions from 320 matches on every line (`LOCKBOX_PROTOCOL.md`).*
 4. **Market benchmark.** This criterion is additional to the original mandate. It is required because beating climatology is necessary but far from sufficient: a model can beat the base rate while knowing less than the market. On the subset with a devigged closing price \(p^{\text{mkt}}\), fit
 \[
 \text{logit}\,P(y = 1) = a + b_1\,\text{logit}\,p^{\text{mkt}} + b_2\,\text{logit}\,\hat p .

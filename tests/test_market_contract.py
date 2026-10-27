@@ -200,6 +200,55 @@ def test_evidence_short_of_any_criterion_does_not_verify(change: Callable[[dict[
     assert any(reason in failure for failure in failures), failures
 
 
+def test_a_selection_recorded_twice_with_a_different_result_is_a_conflict_never_a_silent_pick() -> None:
+    """Contract audit 2026-10-26: the first record of a selection was kept and a later, contradicting one dropped, so 20
+    agreeing examples plus a same-book settlement the other way still verified the contract."""
+    evidence = deepcopy(_passing_evidence())
+    evidence["examples"].append({**evidence["examples"][5], "book_result": "lost"})  # filler 0 again, settled the other way
+    failures = evidence_failures(evidence, "bet365", "tackles", TACKLES)
+    assert failures == ["CONFLICT: filler 0 (19700001) over 1.5 is recorded more than once with different results or counts"]
+    substitute = deepcopy(_passing_evidence())
+    substitute["examples"].append({**substitute["examples"][3], "book_result": "lost"})
+    assert "no example of a substitute appearance" in evidence_failures(substitute, "bet365", "tackles", TACKLES)  # not counted
+    repeated = deepcopy(_passing_evidence())
+    repeated["examples"].append(deepcopy(repeated["examples"][5]))  # the same record twice: counted once, no conflict
+    assert evidence_failures(repeated, "bet365", "tackles", TACKLES) == []
+
+
+@pytest.mark.parametrize("missing", ["source", "settled_on"])
+def test_an_example_that_does_not_say_where_and_when_the_result_was_read_is_not_counted(missing: str) -> None:
+    evidence = deepcopy(_passing_evidence())
+    evidence["examples"][5][missing] = ""
+    assert evidence_failures(evidence, "bet365", "tackles", TACKLES) == [
+        "example 'filler 0' does not say where and when the bookmaker's result was read"]
+    substitute = deepcopy(_passing_evidence())
+    del substitute["examples"][3][missing]  # the only substitute: without its provenance it is not counted
+    assert "no example of a substitute appearance" in evidence_failures(substitute, "bet365", "tackles", TACKLES)
+
+
+@pytest.mark.parametrize("field, value", [
+    ("started", "false"), ("started", 0), ("minutes", "90"), ("minutes", -1), ("minutes", True), ("side", "Over"),
+    ("line", 1.3), ("line", "1.5"), ("settled_on", "yesterday"), ("fixture", ""),
+])
+def test_a_malformed_example_raises_rather_than_being_read_loosely(field: str, value: Any) -> None:
+    evidence = deepcopy(_passing_evidence())
+    evidence["examples"][3][field] = value  # the substitute: bool("false") would have read it as a starter
+    with pytest.raises(ValueError):
+        evidence_failures(evidence, "bet365", "tackles", TACKLES)
+    counted = deepcopy(_passing_evidence())
+    counted["examples"][0]["counts"]["tackles_attempted"] = "1"
+    with pytest.raises(ValueError, match="counts must be whole numbers"):
+        evidence_failures(counted, "bet365", "tackles", TACKLES)
+
+
+def test_a_listed_contract_is_keyed_as_the_gate_looks_it_up() -> None:
+    """contract_verified looks up the lower-case bookmaker name: a key written otherwise would be shown as verified by
+    contract_status while every tip stayed withheld (and its evidence file is named for its key)."""
+    for (book, market), contract in market_contract.VERIFIED_CONTRACTS.items():
+        assert book == book.strip().lower() and market in MODEL_STATISTICS
+        assert contract.evidence == f"{book}_{market}.json"
+
+
 def test_a_contract_the_settlements_contradict_fails_and_bad_evidence_raises() -> None:
     # The same examples against a contract on tackles won: the first example is a discrepancy.
     won = Contract("s.tackles_won", NO_APPEARANCE, "bet365_tackles.json")
@@ -237,7 +286,8 @@ def test_every_evidence_file_is_well_formed_and_holds_only_first_hand_rules() ->
     """2026-10-26: one evidence file per target bookmaker and market. Each must parse against the contract the model would
     need (its statistic, no-appearance void rule), and every rule recorded in it must be the bookmaker's own wording: a
     search summary or another book's page is never put in `rules`."""
-    files = sorted(p for p in EVIDENCE_DIR.glob("*.json") if p.name != "TEMPLATE.json")
+    # Drafts from scripts/contract_evidence.py --write (<book>_<market>.draft.json) are work in progress, never evidence.
+    files = sorted(p for p in EVIDENCE_DIR.glob("*.json") if p.name != "TEMPLATE.json" and not p.name.endswith(".draft.json"))
     assert {p.name for p in files} >= {"bet365_tackles.json", "bet365_fouls.json", "betway_tackles.json", "betway_fouls.json",
                                        "betfred_fouls.json"}
     for path in files:

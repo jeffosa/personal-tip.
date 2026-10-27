@@ -39,6 +39,7 @@ from prop_alpha.alerts import ladder_scan, pilot_ledger
 from prop_alpha.alerts.predictions import PREDICTIONS_NAME, PredictionLog
 from prop_alpha.alerts.scan import CATALOGUE_FILE, ODDS_ARCHIVE_DIR, ODDS_CACHE_DIR, STATE_DIR, load_catalogue
 from prop_alpha.ingestion.results import PILOT_REFUSED_FILE, load_refused
+from prop_alpha.alerts.task_health import DEFAULT_GAP_FILE, STATUS_EVERY, PowerStatus, load_gaps, read_power_status
 from prop_alpha.alerts.telegram import PAPER_LABEL, DeliveryLog, SentAlertStore, TelegramNotifier, load_config
 from prop_alpha.config import DEFAULT_DSN, DSN_ENV
 from prop_alpha.evaluation import lockbox
@@ -370,10 +371,52 @@ def format_report(now: datetime, database_lines: list[str], alerts_in_window: in
     ])
 
 
+# Silent periods of the scheduler (alerts/task_health.py) shown in the report, and the slack after a 4-hour boundary
+# before the next report counts as late (a run takes up to its 10-minute limit; Task Scheduler may start it late).
+SILENCE_LOOKBACK: Final[timedelta] = timedelta(days=7)
+REPORT_SLACK: Final[timedelta] = timedelta(minutes=15)
+
+
+def next_report_due(now: datetime) -> datetime:
+    """Pure: when the next 4-hourly report should have arrived: the next 4-hour boundary (UTC) after `now`, plus slack."""
+    midnight = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc)
+    passed = (now - midnight) // STATUS_EVERY
+    return midnight + (passed + 1) * STATUS_EVERY + REPORT_SLACK
+
+
+def scheduler_section(gap_file: Path, now: datetime, power: PowerStatus | None) -> list[str]:
+    """Silent periods of the last SILENCE_LOOKBACK, the power source now, and when the next report is due: while the
+    laptop or all its tasks are silent nothing can alert, so a report that has not arrived by then is the signal."""
+    gaps, unfinished = load_gaps(gap_file)
+    recent = [gap for gap in gaps if gap.end > now - SILENCE_LOOKBACK]
+    if recent:
+        longest = max(recent, key=lambda gap: gap.hours)
+        latest = recent[-1]
+        lines = [(("WARNING: " if now - latest.end <= timedelta(days=1) else "")
+                  + f"Scheduler silent periods in the last {SILENCE_LOOKBACK.days} days: {len(recent)}, "
+                  f"{sum(gap.hours for gap in recent):.1f} hours in all; longest {longest.start:%a %d %b %H:%M} to "
+                  f"{longest.end:%a %d %b %H:%M} UTC; missed {sum(gap.missed_status_runs for gap in recent)} "
+                  f"four-hourly run(s)")]
+    else:
+        lines = [f"Scheduler silent periods in the last {SILENCE_LOOKBACK.days} days: none recorded"]
+    if unfinished:
+        lines[0] += f" ({unfinished} unfinished record left out: a write cut short)"
+    if power is not None and power.on_mains is False:
+        charge = "" if power.battery_percent is None else f" ({power.battery_percent}%)"
+        lines.append(f"WARNING: on battery{charge}: the laptop sleeps after 3 minutes idle with its wake timers off, so "
+                     "the scheduled runs stop. Plug it in.")
+    elif power is not None:
+        lines.append(f"Power: {power.describe()}")
+    lines.append(f"Next status report due by {next_report_due(now):%a %d %b %H:%M} UTC: if none has arrived by then, the "
+                 "laptop or its scheduled tasks are down.")
+    return lines
+
+
 def build_report(now: datetime, dsn: str, store: SentAlertStore, bets: PlacedBetStore | None = None,
                  rate: ExchangeRate | None = None, deliveries: DeliveryLog | None = None,
                  poll_state: tuple[Path, AnswerOutbox] | None = None, odds_state: Path | None = None,
-                 pilot_state: Path | None = None, coverage_state: Path | None = None) -> str:
+                 pilot_state: Path | None = None, coverage_state: Path | None = None,
+                 gap_file: Path | None = None, power: PowerStatus | None = None) -> str:
     alerts = [alert for alert in store.load() if alert.sent_at > now - REPORT_INTERVAL]
     return format_report(now, database_section(dsn, coverage_state, now), len(alerts), store.exposure(now).total,
                          [*(bet_section(bets, now) if bets is not None else ()),
@@ -381,7 +424,8 @@ def build_report(now: datetime, dsn: str, store: SentAlertStore, bets: PlacedBet
                           *(poll_section(*poll_state, now) if poll_state is not None else ()),
                           *(quote_section(odds_state) if odds_state is not None else ()),
                           *(pilot_section(pilot_state, now) if pilot_state is not None else ()),
-                          *fx_section(rate, now)])
+                          *fx_section(rate, now),
+                          *(scheduler_section(gap_file, now, power) if gap_file is not None else ())])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -391,7 +435,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     report = build_report(datetime.now(timezone.utc), os.environ.get(DSN_ENV, DEFAULT_DSN), SentAlertStore(),
                           PlacedBetStore(), cached_rate(), DeliveryLog(), (DEFAULT_HEARTBEAT_FILE, AnswerOutbox()),
-                          STATE_DIR, pilot_state=STATE_DIR, coverage_state=STATE_DIR)
+                          STATE_DIR, pilot_state=STATE_DIR, coverage_state=STATE_DIR, gap_file=DEFAULT_GAP_FILE,
+                          power=read_power_status())
     print(report)
     if args.send:
         message_id = TelegramNotifier(load_config()).send_message(report)

@@ -203,9 +203,12 @@ def tip_evidence(tips: Sequence[Tip], rng: np.random.Generator) -> dict[str, Any
 
 # PRD Gate 3 criterion 4: 100% of paper bets reconcile to the realised outcome and the book's void rule, with no manual
 # overrides. Each replies.reconcile outcome is one of these; a manual override (Reconciliation.overridden) fails a bet
-# whatever its outcome. Nothing unchecked, unresolved or settled by another bookmaker counts as reconciled.
-INTEGRITY_RECONCILED: Final[tuple[str, ...]] = ("agree",)
-INTEGRITY_FAILED: Final[tuple[str, ...]] = ("discrepancy", "other_book_discrepancy", "unnamed_book_discrepancy")
+# whatever its outcome. Nothing unchecked, unresolved or settled by another bookmaker counts as reconciled. Reconciled:
+# the tipped book's own settlement agreeing, or (Gate 3 trace, 2026-10-26: the PRD asks for no bookmaker's settlement) an
+# automatic result under that book's verified settlement contract that the stored statistics still give.
+INTEGRITY_RECONCILED: Final[tuple[str, ...]] = ("agree", "verified_rules_agree")
+INTEGRITY_FAILED: Final[tuple[str, ...]] = ("discrepancy", "other_book_discrepancy", "unnamed_book_discrepancy",
+                                            "verified_rules_discrepancy")
 INTEGRITY_INCOMPLETE: Final[tuple[str, ...]] = ("unverifiable", "unconfirmed", "other_book_agree", "unnamed_book_agree")
 INTEGRITY_STATUSES: Final[tuple[str, ...]] = ("passed", "failed", "incomplete")
 
@@ -254,15 +257,39 @@ def settlement_integrity(items: Sequence[Reconciliation]) -> SettlementIntegrity
     return SettlementIntegrity(status, len(items), reconciled, tuple(failed), tuple(incomplete))
 
 
-def gate3_result(sample: Mapping[str, Any], integrity: SettlementIntegrity) -> dict[str, Any]:
-    """Pure: PRD Gate 3 over every settled paper bet (`sample`: tip_evidence of all of them) and their settlement
-    integrity. "passed" needs every criterion; "failed" when integrity failed, or on the full sample when the CLV interval
-    lies below 0 (or, with the power met, does not lie above 0); otherwise "incomplete". A met CLV criterion never passes the gate alone."""
+# PRD Gate 3's prerequisite, and Gate 4 item 4 ("MUST be replaced by a per-player estimate before Gate 3 results are
+# accepted"): none is built (Gate 3 trace, 2026-10-26). Until each is, Gate 3 cannot pass, whatever the sample shows. The
+# League One/Two "paper bets" counted below stand in for the ledger the PRD specifies: they are the bets the maintainer
+# reported placing (placed_bets.jsonl), not every StakingDirective persisted with is_paper.
+GATE3_PREREQUISITES: Final[Mapping[str, bool]] = {
+    "projection-refresh job (PRD Scenario B step 5)": False,
+    "bet-ledger writer persisting every StakingDirective as a paper bet with its closing line (PRD Gate 3)": False,
+    "per-player bench_sub_probability (PRD Gate 4 item 4: before Gate 3 results are accepted)": False,
+}
+
+
+def tip_qualifies(item: Reconciliation, result: str, *, contract_verified: bool) -> bool:
+    """Pure: a settled bet counts towards the Gate 3 sample (and its ROI and CLV) only when its own book and market have a
+    verified settlement contract (`contract_verified`: market_contract.automatic_settlement_verified for the bet), its
+    settlement reconciled (the tipped book's own result agreeing, or an automatic result under those verified rules), with
+    no manual override, and it is won or lost (a void returns the stake). Review 2026-10-27: an own-book agreement at a
+    book with no verified contract had qualified, so a later value claim could rest on unverified markets."""
+    return (contract_verified and item.outcome in INTEGRITY_RECONCILED and not item.overridden
+            and result in ("won", "lost"))
+
+
+def gate3_result(sample: Mapping[str, Any], integrity: SettlementIntegrity,
+                 prerequisites: Mapping[str, bool] = GATE3_PREREQUISITES) -> dict[str, Any]:
+    """Pure: PRD Gate 3 over every settled paper bet (`sample`: tip_evidence of all of them), their settlement integrity
+    and the PRD's prerequisites. "passed" needs every criterion and prerequisite; "failed" when integrity failed, or on
+    the full sample when the CLV interval lies below 0 (or, with the power met, does not lie above 0); otherwise
+    "incomplete". A met CLV criterion never passes the gate alone."""
     criteria = {
         f"sample ({MIN_SETTLED_BETS}+ settled bets in {MIN_BET_FIXTURES}+ fixtures)": bool(sample["gate3_sample"]),
         "CLV 90% lower bound above 0": bool("clv_low" in sample and sample["clv_low"] > 0.0),
         "power check": bool(sample.get("power_met", False)),
         "settlement integrity (100% reconciled, no manual override)": integrity.status == "passed",
+        **{f"prerequisite: {name}": bool(met) for name, met in prerequisites.items()},
     }
     # PRD: an interval that excludes zero from below is a failure; with the power met, a lower bound at or below 0 is too.
     clv_refuted = bool(sample["gate3_sample"] and "clv_low" in sample
