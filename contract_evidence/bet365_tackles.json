@@ -1,8 +1,8 @@
 {
   "book": "bet365",
   "market": "tackles",
-  "status": "NOT VERIFIED: no first-hand rule and no same-book settlement",
-  "note": "Only search-engine summaries of help.bet365.com exist here (MARKET_CONTRACT.md section 7): Opta data, a tackle is a ground challenge that takes the ball, a selected player who does not start is void. Summaries do not count.",
+  "status": "NOT VERIFIED: first-hand rules on 3 of 5 topics (2026-10-27); the pilot prices bet365 under its void rule (void if the player does not start) since 2026-10-27, but paper-bet settlement still voids only a player who did not play; no same-book settlement",
+  "note": "bet365's own rules pages, read by the maintainer in their browser on 2026-10-27 and supplied as screenshots (help.bet365.com refuses requests from here). Settled on Opta data by Opta's definitions; a selected player who does not start is void.",
   "access_attempts": [
     {
       "date": "2026-10-10",
@@ -18,12 +18,69 @@
       "date": "2026-10-26",
       "what": "raw download of https://help.bet365.com/s/en-gb/sportsrules/soccer/match-statistics",
       "outcome": "HTTP 403 (bot challenge; not bypassed)"
+    },
+    {
+      "date": "2026-10-27",
+      "what": "help.bet365.com Football rules pages in the maintainer's own browser",
+      "outcome": "read; supplied as screenshots"
     }
   ],
   "missing": [
-    "first-hand wording (rules page saved as PDF with URL and date, or a written support reply) on: statistic and data provider, extra time, player participation and void (starter, substitute, named non-player), abandoned or postponed match, whole-line settlement",
-    "at least 20 results settled by this bookmaker, recorded naming the bookmaker, including examples that contradict every rival count, a substitute appearance and a named player who did not start or play"
+    "abandoned or postponed match, for player markets: first-hand wording (bet365's general Football or postponement rules, or a written support reply)",
+    "whole-line settlement: not stated (cannot arise on the 'k+' ladders and half-point lines seen)",
+    "settlement under bet365's void rule: the pilot prices void if the player does not start (ladder_scan.BOOK_VOID_RULES, maintainer 2026-10-27), but replies.grade voids only a player who did not play, so pilot_ledger.record_tips refuses such a tip until settlement reads who started",
+    "the agreed provider-data check (Sportmonks against Opta's counts) in place of 20+ same-book settlements: decided 2026-10-27, not yet built"
   ],
-  "rules": [],
-  "examples": []
+  "rules": [
+    {
+      "topic": "statistic and data provider",
+      "source": "bookmaker rules page",
+      "url_or_document": "help.bet365.com, 'Settlement' section 'Settlement of Wagers' (address cut off at help.bet365.com/s/...); screenshot .prop_alpha_state/analysis/bookmaker_rules/bet365/bet365_settlement_of_wagers_screenshot_2026-10-27.png; and help.bet365.com, 'Home / Sports Rules / Football / Match/Team/Player Statistics' (the screenshots cut the address off at help.bet365.com/s/...); screenshots kept (gitignored, in the daily backup) at .prop_alpha_state/analysis/bookmaker_rules/bet365/",
+      "checked_on": "2026-10-27",
+      "wording": "Settlement of Wagers: \"Statistics provided by Podium will be used to settle wagers. Where Podium statistics are not provided or there is significant evidence that Podium statistics are incorrect, we will use independent evidence to support wager settlement. Specific to Match, Team and Player Statistics markets, settlement will be determined by Opta provided data (or official competition website outside of this coverage); and according to their definitions of individual statistics. In the absence of consistent, independent evidence or in the presence of significant conflicting evidence, wagers will be settled based on our own statistics.\" Match/Team/Player Statistics: \"Settlement of the following markets will be determined by Opta (or official competition website outside of this coverage) provided data ; and according to their definitions of individual statistics as detailed below:\" Listed player markets include \"Player Tackles\" and \"Alternative Player Tackles\". \"Tackles (Team/Selected Player) - A tackle is defined as when a player connects with the ball in a legal, ground level challenge and successfully takes the ball away from the opposition player. The tackled player must be in controlled possession of the ball to be tackled by an opposition player.\""
+    },
+    {
+      "topic": "extra time",
+      "source": "bookmaker rules page",
+      "url_or_document": "help.bet365.com, 'Home / Sports Rules / Football / Match/Team/Player Statistics' (the screenshots cut the address off at help.bet365.com/s/...); screenshots kept (gitignored, in the daily backup) at .prop_alpha_state/analysis/bookmaker_rules/bet365/",
+      "checked_on": "2026-10-27",
+      "wording": "\"Player match markets, including, (but not confined to) the below list; include Extra Time (if played) for settlement purposes:\" (the list includes the market above)."
+    },
+    {
+      "topic": "player participation and void",
+      "source": "bookmaker rules page",
+      "url_or_document": "help.bet365.com, 'Home / Sports Rules / Football / Match/Team/Player Statistics' (the screenshots cut the address off at help.bet365.com/s/...); screenshots kept (gitignored, in the daily backup) at .prop_alpha_state/analysis/bookmaker_rules/bet365/",
+      "checked_on": "2026-10-27",
+      "wording": "Player Participation: \"If a selected player (any one of the quoted players in a multi-player market) does not start a match, bets will be void; other than competitions in which rolling subs are utilised, where bets will be deemed action start or not. As an example, but not confined to: Baller Leagues, Kings League\""
+    }
+  ],
+  "examples": [],
+  "document": {
+    "title": "bet365 help pages: 'Settlement of Wagers' and 'Match/Team/Player Statistics' (Football)",
+    "supplied": "by the maintainer as 7 browser screenshots on 2026-10-27",
+    "screenshots_sha256": {
+      "bet365_match_team_player_statistics_1_screenshot_2026-10-27.png": "a1842fe331664bfa3c615737cc63774cf2b236fdbb1b7ece540e6b5539c9a66c",
+      "bet365_match_team_player_statistics_2_screenshot_2026-10-27.png": "637fdadf385d8a794f46d2e8481d8ee0b3ea24af3efe407077b140bc23397acf",
+      "bet365_match_team_player_statistics_3_screenshot_2026-10-27.png": "1ee5a6abefce27bb4a10066f7c23d5c9ad16e847f40a3d9abd17ea2d6457eb43",
+      "bet365_match_team_player_statistics_4_screenshot_2026-10-27.png": "92a758a84ad7f29bbe116b14feb89059dce5da777e7ccfd179c7a6750fd6adbe",
+      "bet365_match_team_player_statistics_5_screenshot_2026-10-27.png": "a7f87dc1305932c22d0ac10ecc018ca7ac9f33542055fe26f165917369ed2fe4",
+      "bet365_match_team_player_statistics_6_screenshot_2026-10-27.png": "17ca80aa44a164fb4cc902f228f067f45aa5a6cd4e03e90bc23edf4f1634b1ab",
+      "bet365_settlement_of_wagers_screenshot_2026-10-27.png": "5c1f49d708b3a7e7fee01da29a15550ecf020ad6397a562121c9777231a1b7ac"
+    },
+    "caveats": [
+      "Screenshots, not PDFs: the address bar cuts the URL off at help.bet365.com/s/..., so the exact page URL and the regional version are not recorded.",
+      "Abandonment: the page's only abandonment sentence covers 'All Match and Team Statistics bets'; player markets are not named in it, and postponement is not covered (recorded under partial_rules, not counted).",
+      "Whole-line settlement is not stated. bet365's tackles and fouls prices seen here are 'k+' ladders and half-point lines, which cannot land exactly on the line."
+    ]
+  },
+  "partial_rules": [
+    {
+      "topic": "abandoned or postponed match",
+      "source": "bookmaker rules page",
+      "url_or_document": "help.bet365.com, 'Home / Sports Rules / Football / Match/Team/Player Statistics' (the screenshots cut the address off at help.bet365.com/s/...); screenshots kept (gitignored, in the daily backup) at .prop_alpha_state/analysis/bookmaker_rules/bet365/",
+      "checked_on": "2026-10-27",
+      "wording": "\"All Match and Team Statistics bets are settled on the result at the end of 90 minutes play. In the event of abandonment before 90 minutes have been played then all bets will be void unless settlement is already determined.\"",
+      "why_not_counted": "it names match and team statistics bets, not player markets, and says nothing of postponement"
+    }
+  ]
 }

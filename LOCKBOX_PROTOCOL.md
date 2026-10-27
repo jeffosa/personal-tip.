@@ -209,3 +209,18 @@ It changes how an outcome is captured. The predictions that count, the start, th
 - **Keep the machine on mains and awake through every 72 h mark after a lockbox matchday** (Tuesday 19:45 kickoffs fall due on Friday at 19:45; Saturday 15:00 kickoffs on Tuesday at 15:00). A missed window turns every capture into a rebuild from the first-ingestion data, or an exclusion. `scheduler_gaps.jsonl` records the silence.
 - **Before any manual re-ingestion of a lockbox match:** note the date, the matches and the reason in this file.
 - **Keep the daily database dump.** `raw_payloads` is the only source a rebuild can use.
+
+## 7. Scope amendment of 2026-10-27 (maintainer, 16:43 UTC; `GATE2_SCOPE_DECISION_MEMO.md`)
+
+Made before any lockbox match had kicked off and before any outcome could be captured.
+- **Markets:** Gate 2's target markets are tackles and fouls (the protocol's lines are unchanged). yellow_card, which the
+  frozen model does not price, is no longer a blocker.
+- **Line-ups:** the scored prediction is the one logged at the 4-hourly scan on estimated line-ups, the prediction a tip
+  rests on; the PRD's "lineups fixed at team-sheet time" is amended accordingly.
+- **Benchmark:** still judged here if 200+ two-way closing prices exist (none can while no bookmaker quotes League One/Two
+  tackles or fouls). Otherwise it is judged on a separate market lockbox, to be pre-registered with its own frozen settings
+  and start before any of its matches are scored. Until that lockbox exists and passes, Gate 2 is NOT PASSED. The result
+  file records this lockbox's own verdict as `skill_and_calibration_passed`.
+- Unchanged: the digest, data source, leagues, start, eligibility, capture policy, 500 / 320 threshold, calibration rule,
+  end date and expiry.
+

@@ -117,39 +117,46 @@ def capture(now: datetime, odds_client: Any, dsn: str, state_dir: Path) -> tuple
     """(fixtures captured, quotes written, summary notes). Spends no request when nothing is due."""
     import psycopg2
 
+    from prop_alpha.alerts.ledger import ledger_lock
     from prop_alpha.alerts.scan import collect_odds, load_slate_inputs
 
-    captured_path = state_dir / CAPTURED_NAME
-    captured = frozenset(int(fid) for fid in json.loads(captured_path.read_text(encoding="utf-8"))) \
-        if captured_path.is_file() else frozenset()
-    due = due_fixtures(load_scan_fixtures(state_dir), captured, now)
-    if not due:
-        return 0, 0, []
-    fixtures = [fixture for fixture, _ in due]
-    books = sorted({book for _, entry_books in due for book in entry_books})
-    conn = psycopg2.connect(dsn, options="-c statement_timeout=30000 -c default_transaction_read_only=on",
-                            connect_timeout=10)
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                squads = {fixture.fixture_id: load_slate_inputs(cur, fixture).squad for fixture in fixtures}
-    finally:
-        conn.close()
-    coverage, notes, available = collect_odds(odds_client, fixtures, squads, now, fixtures[-1].kickoff_at, books,
-                                              state_dir)
-    if not available:
-        raise RuntimeError("closing prices: no bookmaker answered: " + "; ".join(notes))
-    kickoffs = {fixture.fixture_id: fixture.kickoff_at for fixture in fixtures}
-    quotes = [quote for quote in coverage.quotes if quote.fixture_id in kickoffs]
-    path = state_dir / CLOSING_QUOTES_NAME
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        for quote in quotes:
-            handle.write(json.dumps(_quote_record(quote, kickoffs[quote.fixture_id])) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    captured_path.write_text(json.dumps(sorted(captured | set(kickoffs))), encoding="utf-8")
-    return len(fixtures), len(quotes), notes
+    with ledger_lock(state_dir / "closing_capture.lock", wait=True):
+        captured_path = state_dir / CAPTURED_NAME
+        captured = set(int(fid) for fid in json.loads(captured_path.read_text(encoding="utf-8"))) \
+            if captured_path.is_file() else set()
+        # A crash after the quote append but before the handled-fixture file is saved must not duplicate the quotes.
+        captured.update(int(record["fixture_id"]) for record in load_closing_quotes(state_dir))
+        due = due_fixtures(load_scan_fixtures(state_dir), frozenset(captured), now)
+        if not due:
+            return 0, 0, []
+        fixtures = [fixture for fixture, _ in due]
+        books = sorted({book for _, entry_books in due for book in entry_books})
+        conn = psycopg2.connect(dsn, options="-c statement_timeout=30000 -c default_transaction_read_only=on",
+                                connect_timeout=10)
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    squads = {fixture.fixture_id: load_slate_inputs(cur, fixture).squad for fixture in fixtures}
+        finally:
+            conn.close()
+        coverage, notes, available = collect_odds(odds_client, fixtures, squads, now, fixtures[-1].kickoff_at, books,
+                                                  state_dir)
+        if not available:
+            raise RuntimeError("closing prices: no bookmaker answered: " + "; ".join(notes))
+        kickoffs = {fixture.fixture_id: fixture.kickoff_at for fixture in fixtures}
+        quotes = [quote for quote in coverage.quotes if quote.fixture_id in kickoffs]
+        if not quotes:
+            return 0, 0, notes
+        captured_fixtures = {int(quote.fixture_id) for quote in quotes}
+        path = state_dir / CLOSING_QUOTES_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            for quote in quotes:
+                handle.write(json.dumps(_quote_record(quote, kickoffs[quote.fixture_id])) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        captured_path.write_text(json.dumps(sorted(captured | captured_fixtures)), encoding="utf-8")
+        return len(captured_fixtures), len(quotes), notes
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -147,8 +147,9 @@ def _tip_brazil(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _verified_contract(monkeypatch: pytest.MonkeyPatch, *books: str) -> None:
+    """A verified contract for each book's tackles, on the void rule its real prices are priced under (BOOK_VOID_RULES)."""
     monkeypatch.setattr(market_contract, "VERIFIED_CONTRACTS", {
-        (book, "tackles"): market_contract.Contract(pilot_ledger.PILOT_TACKLES_SQL, VoidRule.VOID_IF_NO_APPEARANCE.value,
+        (book, "tackles"): market_contract.Contract(pilot_ledger.PILOT_TACKLES_SQL, ladder_scan.BOOK_VOID_RULES[book].value,
                                                     f"{book}_tackles.json")
         for book in books or ("bet365",)})
 
@@ -258,6 +259,39 @@ def test_a_real_price_in_line_with_the_other_book_is_never_tipped(tmp_path: Path
 def test_the_bookmaker_check_is_part_of_the_pilot_settings_digest(monkeypatch: pytest.MonkeyPatch) -> None:
     current = ladder_scan.pilot_settings_digest()
     monkeypatch.setattr(ladder_scan, "MARKET_CHECK_MARGIN", None)
+    assert ladder_scan.pilot_settings_digest() != current
+
+
+def test_every_real_pilot_quote_is_priced_under_its_books_own_void_rule() -> None:
+    """Maintainer 2026-10-27 ("price the pilot as if he starts"): bet365's and Betway's own rules void a player who does not
+    start, so their prices are priced on his chance as a starter, a non-start returning the stake. A book with no recorded
+    rule is refused, never priced on a guess."""
+    assert ladder_scan.BOOK_VOID_RULES == {"bet365": VoidRule.VOID_IF_NOT_STARTING, "betway": VoidRule.VOID_IF_NOT_STARTING}
+    quotes = ladder_scan.with_book_void_rules([_quote(2.0, 1.8), replace(_quote(2.0, 1.8), sportsbook="Betway")])
+    assert [q.void_rule for q in quotes] == [VoidRule.VOID_IF_NOT_STARTING] * 2
+    with pytest.raises(ValueError, match="no void rule recorded for bookmaker"):
+        ladder_scan.with_book_void_rules([replace(_quote(2.0, 1.8), sportsbook="ladbrokes")])
+    projections, _ = ladder_scan.price_pilot(FIXTURE, _inputs(), *ladder_scan.pilot_engines(FIXTURE.league))
+    regular = projections[(9101, 1, "tackles")]
+    # A squad player: starts 60%, comes off the bench 30% (about 20 minutes), absent 10%.
+    projection = replace(regular, lineup=replace(regular.lineup, p_start=0.6, p_sub_appearance=0.3, sub_mixture=None))
+    starts = projection.side_probabilities(1.5, "over", VoidRule.VOID_IF_NOT_STARTING)
+    plays = projection.side_probabilities(1.5, "over", VoidRule.VOID_IF_NO_APPEARANCE)
+    assert starts.p_void == pytest.approx(1.0 - projection.lineup.p_start)  # every non-start is void, a sub appearance too
+    assert starts.p_win / (starts.p_win + starts.p_lose) > plays.p_win / (plays.p_win + plays.p_lose)  # no short sub spells
+
+
+def test_a_book_with_no_recorded_void_rule_is_refused_before_any_odds_request(tmp_path: Path) -> None:
+    odds = _FakeOdds([])
+    with pytest.raises(ValueError, match="no void rule recorded for bookmaker.*ladbrokes"):
+        ladder_scan.collect_pilot_odds(odds, [FIXTURE], {}, NOW, NOW + timedelta(hours=4), ["bet365", "ladbrokes"], tmp_path)
+    assert odds.paths == []
+
+
+def test_the_void_rules_are_part_of_the_pilot_settings_digest(monkeypatch: pytest.MonkeyPatch) -> None:
+    current = ladder_scan.pilot_settings_digest()
+    monkeypatch.setattr(ladder_scan, "BOOK_VOID_RULES", {**ladder_scan.BOOK_VOID_RULES,
+                                                         "bet365": VoidRule.VOID_IF_NO_APPEARANCE})
     assert ladder_scan.pilot_settings_digest() != current
 
 def test_only_brazil_is_tipped_and_the_summary_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -832,9 +866,10 @@ def test_without_a_verified_contract_a_real_price_tip_is_withheld_and_no_paper_b
     assert notifier.texts == [] and store.load() == []
     text = ladder_scan.summary_text(summary, "")
     assert f"Tips withheld: {summary.withheld} (the bookmaker's settlement rules" in text
-    # A contract for the right book but another void rule (bet365 voids non-starters, a lead) is not this contract.
+    # A contract for the right book but another void rule (void if no appearance; bet365's prices are priced void if the
+    # player does not start since 2026-10-27, BOOK_VOID_RULES) is not this contract.
     monkeypatch.setattr(market_contract, "VERIFIED_CONTRACTS", {("bet365", "tackles"): market_contract.Contract(
-        pilot_ledger.PILOT_TACKLES_SQL, VoidRule.VOID_IF_NOT_STARTING.value, "bet365_tackles.json")})
+        pilot_ledger.PILOT_TACKLES_SQL, VoidRule.VOID_IF_NO_APPEARANCE.value, "bet365_tackles.json")})
     again = _run(tmp_path, _Recording(store), store, odds="oddspapi",
                  odds_client=_FakeOdds(_ladder_body({"Regular Starter": (2.6, 9.0, 1.45)})))
     assert again.alerts_sent == 0 and again.withheld >= 1

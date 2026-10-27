@@ -426,9 +426,9 @@ rules found, the access attempts that failed, what is missing and the same-book 
 
 | Target | First-hand rules on file | Same-book examples | Criteria unmet | Blocking |
 |---|---|---|---|---|
-| bet365 tackles | none (help.bet365.com: HTTP 403 to fetch and raw download, refused in the browser pane) | 0 | 13 | rules, examples |
-| bet365 fouls | none (same) | 0 | 10 | rules, examples |
-| Betway tackles | 4 of 5 topics, from Betway Betting Rules v42 (2022), operator and currency unconfirmed | 0 | 9 | whole-line rule, examples; its "players must start" rule is not the void rule priced |
+| bet365 tackles | 3 of 5 topics since 2026-10-27 (section 14; before: none, help.bet365.com refuses requests from here) | 0 | 10 | abandonment for player markets, whole-line rule, examples; settlement under its void rule |
+| bet365 fouls | 3 of 5 topics since 2026-10-27 (section 14) | 0 | 7 | the same |
+| Betway tackles | 4 of 5 topics, from Betway Betting Rules v42 (2022), operator and currency unconfirmed | 0 | 9 | whole-line rule, examples; its "players must start" rule is priced since 2026-10-27 (section 14), not yet settled |
 | Betway fouls | 3 of 5 topics (no player fouls market defined) | 0 | 7 | statistic, whole-line rule, examples |
 | Betfred fouls | none (betfred.com rules page: HTTP 403, bot challenge, not bypassed) | 0 | 10 | rules, examples; not a priced book |
 
@@ -469,8 +469,8 @@ Not used, and why:
    - `python scripts/contract_evidence.py --book <book> --market <market> --write` drafts the examples with their stored
      counts.
    - Once every criterion in section 10 is met, listing the contract is your decision, in a PR.
-   - A Betway contract that voids non-starters also needs your pricing decision (section 12) before any Betway tip could be
-     sent.
+   - A contract that voids non-starters (bet365, Betway) is priced so since 2026-10-27 (section 14); paper-bet settlement
+     must read who started before any such tip could be sent.
 
 **Checks hardened (audit 2026-10-27; nothing became verified, `VERIFIED_CONTRACTS` is still empty):**
 - **Conflicts.** `evidence_failures` reports a CONFLICT when one selection (fixture, player, line, side) is recorded twice with different results or counts, and counts neither record. Before, it kept the first silently, so a contradicting same-book settlement could hide behind an agreeing one.
@@ -490,3 +490,35 @@ The criteria unmet, re-run 2026-10-27, are unchanged: bet365 tackles 13, bet365 
 3. **Counts.** Draft them with `python scripts/contract_evidence.py --book <book> --market <market> --write`. Never type them by hand.
 4. **Listing.** Only when `evidence_failures` returns nothing: list `(book, market): Contract(...)` in `VERIFIED_CONTRACTS` in a PR. `tests/test_market_contract.py` re-checks the file and requires a lower-case key and an evidence file named `<book>_<market>.json`.
 5. **Capital.** Step 2 needs bets actually settled by the bookmaker, i.e. capital at risk, which PRD §1.2 forbids before every gate has passed. That is the maintainer's decision D2 in `GATE3_DECISION_MEMO.md`.
+
+## 14. bet365's own rules, and pricing under its void rule (2026-10-27)
+
+**Source.** bet365's help pages "Settlement of Wagers" and Football "Match/Team/Player Statistics", read by the maintainer
+in their own browser on 2026-10-27 and supplied as 7 screenshots (kept, with SHA-256, in
+`.prop_alpha_state/analysis/bookmaker_rules/bet365/`; recorded in `contract_evidence/bet365_*.json`). The address bar is cut
+off at `help.bet365.com/s/...`, so the exact URL and regional version are not recorded.
+
+| Topic | bet365's wording (summary; exact text in the evidence files) |
+|---|---|
+| Statistic and provider | Player statistics markets settle on Opta data "according to their definitions"; the official competition website outside Opta's coverage; bet365's own statistics when the evidence conflicts. **Tackle:** a legal, ground-level challenge that successfully takes the ball from an opponent in controlled possession. **Foul conceded:** an infringement penalised by the referee with a free kick or penalty; offsides are not fouls; advantage played and a later caution is not a foul unless a free kick or penalty follows. Markets listed: Player Tackles, Alternative Player Tackles, Player Fouls Committed, Alternative Player Fouls Committed. |
+| Extra time | Player match markets include extra time if played (league matches have none). |
+| Participation | "If a selected player ... does not start a match, bets will be void" (rolling-substitute competitions excepted). |
+| Abandoned or postponed | Only for match and team statistics bets (void if abandoned before 90 minutes unless decided): **not counted** for player markets; postponement not covered. |
+| Whole line | Not stated; cannot arise on the "k+" ladders and half-point lines seen. |
+
+**Decisions (maintainer, 2026-10-27).**
+1. **Target: bet365.** SportyBet, which the maintainer also uses, cannot be priced: OddsPapi lists `sportybet`, but odds
+   requests returned HTTP 400 "not supported or does not have any fixtures available" for tournaments 18, 24, 25, 36 and 325 and
+   for the Premier League (17). SportyBet results stay another book's.
+2. **Verification: rules plus a data check.** bet365's first-hand rules, plus a check that Sportmonks' counts equal Opta's for
+   20+ player-matches (substitutes, non-starters and counts on the line among them), in place of 20+ bet365-settled bets
+   (`GATE3_DECISION_MEMO.md` D2). Not built yet; `evidence_failures` still asks for settled examples.
+3. **"Price the pilot as if he starts."** `ladder_scan.BOOK_VOID_RULES` gives bet365 and Betway `void_if_not_starting`; every
+   real pilot quote carries its book's rule and a book with none is refused before any odds request. The model's win chance on
+   such a price is the player's chance as a starter (a non-start, a sub appearance included, returns the stake). The rules are
+   part of the pilot settings digest.
+
+**Still open.** Paper-bet settlement voids only a player who did not play (`replies.grade` reads no starter flag), so
+`pilot_ledger.record_tips` refuses a tip priced void if not starting before anything is recorded or sent; settlement must read
+`player_match_stats.started` before any bet365 or Betway contract can be listed. `scripts/screen_replay.py` and
+`scripts/edge_calibration.py` still replay under void if no appearance.

@@ -56,14 +56,27 @@ STATE: Final[Path] = ROOT / ".prop_alpha_state"
 OUTCOMES_FILE: Final[Path] = STATE / "lockbox_outcomes.jsonl"
 RESULT_FILE: Final[Path] = STATE / "gate2_prospective_result.json"
 RESULT_LOCK_FILE: Final[Path] = STATE / "gate2_prospective_result.lock"
-# PRD target markets the frozen model does not price: Gate 2 cannot pass while one is missing.
-UNPRICED_TARGET_MARKETS: Final[tuple[str, ...]] = ("yellow_card",)
+OUTCOMES_LOCK_FILE: Final[Path] = STATE / "lockbox_outcomes.lock"
+# PRD target markets the frozen model does not price: Gate 2 cannot pass while one is missing. Empty since the scope
+# amendment of 2026-10-27 16:43 UTC (maintainer, GATE2_SCOPE_DECISION_MEMO.md option 2a, before any lockbox outcome was
+# captured): Gate 2's target markets are tackles and fouls; yellow_card was ("yellow_card",) and gets its own freeze and
+# lockbox if it is ever priced.
+UNPRICED_TARGET_MARKETS: Final[tuple[str, ...]] = ()
+# Option 1c of the same amendment: the closing-market benchmark is judged where a market exists, on a separate,
+# pre-registered market lockbox (not built yet). This lockbox still judges it when it has the closing prices; without them
+# Gate 2 stays NOT PASSED, and the result also says whether this lockbox's own skill and calibration criteria passed.
+MARKET_LOCKBOX_NOTE: Final[str] = ("judged on a separate market lockbox under the 2026-10-27 scope amendment "
+                                   "(GATE2_SCOPE_DECISION_MEMO.md 1c; not yet pre-registered), so Gate 2 is not passed")
 # With when the match's stored vendor data was first and last fetched (each distinct payload is a raw_payloads row), so a
 # capture records whether it holds data fetched after the intended capture time (lockbox.capture_timing).
 MATCHES_SQL: Final[str] = """
     SELECT f.vendor_fixture_uid, f.kickoff_at, f.status = 'final',
-           (SELECT min(r.fetched_at) FROM prop_alpha.raw_payloads r WHERE r.vendor_fixture_uid = f.vendor_fixture_uid),
-           (SELECT max(r.fetched_at) FROM prop_alpha.raw_payloads r WHERE r.vendor_fixture_uid = f.vendor_fixture_uid)
+           (SELECT min(r.fetched_at) FROM prop_alpha.raw_payloads r
+            WHERE r.vendor_fixture_uid = f.vendor_fixture_uid AND r.source = %s),
+           (SELECT max(r.fetched_at) FROM prop_alpha.raw_payloads r
+            WHERE r.vendor_fixture_uid = f.vendor_fixture_uid AND r.source = %s),
+           (SELECT r.source FROM prop_alpha.raw_payloads r WHERE r.vendor_fixture_uid = f.vendor_fixture_uid
+            ORDER BY r.fetched_at DESC, r.payload_id DESC LIMIT 1)
     FROM prop_alpha.fixtures f WHERE f.vendor_fixture_uid = ANY(%s)
 """
 PLAYERS_SQL: Final[str] = """
@@ -77,7 +90,8 @@ PLAYERS_SQL: Final[str] = """
 # distinct payload is a raw_payloads row; the payload is the vendor adapter's output, which parse_fixture_payload reads).
 REBUILD_PAYLOAD_SQL: Final[str] = """
     SELECT payload, fetched_at FROM prop_alpha.raw_payloads
-    WHERE vendor_fixture_uid = %s AND fetched_at <= %s ORDER BY fetched_at DESC, payload_id DESC LIMIT 1
+    WHERE vendor_fixture_uid = %s AND source = %s AND fetched_at <= %s
+    ORDER BY fetched_at DESC, payload_id DESC LIMIT 1
 """
 PLAYER_IDS_SQL: Final[str] = "SELECT vendor_player_uid, player_id FROM prop_alpha.players WHERE vendor_player_uid = ANY(%s)"
 # Workers for the re-fetch at the grace: a handful of matches per capture run.
@@ -93,9 +107,9 @@ def read_matches(dsn: str, fixture_ids: Sequence[int]) -> dict[int, lockbox.Stor
     try:
         with conn, conn.cursor() as cur:
             uids = [str(u) for u in fixture_ids]
-            cur.execute(MATCHES_SQL, (uids,))
-            found = {int(uid): (kickoff.astimezone(timezone.utc), bool(final), first, last)
-                     for uid, kickoff, final, first, last in cur.fetchall()}
+            cur.execute(MATCHES_SQL, (lockbox.PROTOCOL.data_vendor, lockbox.PROTOCOL.data_vendor, uids))
+            found = {int(uid): (kickoff.astimezone(timezone.utc), bool(final), first, last, source)
+                     for uid, kickoff, final, first, last, source in cur.fetchall()}
             cur.execute(PLAYERS_SQL, (uids,))
             players: dict[int, dict[int, tuple[int, Mapping[str, int]]]] = {}
             for uid, player_id, minutes, tackles, fouls in cur.fetchall():
@@ -104,8 +118,8 @@ def read_matches(dsn: str, fixture_ids: Sequence[int]) -> dict[int, lockbox.Stor
         conn.close()
     return {uid: lockbox.StoredMatch(kickoff, final, players.get(uid, {}),
                                      None if first is None else first.astimezone(timezone.utc),
-                                     None if last is None else last.astimezone(timezone.utc))
-            for uid, (kickoff, final, first, last) in found.items()}
+                                     None if last is None else last.astimezone(timezone.utc), source)
+            for uid, (kickoff, final, first, last, source) in found.items()}
 
 
 def refetch(dsn: str, fixture_ids: Sequence[int]) -> set[int]:
@@ -129,16 +143,18 @@ def refetch(dsn: str, fixture_ids: Sequence[int]) -> set[int]:
 
 
 def match_from_payload(payload: Mapping[str, Any], fetched_at: datetime, kickoff_at: datetime,
-                       player_ids: Mapping[str, int]) -> lockbox.StoredMatch | None:
+                       player_ids: Mapping[str, int], source: str) -> lockbox.StoredMatch | None:
     """Pure: the match as the stored payload had it (protocol counts per player id), or None when that payload was not of a
     final match. A player the players table does not know is left out (no lockbox prediction can be for him)."""
+    if source != lockbox.PROTOCOL.data_vendor:
+        raise ValueError(f"fixture payload source {source!r} is not {lockbox.PROTOCOL.data_vendor!r}")
     parsed = parse_fixture_payload(payload)
     if parsed.fixture.status != "final":
         return None
     players = {player_ids[p.player_uid]: (p.minutes_played, {"tackles": p.tackles_attempted, "fouls": p.fouls_committed})
                for p in parsed.players if p.player_uid in player_ids}
     fetched = fetched_at.astimezone(timezone.utc)
-    return lockbox.StoredMatch(kickoff_at, True, players, fetched, fetched)
+    return lockbox.StoredMatch(kickoff_at, True, players, fetched, fetched, source)
 
 
 def rebuild(dsn: str, fixture_id: int, kickoff_at: datetime, due: datetime) -> lockbox.StoredMatch | None:
@@ -149,7 +165,7 @@ def rebuild(dsn: str, fixture_id: int, kickoff_at: datetime, due: datetime) -> l
     conn = psycopg2.connect(dsn, options="-c statement_timeout=60000 -c default_transaction_read_only=on")
     try:
         with conn, conn.cursor() as cur:
-            cur.execute(REBUILD_PAYLOAD_SQL, (str(fixture_id), due))
+            cur.execute(REBUILD_PAYLOAD_SQL, (str(fixture_id), lockbox.PROTOCOL.data_vendor, due))
             row = cur.fetchone()
             if row is None:
                 return None
@@ -159,7 +175,7 @@ def rebuild(dsn: str, fixture_id: int, kickoff_at: datetime, due: datetime) -> l
             player_ids = {str(uid): int(player_id) for uid, player_id in cur.fetchall()}
     finally:
         conn.close()
-    return match_from_payload(payload, fetched_at, kickoff_at, player_ids)
+    return match_from_payload(payload, fetched_at, kickoff_at, player_ids, lockbox.PROTOCOL.data_vendor)
 
 
 def load_outcomes(path: Path) -> dict[tuple[int, int], dict[str, Any]]:
@@ -178,9 +194,11 @@ def load_outcomes(path: Path) -> dict[tuple[int, int], dict[str, Any]]:
 
 
 def score(scoring: lockbox.ScoringRows, closing: Mapping[tuple[int, int, str, float], float]) -> dict[str, Any]:
-    """Every Gate 2 metric per market and line, and the verdict with each reason it is not a pass."""
+    """Every Gate 2 metric per market and line, and the verdict with each reason it is not a pass; `skill_and_calibration_
+    passed` is this lockbox's own verdict on every line's criteria, the benchmark left out."""
     rng = np.random.default_rng(lockbox.PROTOCOL.seed)
     result: dict[str, Any] = {"markets": {}, "blockers": []}
+    line_failures = 0
     for market, lines in lockbox.PROTOCOL.lines.items():
         entry: dict[str, Any] = {}
         bench: list[tuple[float, float, int]] = []
@@ -193,6 +211,7 @@ def score(scoring: lockbox.ScoringRows, closing: Mapping[tuple[int, int, str, fl
             if not line_score.passed:
                 failed = [name for name, ok in line_score.criteria.items() if not ok]
                 result["blockers"].append(f"{market} over {line}: " + "; ".join(failed))
+                line_failures += 1
             bench += [(closing[(f, player, market, line)], p_model, outcome)
                       for f, player, p_model, outcome in rows if (f, player, market, line) in closing]
         if len(bench) >= MIN_BENCHMARK_PREDICTIONS:
@@ -203,10 +222,11 @@ def score(scoring: lockbox.ScoringRows, closing: Mapping[tuple[int, int, str, fl
                 result["blockers"].append(f"{market} market benchmark: b2 {fit.b_model:+.3f}, p {fit.p_value:.3f}")
         else:
             entry["market_benchmark"] = {"n": len(bench), "judged": False, "passed": False}
-            result["blockers"].append(f"{market} market benchmark: {len(bench)} predictions with a two-way closing price, "
-                                      f"{MIN_BENCHMARK_PREDICTIONS} needed: not judged, so not passed")
+            result["blockers"].append(f"{market} market benchmark: {len(bench)} predictions with a two-way closing price "
+                                      f"here, {MIN_BENCHMARK_PREDICTIONS} needed: {MARKET_LOCKBOX_NOTE}")
         result["markets"][market] = entry
     result["blockers"] += [f"{m}: a PRD target market the frozen model does not price" for m in UNPRICED_TARGET_MARKETS]
+    result["skill_and_calibration_passed"] = line_failures == 0
     result["passed"] = not result["blockers"]
     return result
 
@@ -328,8 +348,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not lockbox.ready_to_score(scoring):
         print("NOT SCORED: the metrics are computed once, when every line has the required scored predictions from the "
               "required matches; until then only counts are shown. Gate 2 is not passed.")
-        print(f"  Also open whatever the lockbox shows: {', '.join(UNPRICED_TARGET_MARKETS)} is not priced; the market "
-              "benchmark needs closing prices (none captured so far); predictions use estimated line-ups, not team sheets.")
+        print("  Also open whatever the lockbox shows: the market benchmark needs two-way closing prices, none here (no "
+              f"bookmaker quotes these markets); it is {MARKET_LOCKBOX_NOTE}. Scope (amendment of 2026-10-27): tackles "
+              "and fouls; line-ups estimated at the scan, the prediction a tip rests on.")
         return 1
     if args.dry_run:
         print("Ready to score; not scored in a dry run (scoring happens once and is written).")

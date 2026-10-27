@@ -511,11 +511,13 @@ The gates are sequential. A gate is passed only when every criterion is met and 
 - Each prediction uses only data strictly before kickoff.
 - The league prior rate is itself trailing.
 - Lineups are fixed at team-sheet time.
+  *Amended 2026-10-27 by the maintainer, before any lockbox outcome was captured (`GATE2_SCOPE_DECISION_MEMO.md` 3a): the prospective lockbox scores the prediction logged at the scan on estimated line-ups, up to 4 hours before kickoff, which is the prediction a tip rests on.*
 - \(\kappa\), \(\beta_1\), \(\beta_2\) and \(k\) are fitted on a period disjoint from evaluation.
 
 **Criteria.**
 
 1. **Sample size.** ≥ 500 out-of-sample predictions per target market (`tackles`, `fouls`, `yellow_card`).
+   *Amended 2026-10-27 (`GATE2_SCOPE_DECISION_MEMO.md` 2a): the target markets are `tackles` and `fouls`; `yellow_card` is out of scope until it is priced, with its own freeze and lockbox.*
 2. **Skill.**
 \[
 \text{BSS} = 1 - \frac{\text{BS}_{\text{model}}}{\text{BS}_{\text{clim}}}
@@ -528,6 +530,7 @@ The fixture-clustered bootstrap 90% interval of BSS MUST have a **lower bound > 
 \text{logit}\,P(y = 1) = a + b_1\,\text{logit}\,p^{\text{mkt}} + b_2\,\text{logit}\,\hat p .
 \]
 The model carries information beyond the market only if \(b_2 > 0\) with Wald \(p < 0.05\).
+   *Amended 2026-10-27 (`GATE2_SCOPE_DECISION_MEMO.md` 1c): where the evaluated leagues have no market (League One/Two), this criterion is judged on a separate, pre-registered market lockbox in a league with prices; Gate 2 is not passed until it is.*
 5. **`red_card` exclusion.** `red_card` markets are excluded from automated staking until ≥ 50 positive outcomes are scored. At base rates below 1%, 500 predictions contain fewer than 5 events, and BSS is statistically meaningless.
 
 ### Gate 3 — Paper Betting & Closing Line Value

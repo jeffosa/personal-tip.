@@ -79,7 +79,7 @@ from prop_alpha.alerts.telegram import (
 from prop_alpha.config import DEFAULT_PILOT_DSN, PILOT_DSN_ENV
 from prop_alpha.ingestion import oddspapi, sportmonks
 from prop_alpha.ingestion.results import PILOT_REFUSED_FILE, load_refused, pilot_leagues
-from prop_alpha.modeling.engine import FactorProjection, QuantEngine
+from prop_alpha.modeling.engine import FactorProjection, QuantEngine, VoidRule
 from prop_alpha.scanner.market_scanner import (
     MODEL_RISK_LOSS_FLOOR,
     AllocationReport,
@@ -167,6 +167,15 @@ PILOT_STATISTICS: Final[Mapping[str, str]] = {**MODEL_STATISTICS, "tackles": pil
 BOOKMAKERS_ENV: Final[str] = "LADDER_BOOKMAKERS"
 # Brazil Serie A: Betway lists the tackles and fouls ladders for every fixture seen on 2026-10-11 (7 of 7), bet365 for 4 of 13.
 DEFAULT_BOOKMAKERS: Final[tuple[str, ...]] = ("bet365", "betway")
+# Each bookmaker's void rule for player tackles and fouls, from its own rules (maintainer, 2026-10-27: "price the pilot as if
+# he starts"): bet365's Player Participation rule, "If a selected player ... does not start a match, bets will be void"
+# (help.bet365.com, read 2026-10-27, contract_evidence/bet365_*.json), and Betway's "players must start for bets to stand"
+# (Betting Rules v42, p.49). Every real pilot quote is priced under its book's rule: a player who does not start returns the
+# stake, so the price is his chance as a starter. A book not listed here is refused before any odds request.
+BOOK_VOID_RULES: Final[Mapping[str, VoidRule]] = {
+    "bet365": VoidRule.VOID_IF_NOT_STARTING,
+    "betway": VoidRule.VOID_IF_NOT_STARTING,
+}
 # Finished matches this old (and not within STALE_GRACE of now, which ingestion may not have reached yet) must be in the
 # pilot database before a league is priced.
 STALE_AFTER: Final[timedelta] = timedelta(days=10)
@@ -282,7 +291,7 @@ def pilot_settings_digest() -> str:
     settings = {"default_k": DEFAULT_GAME_STATE_K, "k": GAME_STATE_K, "league_k": LEAGUE_GAME_STATE_K,
                 "prior": PRIOR_STRENGTH, "unpriced": {k: sorted(v) for k, v in UNPRICED_MARKETS.items()},
                 "tackles_count": pilot_ledger.PILOT_TACKLES_SQL, "edge_cap": PLAUSIBLE_EDGE_CAP,
-                "market_check": MARKET_CHECK_MARGIN}
+                "market_check": MARKET_CHECK_MARGIN, "void_rules": {b: r.value for b, r in BOOK_VOID_RULES.items()}}
     return "pilot:" + hashlib.sha256(json.dumps(settings, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
@@ -365,6 +374,19 @@ def _save_ladder_catalogue(path: Path, catalogue: Mapping[int, oddspapi.LadderMa
     }), encoding="utf-8")
 
 
+def unknown_void_rule_books(books: Sequence[str]) -> list[str]:
+    """Pure: the bookmakers in `books` with no entry in BOOK_VOID_RULES (names compared in lower case)."""
+    return [book for book in books if book.strip().lower() not in BOOK_VOID_RULES]
+
+
+def with_book_void_rules(quotes: Sequence[LiveOddsQuote]) -> list[LiveOddsQuote]:
+    """Pure: each quote carrying its bookmaker's void rule (BOOK_VOID_RULES); a quote from a book not listed raises."""
+    unknown = sorted({q.sportsbook for q in quotes if q.sportsbook.strip().lower() not in BOOK_VOID_RULES})
+    if unknown:
+        raise ValueError(f"no void rule recorded for bookmaker(s) {', '.join(unknown)} (ladder_scan.BOOK_VOID_RULES)")
+    return [replace(q, void_rule=BOOK_VOID_RULES[q.sportsbook.strip().lower()]) for q in quotes]
+
+
 def collect_pilot_odds(
     client: Any, fixtures: Sequence[UpcomingFixture], squads: Mapping[int, Sequence[SquadPlayer]],
     now: datetime, window_end: datetime, books: Sequence[str], state_dir: Path,
@@ -374,7 +396,11 @@ def collect_pilot_odds(
     account endpoint is read first and odds are skipped when fewer than ODDS_QUOTA_RESERVE requests would remain. A
     bookmaker that reports no fixtures is recorded; any other failure, or a reply a parser does not understand, raises.
     One request per bookmaker covers every pilot league (at most five tournaments per request). Every raw reply is
-    archived under pilot/ as <stamp>_<book>_pilot.json.gz."""
+    archived under pilot/ as <stamp>_<book>_pilot.json.gz. Each quote carries its book's void rule (BOOK_VOID_RULES); a
+    book with none recorded raises before any request."""
+    unknown = unknown_void_rule_books(books)
+    if unknown:
+        raise ValueError(f"no void rule recorded for bookmaker(s) {', '.join(unknown)} (ladder_scan.BOOK_VOID_RULES)")
     empty = OddsCoverage((), 0, 0, (), ())
     cache = state_dir / scan.ODDS_CACHE_DIR
     line_file, ladder_file, names_file = cache / scan.CATALOGUE_FILE, cache / LADDER_CATALOGUE_FILE, cache / "participants.json"
@@ -420,6 +446,7 @@ def collect_pilot_odds(
         cache.mkdir(parents=True, exist_ok=True)
         names_file.write_text(json.dumps({str(k): v for k, v in names.items()}), encoding="utf-8")
     coverage = quotes_from_prices(prices, names, fixtures, squads, now)
+    coverage = replace(coverage, quotes=tuple(with_book_void_rules(coverage.quotes)))
     notes = [
         f"Odds: OddsPapi ({', '.join(books)}): {coverage.prices} tackles/fouls prices in this window, "
         f"{coverage.matched_prices} matched to our players, {len(coverage.quotes)} lines; "

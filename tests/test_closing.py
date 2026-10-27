@@ -72,6 +72,28 @@ def test_capture_writes_matched_closing_quotes_once(tmp_path: Path, monkeypatch:
     assert closing.capture(now, again, "postgresql://unused", tmp_path)[:2] == (0, 0) and again.paths == []
 
 
+def test_empty_successful_response_is_retried_and_later_quotes_are_not_duplicated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_squads(monkeypatch)
+    closing.save_scan_fixtures(tmp_path, [FIXTURE], ["bet365"], KICKOFF - timedelta(hours=4))
+    now = KICKOFF - timedelta(minutes=10)
+
+    empty = FakeOddsClient(left=200, odds=[])
+    assert closing.capture(now, empty, "postgresql://unused", tmp_path)[:2] == (0, 0)
+    assert closing.due_fixtures(closing.load_scan_fixtures(tmp_path), frozenset(), now) == [(FIXTURE, ("bet365",))]
+    assert not (tmp_path / closing.CAPTURED_NAME).exists()
+
+    available = FakeOddsClient(left=200, odds=_odds())
+    assert closing.capture(now, available, "postgresql://unused", tmp_path)[:2] == (1, 2)
+    records = closing.load_closing_quotes(tmp_path)
+    assert len(records) == 2
+
+    duplicate = FakeOddsClient(left=200, odds=_odds())
+    assert closing.capture(now, duplicate, "postgresql://unused", tmp_path)[:2] == (0, 0)
+    assert duplicate.paths == [] and closing.load_closing_quotes(tmp_path) == records
+
+
 def test_capture_fails_loudly_when_every_bookmaker_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_squads(monkeypatch)
     closing.save_scan_fixtures(tmp_path, [FIXTURE], ["broken"], KICKOFF - timedelta(hours=4))
@@ -128,7 +150,14 @@ def test_market_benchmark_detects_information_beyond_the_market() -> None:
 def test_the_scan_saves_its_fixtures_for_closing_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from test_scan import _patch_database, _StubSportmonks
 
-    _patch_database(monkeypatch)
+    _patch_database(mo
+                    
+                    
+                    
+                    
+                    
+                    
+                    nkeypatch)
 
     class OneBook(FakeOddsClient):
         pass

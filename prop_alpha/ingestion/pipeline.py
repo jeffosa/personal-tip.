@@ -189,6 +189,7 @@ class VendorClient:
         lineups_adapter: PayloadAdapter | None = None,
         fixture_adapter: FixtureAdapter | None = None,
         quota_headers: Sequence[str] = QUOTA_REMAINING_HEADERS,
+        source: str = "generic",
     ) -> None:
         """Every attempt, retries included, spends vendor quota. `max_requests` caps attempts for this
         client's lifetime; `quota_reserve` stops all further requests once the vendor's remaining-quota
@@ -230,6 +231,9 @@ class VendorClient:
         self.lineups_adapter = lineups_adapter
         self.fixture_adapter = fixture_adapter
         self.quota_headers = tuple(quota_headers)
+        if source not in ("generic", "sportmonks", "thestatsapi"):
+            raise ValueError(f"unknown raw payload source {source!r}")
+        self.source = source
         self.requests_sent = 0
         self._quota_stop: str | None = None
         self._quota_lock = threading.Lock()
@@ -560,7 +564,7 @@ class ConcurrentIngestionEngine:
         digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
         def write(cur: Any) -> int:
-            cur.execute(INSERT_RAW_SQL, ("vendor_fixture_stats", uid, body, digest))
+            cur.execute(INSERT_RAW_SQL, (self.client.source, uid, body, digest))
             psycopg2.extras.execute_values(cur, INSERT_STAGING_SQL, rows, page_size=1000)
             return len(rows) - 1
 
@@ -665,10 +669,11 @@ def build_vendor_client(environ: Mapping[str, str]) -> VendorClient:
             auth_header="Authorization", auth_prefix="",
             stats_path=sportmonks.STATS_PATH, lineups_path=sportmonks.LINEUPS_PATH,
             stats_adapter=sportmonks.fixture_payload, lineups_adapter=sportmonks.lineup_payload,
+            source="sportmonks",
         )
     return VendorClient(
         environ["DATA_VENDOR_BASE_URL"], environ["DATA_VENDOR_API_KEY"], limiter,
-        max_requests=max_requests, quota_reserve=quota_reserve,
+        max_requests=max_requests, quota_reserve=quota_reserve, source="generic",
     )
 
 
@@ -696,7 +701,7 @@ def build_thestatsapi_client(environ: Mapping[str, str], matches: Mapping[str, M
         auth_header="Authorization", auth_prefix="Bearer ",
         stats_path=thestatsapi.PLAYER_STATS_PATH, lineups_path=thestatsapi.LINEUPS_PATH,
         fixture_adapter=adapt if matches is not None else None, lineups_adapter=thestatsapi.lineup_payload,
-        quota_headers=thestatsapi.QUOTA_HEADERS,
+        quota_headers=thestatsapi.QUOTA_HEADERS, source="thestatsapi",
     )
 
 

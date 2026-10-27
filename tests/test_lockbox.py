@@ -156,16 +156,31 @@ def test_the_retired_repricing_scorer_refuses_to_run(capsys: pytest.CaptureFixtu
     assert "retired" in capsys.readouterr().out
 
 
-def test_the_scorer_never_passes_without_the_benchmark_and_the_card_market(tmp_path: Path) -> None:
+def test_the_scorer_never_passes_without_the_benchmark(tmp_path: Path) -> None:
+    """The scope amendment of 2026-10-27 (GATE2_SCOPE_DECISION_MEMO.md): yellow_card is no longer a Gate 2 target market,
+    and the benchmark is judged on a separate market lockbox; without it Gate 2 is never passed."""
     scorer = _script("gate2_prospective")
     rows = {key: tuple((f, p, 0.3 + 0.4 * (p % 2), (f + p) % 2) for f in range(12) for p in range(10))
             for key in [(m, line) for m, lines in PROTOCOL.lines.items() for line in lines]}
     result = scorer.score(lockbox.ScoringRows(rows, {}), {})
-    assert result["passed"] is False
-    assert any("market benchmark: 0 predictions" in b for b in result["blockers"])
-    assert any(b.startswith("yellow_card") for b in result["blockers"])
+    assert result["passed"] is False and result["skill_and_calibration_passed"] is False
+    assert any("market benchmark: 0 predictions" in b and "separate market lockbox" in b for b in result["blockers"])
+    assert not any("yellow_card" in b for b in result["blockers"]) and scorer.UNPRICED_TARGET_MARKETS == ()
     assert all("bins" in entry and "criteria" in entry for market in result["markets"].values()
                for key, entry in market.items() if key != "market_benchmark")
+
+
+def test_a_lockbox_passing_every_line_still_does_not_pass_gate_2_without_the_benchmark() -> None:
+    """Every line skilful and calibrated (outcomes at exactly the predicted rates, 600 predictions from 320 matches): this
+    lockbox's own verdict passes, Gate 2 does not, and the only reasons are the benchmarks to be judged elsewhere."""
+    scorer = _script("gate2_prospective")
+    line_rows = tuple((n % 320, n, p, int(n % 300 < hits)) for n in range(600)
+                      for p, hits in [((0.2, 60) if n < 300 else (0.8, 240))])
+    rows = {(m, line): line_rows for m, lines in PROTOCOL.lines.items() for line in lines}
+    result = scorer.score(lockbox.ScoringRows(rows, {}), {})
+    assert result["skill_and_calibration_passed"] is True and result["passed"] is False
+    assert len(result["blockers"]) == len(PROTOCOL.lines)
+    assert all("market benchmark" in b and "separate market lockbox" in b for b in result["blockers"])
 
 
 def test_the_first_captured_outcome_of_a_player_is_the_one_kept(tmp_path: Path) -> None:

@@ -50,6 +50,7 @@ from prop_alpha.alerts.replies import (
 )
 from prop_alpha.alerts.telegram import TelegramNotifier, TipLine, load_config
 from prop_alpha.config import DEFAULT_PILOT_DSN, PILOT_DSN_ENV
+from prop_alpha.modeling.engine import VoidRule
 from prop_alpha.scanner.slate import UpcomingFixture
 
 # The pilot's tackles count: plain `tackles_attempted` (Opta's "Tackles"), as the frozen League One/Two model (maintainer,
@@ -62,6 +63,11 @@ from prop_alpha.scanner.slate import UpcomingFixture
 PILOT_TACKLES_SQL: Final[str] = "s.tackles_attempted"
 # The count of 2026-10-12, kept for the diagnostics that compare the two (scripts/pilot_gap_diagnosis.py).
 TACKLES_PLUS_CHALLENGES_LOST_SQL: Final[str] = "(s.tackles_attempted + s.dribbled_past)"
+# The void rule paper bets are settled under: replies.grade voids only a player who did not play, and reads no starter flag.
+# Since 2026-10-27 the pilot prices bet365 and Betway under their own rule, void if the player does not start
+# (ladder_scan.BOOK_VOID_RULES), so a tip on those prices is refused before anything is recorded or sent, until settlement
+# reads who started; a sub appearance would otherwise be graded, not voided.
+SETTLED_VOID_RULE: Final[str] = VoidRule.VOID_IF_NO_APPEARANCE.value
 
 
 def recount(sql: str, count: str = PILOT_TACKLES_SQL) -> str:
@@ -131,10 +137,15 @@ def record_tips(
     """Record each tip as a paper bet and a tip line, under the store's lock (a second writer fails at once rather than
     interleave). A tip already recorded (same selection, not undone) is skipped, so an overlapping or retried run never
     records it twice. The tip line is written before the bet: a crash between them leaves a tip line with no bet, which
-    nothing reads, never a bet whose match cannot be found. A tip whose fixture is unknown raises before anything is written."""
+    nothing reads, never a bet whose match cannot be found. A tip whose fixture is unknown, or whose void rule is not the one
+    settlement applies (SETTLED_VOID_RULE), raises before anything is written."""
     missing = sorted({tip.directive.fixture_id for tip in tips if tip.directive.fixture_id not in fixtures})
     if missing:
         raise ValueError(f"tip for fixture {missing[0]} has no fixture to settle against")
+    unsettleable = sorted({VoidRule(tip.directive.void_rule).value for tip in tips} - {SETTLED_VOID_RULE})
+    if unsettleable:
+        raise ValueError(f"a tip priced under {', '.join(unsettleable)} cannot be settled: pilot settlement voids only a "
+                         f"player who did not play ({SETTLED_VOID_RULE})")
     recorded: list[PlacedBet] = []
     with ledger.ledger_lock(lock_for(store)):
         bets, cancelled, _, _ = store.load_all()

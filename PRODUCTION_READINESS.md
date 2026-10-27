@@ -346,8 +346,9 @@ repaired (`LOCKBOX_PROTOCOL.md`). No pricing, staking, settlement or risk settin
 
 **Still open (Gate 2 cannot pass until each is closed):** 500 scored predictions per line from 2026-10-27 (calendar time,
 the laptop on and the scheduled scans running); the market benchmark (no closing price captured; no bookmaker has been seen
-quoting League One/Two tackles or fouls); `yellow_card`, a PRD target market the model does not price (build it or a
-maintainer decision on scope); line-ups are estimated, not team-sheet based, a PRD protocol deviation. Settlement
+quoting League One/Two tackles or fouls; since the scope amendment of 2026-10-27, `GATE2_SCOPE_DECISION_MEMO.md`, it is
+judged on a separate market lockbox, not yet pre-registered). Closed by that amendment: `yellow_card` is out of scope
+(tackles and fouls only) and the estimated line-ups at the scan are the protocol. Settlement
 verification and Gate 3 are unchanged from the 2026-10-15 table below.
 
 ## Status on 2026-10-15 (history)

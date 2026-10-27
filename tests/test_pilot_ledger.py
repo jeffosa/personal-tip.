@@ -41,6 +41,18 @@ def _record(tmp_path: Path, n: int = 2) -> tuple[PlacedBetStore, Path]:
 
 
 # ---------------- recording ----------------
+def test_a_tip_priced_void_if_the_player_does_not_start_is_never_recorded(tmp_path: Path) -> None:
+    """2026-10-27: the pilot prices bet365 and Betway void if the player does not start, but paper bets are settled void only
+    for a player who did not play (replies.grade reads no starter flag), so a sub appearance would be graded, not voided. Such
+    a tip raises before anything is written, and so before its message is sent (TelegramNotifier's on_tips)."""
+    store, tips_file = PlacedBetStore(tmp_path / "bets.jsonl"), tmp_path / "tips.jsonl"
+    tips = [replace(tip, directive=replace(tip.directive, void_rule="void_if_not_starting")) for tip in _tips(2)]
+    with pytest.raises(ValueError, match="void_if_not_starting cannot be settled"):
+        pilot_ledger.record_tips(store, tips_file, tips, {500: FIXTURE}, NOW)
+    assert not tips_file.exists() and store.load_all()[0] == {}
+    assert pilot_ledger.SETTLED_VOID_RULE == "void_if_no_appearance"
+
+
 def test_each_tip_becomes_a_numbered_paper_bet_with_its_odds_and_a_tip_line(tmp_path: Path) -> None:
     store, tips_file = _record(tmp_path)
     bets = store.open_bets(NOW)
