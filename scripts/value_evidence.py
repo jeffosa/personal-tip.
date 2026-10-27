@@ -7,8 +7,12 @@ value, measured only on rows that can be evidence (evaluation/value_evidence.py)
 2. Predictions: the League One/Two prediction log filtered by the lockbox protocol (evaluation/lockbox.py); the pilot log
    is counted and left out (no frozen pricing, no protocol, and its matches were inspected on 2026-10-25 by
    scripts/screen_replay.py and scripts/edge_calibration.py).
-3. Metrics per market and line against bookmaker-settled outcomes of the same book, the de-vigged closing prices captured
-   before kickoff, and the tips settled by their own book (ROI and CLV with fixture-clustered 90% intervals).
+3. Metrics per market and line against bookmaker-settled outcomes of the same book and the de-vigged closing prices
+   captured before kickoff; the tips' ROI and CLV with fixture-clustered 90% intervals, over the bets whose settlement
+   reconciled: the tipped book's own result agreeing, or an automatic result under that book's verified settlement
+   contract (PRD Gate 3 criterion 4 reconciles to the outcome and the book's void rule; it needs no bookmaker's result).
+4. Gate 3 over that population, which stands in for the PRD's paper-bet ledger (not built; GATE3_PREREQUISITES): it
+   cannot pass until the prerequisites are built (GATE3_DECISION_MEMO.md).
 
 Read-only on both databases; writes only `.prop_alpha_state/analysis/value_evidence_<date>.json`. It scores nothing for a
 gate and is not the lockbox scorer (scripts/gate2_prospective.py); it never looks at an outcome the lockbox has not
@@ -33,7 +37,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from prop_alpha.alerts import ledger  # noqa: E402
 from prop_alpha.alerts.closing import load_closing_quotes  # noqa: E402
-from prop_alpha.alerts.market_contract import VERIFIED_CONTRACTS, contract_status  # noqa: E402
+from prop_alpha.alerts.market_contract import (  # noqa: E402
+    automatic_settlement_verified,
+    contract_status,
+)
 from prop_alpha.alerts.ledger import PlacedBetStore  # noqa: E402
 from prop_alpha.alerts.pilot_ledger import (  # noqa: E402
     PILOT_BETS_FILE,
@@ -49,7 +56,6 @@ from prop_alpha.alerts.replies import (  # noqa: E402
     profit,
     reconciliation_summary,
     reconciliation_text,
-    same_book,
 )
 from prop_alpha.config import DEFAULT_DSN, DEFAULT_PILOT_DSN, DSN_ENV  # noqa: E402
 from prop_alpha.evaluation import lockbox, value_evidence  # noqa: E402
@@ -80,9 +86,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print("1. Settlement agreement (bookmaker result v automatic settlement on stored Sportmonks counts)")
     reconciled: dict[str, list[tuple[PlacedBet, Reconciliation]]] = {}
-    for name, store, db, sql in (("League One/Two ledger", PlacedBetStore(), dsn, ledger.SETTLEMENT_SQL),
-                                 ("pilot paper tips", PlacedBetStore(PILOT_BETS_FILE), DEFAULT_PILOT_DSN, PILOT_SETTLEMENT_SQL)):
-        items = ledger.reconcile_settlements(store, db, now, sql)
+    # An automatic League One/Two result can reconcile under its book's verified contract (PRD Gate 3 criterion 4 needs no
+    # bookmaker's settlement); the pilot settles on its own counts and is not in the Gate 3 population.
+    for name, store, db, sql, verified in (
+            ("League One/Two ledger", PlacedBetStore(), dsn, ledger.SETTLEMENT_SQL,
+             lambda bet: automatic_settlement_verified(bet.book, bet.market)),
+            ("pilot paper tips", PlacedBetStore(PILOT_BETS_FILE), DEFAULT_PILOT_DSN, PILOT_SETTLEMENT_SQL, None)):
+        items = ledger.reconcile_settlements(store, db, now, sql, verified)
         reconciled[name] = items
         counts = Counter(item.outcome for _, item in items)
         whole = value_evidence.settlement_integrity([item for _, item in items])
@@ -115,12 +125,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     kickoff = {int(r["fixture_id"]): datetime.fromisoformat(str(r["kickoff_at"])) for r in selection.eligible}
     tips = []
     not_tips: Counter[str] = Counter()
+    tip_books: list[tuple[str, str]] = []
+    reconciliation = {bet.bet_id: item for bet, item in reconciled["League One/Two ledger"]}
     for bet, settlement in real_settled:
         if bet.fixture_id not in kickoff or bet.placed_at >= kickoff[bet.fixture_id]:
             not_tips["not a lockbox match, or placed after kickoff"] += 1
-        elif settlement.source != "manual" or not same_book(bet.book, settlement.book) or settlement.result == "void":
-            not_tips["no own-book won/lost settlement"] += 1
+        elif not automatic_settlement_verified(bet.book, bet.market):
+            not_tips["no verified settlement contract for its book and market"] += 1
+        elif not value_evidence.tip_qualifies(reconciliation[bet.bet_id], settlement.result, contract_verified=True):
+            not_tips["not reconciled (own-book result or verified rules), overridden, or void"] += 1
         else:
+            tip_books.append((bet.book, bet.market))
             value = ledger.closing_value(bet, quotes)
             tips.append(value_evidence.Tip(bet.fixture_id, bet.market, bet.line, bet.stake, profit(bet, settlement),
                                            None if value is None else value.clv))
@@ -160,6 +175,8 @@ def main(argv: Sequence[str] | None = None) -> int:
               f"({entry['with_two_way_close']} two-way) in {entry['fixtures']} matches{price_text}{clv}; reported, not judged")
     gate3 = result["gate3"]
     print(f"5. Gate 3 (all settled paper bets): {gate3['status'].upper()}")
+    print("  population: the League One/Two bets you recorded as placed (placed_bets.jsonl), standing in for the PRD's paper-bet"
+          " ledger (every StakingDirective persisted with is_paper), which is not built; shadow picks are never counted")
     print(f"  CLV criteria (statistical result only, never a passed gate on its own): "
           f"{'met' if gate3['clv_criteria_met'] else 'not met'}")
     print(f"  settlement integrity (100% reconciled, no manual override): {integrity.status.upper()} over "
@@ -169,8 +186,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"    {reason}")
     for blocker in gate3["blockers"]:
         print(f"  not met: {blocker}")
-    # Value is claimed only when Gate 3 passed (CLV and settlement integrity together) under a verified contract.
-    shown = bool(VERIFIED_CONTRACTS) and gate3["status"] == "passed"
+    # Value is claimed only when Gate 3 passed (CLV and settlement integrity together) and every bet in its sample is at a
+    # book and market with a verified contract (review 2026-10-27: this checked only that some contract existed).
+    shown = (gate3["status"] == "passed" and bool(tip_books)
+             and all(automatic_settlement_verified(book, market) for book, market in tip_books))
     report["value_shown"] = shown
     print(f"Verdict: value {'shown: Gate 3 passed' if shown else 'NOT shown'}; Gate 3 {gate3['status']}; "
           f"{contract_status()}. No value claim is made without a verified contract and a passed Gate 3.")

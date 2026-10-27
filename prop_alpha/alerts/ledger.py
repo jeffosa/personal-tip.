@@ -690,14 +690,20 @@ def settle(store: PlacedBetStore, dsn: str, now: datetime,
 
 
 def reconcile_settlements(store: PlacedBetStore, dsn: str, now: datetime,
-                          settlement_sql: str = SETTLEMENT_SQL) -> list[tuple[PlacedBet, Reconciliation]]:
+                          settlement_sql: str = SETTLEMENT_SQL,
+                          rules_verified: Callable[[PlacedBet], bool] | None = None,
+                          ) -> list[tuple[PlacedBet, Reconciliation]]:
     """Every settled bet compared with automatic settlement on the statistics stored now (replies.reconcile), from one
-    read-only transaction. Bets settled only automatically need no query."""
+    read-only transaction. `rules_verified` says which bets' books have a verified contract on the rules automatic
+    settlement uses (market_contract.automatic_settlement_verified); their automatic results are re-graded too. Other bets
+    settled only automatically need no query."""
     settled = store.settled_bets()
-    confirmed = [bet for bet, settlement in settled if settlement.source == "manual"]
-    rows = read_settlement_rows(dsn, confirmed, settlement_sql)
+    verified = {bet.bet_id for bet, _ in settled if rules_verified is not None and rules_verified(bet)}
+    checked = [bet for bet, settlement in settled if settlement.source == "manual" or bet.bet_id in verified]
+    rows = read_settlement_rows(dsn, checked, settlement_sql)
     automatic = store.automatic_settlements()
-    return [(bet, reconcile(bet, settlement, rows.get((bet.fixture_id, bet.player_id)), automatic.get(bet.bet_id), now))
+    return [(bet, reconcile(bet, settlement, rows.get((bet.fixture_id, bet.player_id)), automatic.get(bet.bet_id), now,
+                            bet.bet_id in verified))
             for bet, settlement in settled]
 
 

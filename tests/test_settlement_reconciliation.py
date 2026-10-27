@@ -169,7 +169,8 @@ def test_another_books_result_is_compared_but_never_counted_as_agreement_with_th
     assert summary.endswith("PRD Gate 3 needs every bet to reconcile.") and "FAIL" in summary
     assert "nothing verified yet at the tipped book" in reconciliation_summary([agreeing])
     assert "OTHER BOOK, DISAGREES" in reconciliation_text(bet, disagreeing)
-    assert set(RECONCILE_FAILURES) == {"discrepancy", "other_book_discrepancy", "unnamed_book_discrepancy"}
+    assert set(RECONCILE_FAILURES) == {"discrepancy", "other_book_discrepancy", "unnamed_book_discrepancy",
+                                       "verified_rules_discrepancy"}  # Gate 3 trace, 2026-10-26
 
 
 def test_a_settlement_names_its_bookmaker_only_when_manual_and_trimmed() -> None:

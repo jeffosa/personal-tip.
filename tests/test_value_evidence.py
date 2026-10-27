@@ -212,7 +212,9 @@ def test_a_positive_clv_sample_never_passes_gate3_when_settlement_integrity_is_n
         "failed_override": value_evidence.settlement_integrity([*settled[:-1], _agree(320, overridden=True)]),
         "incomplete": value_evidence.settlement_integrity([*settled[:-1], Reconciliation(320, "unconfirmed", None, "won", "x")]),
     }
-    results = {name: value_evidence.gate3_result(sample, integrity) for name, integrity in integrity_cases.items()}
+    # The PRD's prerequisites are given as built here: this test is about settlement integrity (they are tested apart).
+    built = {name: True for name in value_evidence.GATE3_PREREQUISITES}
+    results = {name: value_evidence.gate3_result(sample, integrity, built) for name, integrity in integrity_cases.items()}
     assert results["passed"]["status"] == "passed" and results["passed"]["blockers"] == []
     for name in ("failed", "failed_override"):
         assert results[name]["status"] == "failed" and results[name]["clv_criteria_met"] is True

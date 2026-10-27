@@ -11,7 +11,21 @@ settlements, closing prices) that code cannot produce. They take calendar time a
 
 Tags as in AGENT.md: **[T]** tested in this change · **[U]** implemented, not executed where it will run · **[N]** not built.
 
-## Status on 2026-10-26 (e): scheduler reliability: missed runs verified, silence and battery now detected (read this first)
+## Status on 2026-10-26 (f): Gate 3 traced against the PRD (read this first)
+
+**Still PAPER ONLY; Gate 3 INCOMPLETE.** The full trace and the open decisions are in `GATE3_DECISION_MEMO.md`.
+
+| Defect (unambiguous against the PRD) | Fix [T] |
+|---|---|
+| Settlement integrity reconciled a bet only through the tipped book's own manual result. PRD criterion 4 reconciles to the stored outcome and the book's void rule, and a paper bet has no bookmaker's settlement. | An automatic result under the bet's book's verified contract is re-graded: it reconciles, or fails when the stored statistics changed under it. Without a verified contract nothing changes. |
+| The CLV/ROI sample admitted only manual own-book results, and "value shown" checked only that some contract existed | It takes every reconciled, won or lost bet with no override at a book and market with a verified contract; "value shown" needs that for every bet in the sample |
+| Gate 3 could pass with the PRD's prerequisites unbuilt (projection refresh, paper-bet ledger writer, per-player bench probability before Gate 3 results are accepted) | Each is a Gate 3 criterion (`GATE3_PREREQUISITES`); all are unbuilt, so Gate 3 cannot pass |
+
+- **Effect today:** none (`VERIFIED_CONTRACTS` empty; 0 settled League One/Two bets).
+- **Not changed:** the population is the bets you reported placing (real money), standing in for the PRD's paper-bet ledger. And verifying a contract needs 20+ same-book (real-money) settlements. Both conflict with PRD §1.2 and are maintainer decisions D1 and D2.
+- **Never counted:** shadow picks.
+
+## Status on 2026-10-26 (e): scheduler reliability: missed runs verified, silence and battery now detected
 
 **Uptime is NOT fixed.** These changes make silence visible; only an always-on, plugged-in, online and logged-in machine
 prevents it.

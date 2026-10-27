@@ -101,6 +101,15 @@ def contract_verified(book: str, market: str, void_rule: str, statistic: str,
     return contract is not None and contract.void_rule == void_rule and contract.statistic == statistic
 
 
+def automatic_settlement_verified(book: str, market: str,
+                                  contracts: Mapping[tuple[str, str], Contract] | None = None) -> bool:
+    """Pure: whether the ledger's automatic settlement of a `book` bet on `market` follows that book's verified rules:
+    replies.grade settles on MODEL_STATISTICS[market] and voids a player who did not play (VOID_IF_NO_APPEARANCE), so
+    the contract must be on exactly those (Gate 3 criterion 4: reconciled to the outcome and the book's void rule)."""
+    return market in MODEL_STATISTICS and contract_verified(
+        book, market, VoidRule.VOID_IF_NO_APPEARANCE.value, MODEL_STATISTICS[market], contracts)
+
+
 def split_unverified(directives: Sequence[StakingDirective], statistics: Mapping[str, str],
                      contracts: Mapping[tuple[str, str], Contract] | None = None,
                      ) -> tuple[list[StakingDirective], list[StakingDirective]]:

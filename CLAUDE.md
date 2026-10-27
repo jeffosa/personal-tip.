@@ -64,6 +64,20 @@ Full rules for any code change: **AGENT.md**. Requirements and go-live gates: `p
     `clv_criteria_met` is the statistical result alone.
   - "value shown" needs Gate 3 passed and a verified contract. Today Gate 3 is INCOMPLETE (0 settled League One/Two
     paper bets).
+  **Gate 3 trace (2026-10-26, `GATE3_DECISION_MEMO.md`):**
+  - PRD criterion 4 reconciles a paper bet to the stored outcome and the book's void rule; it asks for no bookmaker's
+    settlement. So an automatic result under the bet's book's verified contract (`market_contract.automatic_settlement_verified`)
+    is re-graded and reconciles (`verified_rules_agree`), or fails when the stored statistics changed under it
+    (`verified_rules_discrepancy`). Before, only the tipped book's own manual result could reconcile.
+  - The CLV/ROI sample takes only reconciled bets whose own book and market have a verified contract
+    (`value_evidence.tip_qualifies`), and "value shown" needs that for every bet in the sample (review 2026-10-27:
+    an own-book agreement at an unverified book had qualified, and the verdict checked only that some contract existed).
+  - Gate 3 cannot pass while the PRD's prerequisites (projection refresh, paper-bet ledger writer, per-player bench
+    probability; `value_evidence.GATE3_PREREQUISITES`, all unbuilt) are missing.
+  - No effect today: `VERIFIED_CONTRACTS` is empty.
+  - Open for the maintainer (memo D1-D5): the population is the bets reported placed (real money), standing in for the
+    PRD's paper ledger, and verifying any contract needs 20+ same-book (real-money) settlements. Both conflict with PRD
+    §1.2, "MUST NOT risk capital until every gate has passed". Shadow picks are never counted.
   **A result naming no bookmaker is never agreement (audit M2, 2026-10-26):**
   - `replies.same_book` is true only when the result names the bet's bookmaker. Before, an unnamed one counted as the
     tipped book's, so a SportyBet ticket typed as `result 3 lost` reconciled as AGREE at bet365.
@@ -161,7 +175,7 @@ python3 -m venv .venv
 Tests:
 
 ```bash
-# Whole suite (990 tests). This is the command that counts.
+# Whole suite (1000 tests). This is the command that counts.
 python -m pytest tests -q -p no:cacheprovider
 
 # Individual suites
@@ -270,7 +284,7 @@ On a machine without a native install, Docker works too (untested here): `docker
 
 ## Before you say a change is done
 
-1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (990). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
+1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (1000). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
 2. `bash ci/bootstrap.sh --preflight` passes, and `python -m mypy` and `npx --yes pyright@1.1.406` report no errors.
 3. If you touched SQL: the full pipeline with `PROP_ALPHA_CI_DATABASE_URL` set ends with `schema smoke test passed`, and any new merge behaviour has a check in `tests/test_merge_postgres.sql`.
 4. New behaviour has tests that failed before the change.
