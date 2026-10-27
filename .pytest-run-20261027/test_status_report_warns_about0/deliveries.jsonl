@@ -1,2 +1,0 @@
-{"delivery_id": 1, "event": "pending", "at": "2026-10-27T09:33:30.677017+00:00", "kind": "digest", "text": "HIGH-VALUE BETS 1-1 of 1", "items": [{"number": 1, "kind": "board", "fixture_id": 9001, "player_id": 7, "market": "tackles", "line": 1.5, "min_odds": [["over", 2.1], ["under", 1.9]], "match": "Walsall v Port Vale", "player": "A Player (Walsall)", "book": null, "label": ""}], "valid_until": "2026-10-27T11:33:30.677017+00:00"}
-{"delivery_id": 1, "event": "confirmed_by_operator", "at": "2026-10-27T10:33:30.697673+00:00"}
