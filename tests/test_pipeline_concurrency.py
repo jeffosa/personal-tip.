@@ -35,6 +35,7 @@ class FakeDatabase:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.raw_payloads: dict[str, str] = {}
+        self.raw_sources: dict[str, str] = {}  # payload digest -> the source it was stored under
         self.staging: list[tuple[Any, ...]] = []
         self.merged_fixtures: set[str] = set()
         self.player_ids: dict[str, int] = {}
@@ -137,6 +138,7 @@ class FakeConnection:
             for kind, value in self.pending:
                 if kind == "raw":
                     db.raw_payloads.setdefault(value[3], value[1])
+                    db.raw_sources.setdefault(value[3], value[0])
                 elif kind == "stage":
                     db.staging.append(value)
                 elif kind == "merge":
@@ -193,6 +195,7 @@ class FakeVendor:
     def __init__(self, pool: FakePool, payloads: dict[str, dict[str, Any]]) -> None:
         self.pool = pool
         self.payloads = payloads
+        self.source = "sportmonks"  # VendorClient.source: what each raw payload is stored under
         self.lineups: dict[str, dict[str, Any]] = {}
         self.errors: dict[str, BaseException] = {}
         self.before_fetch: Callable[[str], object] | None = None  # its return value is ignored
@@ -263,6 +266,20 @@ def test_transient_database_error_is_retried() -> None:
     assert result.ok and result.db_attempts == 2
     assert len(db.staging) == 1 + 4
     assert len(db.raw_payloads) == 1
+
+
+def test_each_raw_payload_is_stored_under_its_clients_data_source() -> None:
+    """2026-10-27: raw_payloads.source names the vendor (VendorClient.source), so the lockbox capture can refuse outcomes
+    from any other source; it used to be the fixed label 'vendor_fixture_stats'."""
+    db, pool, vendor, uids = _setup(2)
+    with _engine(vendor, pool) as engine:
+        assert engine.run_slate(uids, job="stats", merge=False).fully_successful
+    assert len(db.raw_sources) == 2 and set(db.raw_sources.values()) == {"sportmonks"}
+
+
+def test_a_vendor_client_with_an_unknown_data_source_is_refused() -> None:
+    with pytest.raises(ValueError, match="unknown raw payload source 'vendor_fixture_stats'"):
+        VendorClient("https://example.test", "k", TokenBucketRateLimiter(100.0, 10), source="vendor_fixture_stats")
 
 
 def test_statement_timeout_fails_closed_without_retry(caplog: pytest.LogCaptureFixture) -> None:

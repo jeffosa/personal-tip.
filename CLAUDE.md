@@ -74,6 +74,13 @@ Full rules for any code change: **AGENT.md**. Requirements and go-live gates: `p
     section 6). At its first capture run within 4 h after the grace a match is re-fetched through the ingestion engine
     and captured from the fresh data. Later it is rebuilt from the last raw payload fetched at or before the grace,
     and excluded (never scored) when there is none. Tests: `tests/test_lockbox_capture_policy.py`.
+  - **Data source on every raw payload (2026-10-27, `452e9a3`):** `raw_payloads.source` is the client's vendor
+    (`VendorClient.source`: `sportmonks`, `thestatsapi` or `generic`; any other is refused), no longer the fixed
+    `vendor_fixture_stats`, which every earlier row still carries. The lockbox capture reads fetch times and rebuild
+    payloads from `sportmonks` rows only, and refuses (raises) a match whose latest payload is from another source; a match
+    with no payload at all is captured with `provider` null. Every lockbox match is ingested after this change (the first
+    kick off 2026-10-27 19:45 UTC). Tests: `tests/test_pipeline_concurrency.py`, `tests/test_lockbox.py`,
+    `tests/test_lockbox_capture_policy.py`.
   **Gate 3 trace (2026-10-26, `GATE3_DECISION_MEMO.md`):**
   - PRD criterion 4 reconciles a paper bet to the stored outcome and the book's void rule; it asks for no bookmaker's
     settlement. So an automatic result under the bet's book's verified contract (`market_contract.automatic_settlement_verified`)
@@ -221,7 +228,7 @@ python3 -m venv .venv
 Tests:
 
 ```bash
-# Whole suite (1033 tests). This is the command that counts.
+# Whole suite (1037 tests). This is the command that counts.
 python -m pytest tests -q -p no:cacheprovider
 
 # Individual suites
@@ -330,7 +337,7 @@ On a machine without a native install, Docker works too (untested here): `docker
 
 ## Before you say a change is done
 
-1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (1033). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
+1. `python -m pytest tests -q -p no:cacheprovider` shows `N passed`, with no failures and no skips, and `N` ≥ the previous total (1037). Update `EXPECTED_TESTS` in `ci/bootstrap.sh` if it grew.
 2. `bash ci/bootstrap.sh --preflight` passes, and `python -m mypy` and `npx --yes pyright@1.1.406` report no errors.
 3. If you touched SQL: the full pipeline with `PROP_ALPHA_CI_DATABASE_URL` set ends with `schema smoke test passed`, and any new merge behaviour has a check in `tests/test_merge_postgres.sql`.
 4. New behaviour has tests that failed before the change.

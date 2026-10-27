@@ -252,7 +252,7 @@ def outcomes_to_capture(predictions: Sequence[Mapping[str, Any]], captured: Mapp
         match = matches.get(key[0])
         if key in captured or key in new or match is None or not match.final or now < match.kickoff_at + protocol.revision_grace:
             continue
-        if match.data_source != protocol.data_vendor:
+        if match.data_source is not None and match.data_source != protocol.data_vendor:
             raise ValueError(f"fixture {key[0]} outcome source {match.data_source!r} is not {protocol.data_vendor!r}")
         minutes, counts = match.players.get(key[1], (0, {}))
         new[key] = {"fixture_id": key[0], "player_id": key[1], "minutes": int(minutes),

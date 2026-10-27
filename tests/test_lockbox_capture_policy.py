@@ -97,7 +97,7 @@ class _Cursor:
             return [("5001-h0", 7)]
         if "player_match_stats" in sql:
             return [("5001", 7, 90, self.db.stored_tackles, 1)]
-        return [("5001", KICKOFF, True, EARLY, self.db.last_fetched)]
+        return [("5001", KICKOFF, True, EARLY, self.db.last_fetched, "sportmonks")]
 
 
 class _Conn(_Cursor):
@@ -209,7 +209,9 @@ def test_a_payload_of_a_match_not_final_rebuilds_nothing_and_unknown_players_are
         fixture_payload: Callable[..., dict[str, Any]]) -> None:
     scorer = _script("gate2_prospective")
     payload = fixture_payload("5001")
-    rebuilt = scorer.match_from_payload(payload, EARLY, KICKOFF, {"5001-h0": 7})
+    rebuilt = scorer.match_from_payload(payload, EARLY, KICKOFF, {"5001-h0": 7}, "sportmonks")
     assert rebuilt is not None and set(rebuilt.players) == {7} and rebuilt.players[7] == (90, {"tackles": 4, "fouls": 2})
+    with pytest.raises(ValueError, match="payload source 'thestatsapi' is not 'sportmonks'"):
+        scorer.match_from_payload(payload, EARLY, KICKOFF, {"5001-h0": 7}, "thestatsapi")
     payload["fixture"]["status"] = "live"
-    assert scorer.match_from_payload(payload, EARLY, KICKOFF, {"5001-h0": 7}) is None
+    assert scorer.match_from_payload(payload, EARLY, KICKOFF, {"5001-h0": 7}, "sportmonks") is None

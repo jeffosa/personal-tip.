@@ -150,14 +150,7 @@ def test_market_benchmark_detects_information_beyond_the_market() -> None:
 def test_the_scan_saves_its_fixtures_for_closing_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from test_scan import _patch_database, _StubSportmonks
 
-    _patch_database(mo
-                    
-                    
-                    
-                    
-                    
-                    
-                    nkeypatch)
+    _patch_database(monkeypatch)
 
     class OneBook(FakeOddsClient):
         pass

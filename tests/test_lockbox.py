@@ -111,6 +111,17 @@ def test_an_outcome_is_captured_once_after_the_revision_grace_and_only_for_a_fin
     assert lockbox.outcomes_to_capture(records, {(5001, 7): captured}, {5001: _match(tackles=4)}, after) == []
 
 
+def test_an_outcome_from_another_data_source_is_never_captured() -> None:
+    """2026-10-27: a match whose stored data came from another source than the protocol's raises instead of being captured;
+    one with no recorded source (no raw payload) and one from Sportmonks are captured, the source kept on the record."""
+    after = KICKOFF + PROTOCOL.revision_grace
+    with pytest.raises(ValueError, match="outcome source 'thestatsapi' is not 'sportmonks'"):
+        lockbox.outcomes_to_capture([_record()], {}, {5001: replace(_match(), data_source="thestatsapi")}, after)
+    [captured] = lockbox.outcomes_to_capture([_record()], {}, {5001: replace(_match(), data_source="sportmonks")}, after)
+    assert captured["provider"] == "sportmonks"
+    assert lockbox.outcomes_to_capture([_record()], {}, {5001: _match()}, after)[0]["provider"] is None
+
+
 def test_a_player_without_a_stored_row_is_captured_as_not_playing() -> None:
     [captured] = lockbox.outcomes_to_capture([_record(player_id=8)], {}, {5001: _match()}, KICKOFF + timedelta(days=4))
     assert captured["minutes"] == 0 and captured["tackles"] is None
